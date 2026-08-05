@@ -579,12 +579,4 @@ ngx_lookup_udp_connection(ngx_listening_t *ls, struct sockaddr *sockaddr,
     return NULL;
 }
 
-#else
-
-void
-ngx_delete_udp_connection(void *data)
-{
-    return;
-}
-
 #endif

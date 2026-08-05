@@ -30,6 +30,9 @@ static ngx_int_t ngx_quic_handle_frames(ngx_connection_t *c,
     ngx_quic_header_t *pkt);
 
 static void ngx_quic_push_handler(ngx_event_t *ev);
+#if (NGX_HAVE_IOCP)
+static void ngx_quic_iocp_write_handler(ngx_event_t *ev);
+#endif
 
 
 static ngx_core_module_t  ngx_quic_module_ctx = {
@@ -213,6 +216,12 @@ ngx_quic_run(ngx_connection_t *c, ngx_quic_conf_t *conf)
 
     /* quic connection is now created */
     qc = ngx_quic_get_connection(c);
+
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        c->write->handler = ngx_quic_iocp_write_handler;
+    }
+#endif
 
     ngx_add_timer(c->read, qc->tp.max_idle_timeout);
 
@@ -1459,6 +1468,33 @@ ngx_quic_push_handler(ngx_event_t *ev)
 
     ngx_quic_connstate_dbg(c);
 }
+
+
+#if (NGX_HAVE_IOCP)
+
+static void
+ngx_quic_iocp_write_handler(ngx_event_t *ev)
+{
+    ssize_t            n;
+    ngx_connection_t  *c;
+
+    c = ev->data;
+
+    n = ngx_sendmsg(c, NULL, 0);
+
+    if (n == NGX_AGAIN) {
+        return;
+    }
+
+    if (n == NGX_ERROR) {
+        ngx_quic_close_connection(c, NGX_ERROR);
+        return;
+    }
+
+    ngx_quic_push_handler(ev);
+}
+
+#endif
 
 
 void

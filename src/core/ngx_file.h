@@ -81,6 +81,9 @@ typedef struct {
     unsigned                   persistent:1;
     unsigned                   clean:1;
     unsigned                   thread_write:1;
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_COMPAT)
+    unsigned                   aio_write:1;
+#endif
 } ngx_temp_file_t;
 
 

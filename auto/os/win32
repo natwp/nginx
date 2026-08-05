@@ -37,3 +37,4 @@ EVENT_MODULES="$EVENT_MODULES $IOCP_MODULE"
 have=NGX_HAVE_INET6 . auto/have
 
 have=NGX_HAVE_IOCP . auto/have
+have=NGX_HAVE_FILE_AIO . auto/have

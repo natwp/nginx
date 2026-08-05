@@ -236,6 +236,7 @@ WIN32_SRCS="$CORE_SRCS $EVENT_SRCS \
             src/os/win32/ngx_errno.c \
             src/os/win32/ngx_alloc.c \
             src/os/win32/ngx_files.c \
+            src/os/win32/ngx_file_aio.c \
             src/os/win32/ngx_shmem.c \
             src/os/win32/ngx_time.c \
             src/os/win32/ngx_process.c \
@@ -251,7 +252,8 @@ WIN32_SRCS="$CORE_SRCS $EVENT_SRCS \
             src/os/win32/ngx_dlopen.c \
             src/os/win32/ngx_event_log.c \
             src/os/win32/ngx_process_cycle.c \
-            src/event/ngx_event_acceptex.c"
+            src/event/ngx_event_acceptex.c \
+            src/event/ngx_event_udp_win32.c"
 
 NGX_WIN32_ICONS="src/os/win32/nginx.ico"
 NGX_WIN32_RC="src/os/win32/nginx.rc"

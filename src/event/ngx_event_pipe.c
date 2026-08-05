@@ -116,7 +116,7 @@ ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
         return NGX_OK;
     }
 
-#if (NGX_THREADS)
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_THREADS)
 
     if (p->aio) {
         ngx_log_debug0(NGX_LOG_DEBUG_EVENT, p->log, 0,
@@ -517,7 +517,7 @@ ngx_event_pipe_write_to_downstream(ngx_event_pipe_t *p)
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, p->log, 0,
                    "pipe write downstream: %d", downstream->write->ready);
 
-#if (NGX_THREADS)
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_THREADS)
 
     if (p->writing) {
         rc = ngx_event_pipe_write_chain_to_temp_file(p);
@@ -746,7 +746,7 @@ ngx_event_pipe_write_chain_to_temp_file(ngx_event_pipe_t *p)
     ngx_uint_t    prev_last_shadow;
     ngx_chain_t  *cl, *tl, *next, *out, **ll, **last_out, **last_free;
 
-#if (NGX_THREADS)
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_THREADS)
 
     if (p->writing) {
 
@@ -850,11 +850,26 @@ ngx_event_pipe_write_chain_to_temp_file(ngx_event_pipe_t *p)
         return NGX_ABORT;
     }
 
-#if (NGX_THREADS)
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_THREADS)
 
     if (n == NGX_AGAIN) {
         p->writing = out;
+
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+        if (p->temp_file->aio_write) {
+            if (p->aio_handler == NULL) {
+                ngx_log_error(NGX_LOG_ALERT, p->log, 0,
+                              "file AIO write has no event pipe handler");
+                return NGX_ABORT;
+            }
+
+            p->aio_handler(p, &p->temp_file->file);
+        }
+#endif
+
+#if (NGX_THREADS)
         p->thread_task = p->temp_file->file.thread_task;
+#endif
         return NGX_AGAIN;
     }
 

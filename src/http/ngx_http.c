@@ -1839,7 +1839,7 @@ ngx_http_add_listening(ngx_conf_t *cf, ngx_http_conf_addr_t *addr)
     if (ngx_get_conf(cf->cycle->conf_ctx, ngx_events_module)) {
         iocpcf = ngx_event_get_conf(cf->cycle->conf_ctx, ngx_iocp_module);
     }
-    if (iocpcf && iocpcf->acceptex_read) {
+    if (iocpcf && iocpcf->acceptex_read && !addr->opt.ssl) {
         ls->post_accept_buffer_size = cscf->client_header_buffer_size;
     }
     }

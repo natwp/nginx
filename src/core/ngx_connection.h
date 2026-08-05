@@ -144,6 +144,10 @@ struct ngx_connection_s {
 
     ngx_pool_t         *pool;
 
+#if (NGX_HAVE_IOCP)
+    ngx_iocp_owner_t   *iocp;
+#endif
+
     int                 type;
 
     struct sockaddr    *sockaddr;

@@ -8,6 +8,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_event.h>
+#include <ngx_event_connect.h>
 
 
 #define NGX_RESOLVER_UDP_SIZE   4096
@@ -1331,9 +1332,27 @@ ngx_resolver_send_udp_query(ngx_resolver_t *r, ngx_resolver_connection_t  *rec,
         rec->udp->data = rec;
         rec->udp->read->handler = ngx_resolver_udp_read;
         rec->udp->read->resolver = 1;
+
+#if (NGX_HAVE_IOCP)
+        if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+            ngx_post_event(rec->udp->read, &ngx_posted_events);
+
+        } else
+#endif
+        if (ngx_handle_read_event(rec->udp->read, 0) != NGX_OK) {
+            goto failed;
+        }
     }
 
-    n = ngx_send(rec->udp, query, qlen);
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        n = ngx_wsasend(rec->udp, query, qlen);
+
+    } else
+#endif
+    {
+        n = ngx_send(rec->udp, query, qlen);
+    }
 
     if (n == NGX_ERROR) {
         goto failed;
@@ -4459,6 +4478,7 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
 {
     int                rc;
     ngx_int_t          event;
+    ngx_err_t          err;
     ngx_event_t       *rev, *wev;
     ngx_socket_t       s;
     ngx_connection_t  *c;
@@ -4484,6 +4504,8 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
         return NGX_ERROR;
     }
 
+    c->type = SOCK_DGRAM;
+
     if (ngx_nonblocking(s) == -1) {
         ngx_log_error(NGX_LOG_ALERT, &rec->log, ngx_socket_errno,
                       ngx_nonblocking_n " failed");
@@ -4506,12 +4528,35 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, &rec->log, 0,
                    "connect to %V, fd:%d #%uA", &rec->server, s, c->number);
 
-    rc = connect(s, rec->sockaddr, rec->socklen);
+    err = 0;
 
-    /* TODO: iocp */
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        if (ngx_blocking(s) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, &rec->log, ngx_socket_errno,
+                          ngx_blocking_n " failed");
+            goto failed;
+        }
+    }
+#endif
+
+    rc = connect(s, rec->sockaddr, rec->socklen);
+    if (rc == -1) {
+        err = ngx_socket_errno;
+    }
+
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        if (ngx_nonblocking(s) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, &rec->log, ngx_socket_errno,
+                          ngx_nonblocking_n " failed");
+            goto failed;
+        }
+    }
+#endif
 
     if (rc == -1) {
-        ngx_log_error(NGX_LOG_CRIT, &rec->log, ngx_socket_errno,
+        ngx_log_error(NGX_LOG_CRIT, &rec->log, err,
                       "connect() failed");
 
         goto failed;
@@ -4528,6 +4573,12 @@ ngx_udp_connect(ngx_resolver_connection_t *rec)
     if (ngx_add_event(rev, NGX_READ_EVENT, event) != NGX_OK) {
         goto failed;
     }
+
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        rev->ready = 1;
+    }
+#endif
 
     return NGX_OK;
 
@@ -4572,6 +4623,8 @@ ngx_tcp_connect(ngx_resolver_connection_t *rec)
         return NGX_ERROR;
     }
 
+    c->type = SOCK_STREAM;
+
     if (ngx_nonblocking(s) == -1) {
         ngx_log_error(NGX_LOG_ALERT, &rec->log, ngx_socket_errno,
                       ngx_nonblocking_n " failed");
@@ -4599,6 +4652,21 @@ ngx_tcp_connect(ngx_resolver_connection_t *rec)
 
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, &rec->log, 0,
                    "connect to %V, fd:%d #%uA", &rec->server, s, c->number);
+
+#if (NGX_HAVE_IOCP)
+
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        rc = ngx_event_connect_iocp(c, rec->sockaddr, rec->socklen,
+                                    &rec->server, 1);
+
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
+        goto failed;
+    }
+
+#endif
 
     rc = connect(s, rec->sockaddr, rec->socklen);
 

@@ -169,6 +169,21 @@ ngx_int_t ngx_create_file_mapping(ngx_file_mapping_t *fm);
 void ngx_close_file_mapping(ngx_file_mapping_t *fm);
 
 
+#if (NGX_HAVE_FILE_AIO)
+
+ngx_int_t ngx_file_aio_init(ngx_file_t *file, ngx_pool_t *pool);
+ssize_t ngx_file_aio_read(ngx_file_t *file, u_char *buf, size_t size,
+    off_t offset, ngx_pool_t *pool);
+ssize_t ngx_file_aio_write(ngx_file_t *file, u_char *buf, size_t size,
+    off_t offset, ngx_pool_t *pool);
+ssize_t ngx_file_aio_write_chain(ngx_file_t *file, ngx_chain_t *chain,
+    off_t offset, ngx_pool_t *pool);
+
+extern ngx_uint_t  ngx_file_aio;
+
+#endif
+
+
 u_char *ngx_realpath(u_char *path, u_char *resolved);
 #define ngx_realpath_n              ""
 

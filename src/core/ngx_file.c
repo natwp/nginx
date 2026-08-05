@@ -133,6 +133,15 @@ ngx_write_chain_to_temp_file(ngx_temp_file_t *tf, ngx_chain_t *chain)
 
 #endif
 
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+
+    if (tf->aio_write) {
+        return ngx_file_aio_write_chain(&tf->file, chain, tf->offset,
+                                        tf->pool);
+    }
+
+#endif
+
     return ngx_write_chain_to_file(&tf->file, chain, tf->offset, tf->pool);
 }
 

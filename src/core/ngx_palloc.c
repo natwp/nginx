@@ -13,6 +13,7 @@ static ngx_inline void *ngx_palloc_small(ngx_pool_t *pool, size_t size,
     ngx_uint_t align);
 static void *ngx_palloc_block(ngx_pool_t *pool, size_t size);
 static void *ngx_palloc_large(ngx_pool_t *pool, size_t size);
+static void ngx_destroy_pool_now(ngx_pool_t *pool);
 
 
 ngx_pool_t *
@@ -39,12 +40,80 @@ ngx_create_pool(size_t size, ngx_log_t *log)
     p->cleanup = NULL;
     p->log = log;
 
+#if (NGX_HAVE_IOCP)
+    p->references = 1;
+    p->destroy_pending = 0;
+#endif
+
     return p;
 }
 
 
 void
 ngx_destroy_pool(ngx_pool_t *pool)
+{
+#if (NGX_HAVE_IOCP)
+    if (pool->destroy_pending) {
+        return;
+    }
+
+    pool->destroy_pending = 1;
+
+    if (--pool->references != 0) {
+        return;
+    }
+#endif
+
+    ngx_destroy_pool_now(pool);
+}
+
+
+#if (NGX_HAVE_IOCP)
+
+ngx_int_t
+ngx_pool_hold(ngx_pool_t *pool)
+{
+    if (pool == NULL || pool->destroy_pending) {
+        return NGX_ERROR;
+    }
+
+    if (pool->references == (ngx_uint_t) -1) {
+        ngx_log_error(NGX_LOG_ALERT, pool->log, 0,
+                      "pool reference count overflow");
+        return NGX_ERROR;
+    }
+
+    pool->references++;
+
+    return NGX_OK;
+}
+
+
+void
+ngx_pool_release(ngx_pool_t *pool)
+{
+    if (pool == NULL) {
+        return;
+    }
+
+    if (pool->references == 0) {
+        ngx_log_error(NGX_LOG_ALERT, pool->log, 0,
+                      "pool reference count underflow");
+        return;
+    }
+
+    if (--pool->references != 0 || !pool->destroy_pending) {
+        return;
+    }
+
+    ngx_destroy_pool_now(pool);
+}
+
+#endif
+
+
+static void
+ngx_destroy_pool_now(ngx_pool_t *pool)
 {
     ngx_pool_t          *p, *n;
     ngx_pool_large_t    *l;
@@ -101,6 +170,14 @@ ngx_reset_pool(ngx_pool_t *pool)
 {
     ngx_pool_t        *p;
     ngx_pool_large_t  *l;
+
+#if (NGX_HAVE_IOCP)
+    if (pool->destroy_pending || pool->references != 1) {
+        ngx_log_error(NGX_LOG_ALERT, pool->log, 0,
+                      "cannot reset a referenced pool");
+        return;
+    }
+#endif
 
     for (l = pool->large; l; l = l->next) {
         if (l->alloc) {

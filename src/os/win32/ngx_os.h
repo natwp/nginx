@@ -15,6 +15,10 @@
 
 #define NGX_IO_SENDFILE    1
 
+#define NGX_IOCP_READ_LIMIT  65536
+#define NGX_IOCP_SEND_LIMIT  (2 * 1024 * 1024)
+#define NGX_IOCP_UDP_LIMIT   65535
+
 
 typedef ssize_t (*ngx_recv_pt)(ngx_connection_t *c, u_char *buf, size_t size);
 typedef ssize_t (*ngx_recv_chain_pt)(ngx_connection_t *c, ngx_chain_t *in,
@@ -45,11 +49,16 @@ ssize_t ngx_udp_wsarecv(ngx_connection_t *c, u_char *buf, size_t size);
 ssize_t ngx_udp_overlapped_wsarecv(ngx_connection_t *c, u_char *buf,
     size_t size);
 ssize_t ngx_wsarecv_chain(ngx_connection_t *c, ngx_chain_t *chain, off_t limit);
+ssize_t ngx_overlapped_wsarecv_chain(ngx_connection_t *c,
+    ngx_chain_t *chain, off_t limit);
 ssize_t ngx_wsasend(ngx_connection_t *c, u_char *buf, size_t size);
 ssize_t ngx_overlapped_wsasend(ngx_connection_t *c, u_char *buf, size_t size);
 ngx_chain_t *ngx_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in,
     off_t limit);
 ngx_chain_t *ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in,
+    off_t limit);
+ssize_t ngx_iocp_udp_send(ngx_connection_t *c, u_char *buf, size_t size);
+ngx_chain_t *ngx_iocp_udp_send_chain(ngx_connection_t *c, ngx_chain_t *in,
     off_t limit);
 
 void ngx_cdecl ngx_event_log(ngx_err_t err, const char *fmt, ...);

@@ -16,6 +16,8 @@ static ngx_connection_t *ngx_quic_lookup_connection(ngx_listening_t *ls,
     ngx_str_t *key, struct sockaddr *local_sockaddr, socklen_t local_socklen);
 
 
+#if !(NGX_WIN32)
+
 void
 ngx_quic_recvmsg(ngx_event_t *ev)
 {
@@ -347,16 +349,201 @@ ngx_quic_recvmsg(ngx_event_t *ev)
     } while (ev->available);
 }
 
+#else
+
+void
+ngx_quic_recvmsg(ngx_event_t *ev)
+{
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, ev->log, 0,
+                   "IOCP QUIC datagram event for fd:%d",
+                   ((ngx_connection_t *) ev->data)->fd);
+}
+
+
+void
+ngx_quic_iocp_dispatch(ngx_listening_t *ls, u_char *data, size_t size,
+    struct sockaddr *sockaddr, socklen_t socklen,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen)
+{
+    ngx_str_t           key;
+    ngx_buf_t           buf;
+    ngx_log_t          *log;
+    ngx_event_t        *rev, *wev;
+    ngx_uint_t          instance;
+    ngx_connection_t   *c, *lc;
+    ngx_quic_socket_t  *qsock;
+
+    lc = ls->connection;
+
+    if (ngx_quic_get_packet_dcid(&ls->log, data, size, &key) != NGX_OK) {
+        return;
+    }
+
+    c = ngx_quic_lookup_connection(ls, &key, local_sockaddr, local_socklen);
+
+    if (c) {
+        ngx_memzero(&buf, sizeof(ngx_buf_t));
+        buf.pos = data;
+        buf.last = data + size;
+        buf.start = data;
+        buf.end = data + size;
+
+        qsock = ngx_quic_get_socket(c);
+        ngx_memcpy(&qsock->sockaddr, sockaddr, socklen);
+        qsock->socklen = socklen;
+
+        c->udp->buffer = &buf;
+        rev = c->read;
+        instance = rev->instance;
+        rev->ready = 1;
+        rev->active = 0;
+        rev->handler(rev);
+
+        if (c->fd == (ngx_socket_t) -1 || rev->instance != instance) {
+            return;
+        }
+
+        if (c->udp) {
+            c->udp->buffer = NULL;
+        }
+
+        rev->ready = 0;
+        rev->active = 1;
+
+        return;
+    }
+
+#if (NGX_STAT_STUB)
+    (void) ngx_atomic_fetch_add(ngx_stat_accepted, 1);
+#endif
+
+    ngx_accept_disabled = ngx_cycle->connection_n / 8
+                          - ngx_cycle->free_connection_n;
+
+    c = ngx_get_connection(lc->fd, &ls->log);
+    if (c == NULL) {
+        return;
+    }
+
+    c->shared = 1;
+    c->type = SOCK_DGRAM;
+    c->socklen = socklen;
+
+#if (NGX_STAT_STUB)
+    (void) ngx_atomic_fetch_add(ngx_stat_active, 1);
+#endif
+
+    c->pool = ngx_create_pool(ls->pool_size, &ls->log);
+    if (c->pool == NULL) {
+        ngx_quic_close_accepted_connection(c);
+        return;
+    }
+
+    c->sockaddr = ngx_palloc(c->pool, NGX_SOCKADDRLEN);
+    if (c->sockaddr == NULL) {
+        ngx_quic_close_accepted_connection(c);
+        return;
+    }
+    ngx_memcpy(c->sockaddr, sockaddr, socklen);
+
+    log = ngx_palloc(c->pool, sizeof(ngx_log_t));
+    if (log == NULL) {
+        ngx_quic_close_accepted_connection(c);
+        return;
+    }
+
+    *log = ls->log;
+    c->log = log;
+    c->pool->log = log;
+    c->listening = ls;
+
+    if (local_sockaddr != ls->sockaddr) {
+        c->local_sockaddr = ngx_palloc(c->pool, local_socklen);
+        if (c->local_sockaddr == NULL) {
+            ngx_quic_close_accepted_connection(c);
+            return;
+        }
+
+        ngx_memcpy(c->local_sockaddr, local_sockaddr, local_socklen);
+
+    } else {
+        c->local_sockaddr = local_sockaddr;
+    }
+
+    c->local_socklen = local_socklen;
+
+    if (ngx_iocp_create_shared_owner(c, lc->iocp) == NULL) {
+        ngx_quic_close_accepted_connection(c);
+        return;
+    }
+
+    c->buffer = ngx_create_temp_buf(c->pool, size ? size : 1);
+    if (c->buffer == NULL) {
+        ngx_quic_close_accepted_connection(c);
+        return;
+    }
+    c->buffer->last = ngx_cpymem(c->buffer->last, data, size);
+
+    rev = c->read;
+    wev = c->write;
+    rev->active = 1;
+    wev->ready = 1;
+    rev->log = log;
+    wev->log = log;
+
+    c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
+    c->start_time = ngx_current_msec;
+
+#if (NGX_STAT_STUB)
+    (void) ngx_atomic_fetch_add(ngx_stat_handled, 1);
+#endif
+
+    if (ls->addr_ntop) {
+        c->addr_text.data = ngx_pnalloc(c->pool, ls->addr_text_max_len);
+        if (c->addr_text.data == NULL) {
+            ngx_quic_close_accepted_connection(c);
+            return;
+        }
+
+        c->addr_text.len = ngx_sock_ntop(c->sockaddr, c->socklen,
+                                         c->addr_text.data,
+                                         ls->addr_text_max_len, 0);
+        if (c->addr_text.len == 0) {
+            ngx_quic_close_accepted_connection(c);
+            return;
+        }
+    }
+
+    log->data = NULL;
+    log->handler = NULL;
+    ls->handler(c);
+}
+
+#endif
+
 
 static void
 ngx_quic_close_accepted_connection(ngx_connection_t *c)
 {
+    ngx_pool_t  *pool;
+
+    pool = c->pool;
+
+#if (NGX_WIN32)
+    if (c->iocp) {
+        ngx_close_connection(c);
+
+    } else {
+        ngx_free_connection(c);
+        c->fd = (ngx_socket_t) -1;
+    }
+#else
     ngx_free_connection(c);
-
     c->fd = (ngx_socket_t) -1;
+#endif
 
-    if (c->pool) {
-        ngx_destroy_pool(c->pool);
+    if (pool) {
+        ngx_destroy_pool(pool);
     }
 
 #if (NGX_STAT_STUB)

@@ -16,6 +16,17 @@ static ngx_int_t ngx_event_connect_set_transparent(ngx_peer_connection_t *pc,
     ngx_socket_t s);
 #endif
 
+#if (NGX_HAVE_IOCP)
+typedef struct {
+    ngx_iocp_op_t  op;
+    ngx_sockaddr_t sockaddr;
+    socklen_t      socklen;
+} ngx_iocp_connect_op_t;
+
+
+static void ngx_event_connect_iocp_complete(ngx_iocp_op_t *op);
+#endif
+
 
 ngx_int_t
 ngx_event_connect_peer(ngx_peer_connection_t *pc)
@@ -189,6 +200,13 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
 
     } else { /* type == SOCK_DGRAM */
         c->recv = ngx_udp_recv;
+
+#if (NGX_HAVE_IOCP)
+        if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+            c->send = ngx_udp_send;
+
+        } else
+#endif
         c->send = ngx_send;
         c->send_chain = ngx_udp_send_chain;
 
@@ -217,6 +235,57 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
 
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, pc->log, 0,
                    "connect to %V, fd:%d #%uA", pc->name, s, c->number);
+
+#if (NGX_HAVE_IOCP)
+
+    if ((ngx_event_flags & NGX_USE_IOCP_EVENT) && type == SOCK_STREAM) {
+        rc = ngx_event_connect_iocp(c, pc->sockaddr, pc->socklen, pc->name,
+                                    pc->local == NULL);
+
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+
+        if (rc == NGX_DECLINED) {
+            ngx_close_connection(c);
+            pc->connection = NULL;
+            return NGX_DECLINED;
+        }
+
+        goto failed;
+    }
+
+    if ((ngx_event_flags & NGX_USE_IOCP_EVENT) && type == SOCK_DGRAM) {
+        if (ngx_blocking(s) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, pc->log, ngx_socket_errno,
+                          ngx_blocking_n " failed");
+            goto failed;
+        }
+
+        rc = connect(s, pc->sockaddr, pc->socklen);
+        err = (rc == -1) ? ngx_socket_errno : 0;
+
+        if (ngx_nonblocking(s) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, pc->log, ngx_socket_errno,
+                          ngx_nonblocking_n " failed");
+            goto failed;
+        }
+
+        if (rc == -1) {
+            ngx_log_error(NGX_LOG_ERR, pc->log, err,
+                          "connect() to %V failed", pc->name);
+            ngx_close_connection(c);
+            pc->connection = NULL;
+            return NGX_DECLINED;
+        }
+
+        rev->ready = 1;
+        wev->ready = 1;
+
+        return NGX_OK;
+    }
+
+#endif
 
     rc = connect(s, pc->sockaddr, pc->socklen);
 
@@ -341,6 +410,200 @@ failed:
 
     return NGX_ERROR;
 }
+
+
+#if (NGX_HAVE_IOCP)
+
+ngx_int_t
+ngx_event_connect_iocp(ngx_connection_t *c, struct sockaddr *sockaddr,
+    socklen_t socklen, ngx_str_t *name, ngx_uint_t bind_socket)
+{
+    int                 rc;
+    DWORD               bytes;
+    ngx_err_t           err;
+    ngx_uint_t          level;
+    ngx_event_t        *wev;
+    ngx_iocp_connect_op_t *op;
+    struct sockaddr_in  sin;
+#if (NGX_HAVE_INET6)
+    struct sockaddr_in6 sin6;
+#endif
+
+    if (c == NULL || c->iocp == NULL || c->iocp->connectex == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, c ? c->log : ngx_cycle->log, 0,
+                      "ConnectEx extension function is unavailable");
+        return NGX_ERROR;
+    }
+
+    if (sockaddr == NULL || socklen <= 0
+        || socklen > (socklen_t) sizeof(ngx_sockaddr_t)
+        || socklen < (socklen_t) sizeof(sockaddr->sa_family))
+    {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "ConnectEx() peer address is invalid");
+        return NGX_ERROR;
+    }
+
+    switch (sockaddr->sa_family) {
+
+    case AF_INET:
+        if (socklen < (socklen_t) sizeof(struct sockaddr_in)) {
+            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                          "ConnectEx() IPv4 peer address is too short");
+            return NGX_ERROR;
+        }
+        break;
+
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+        if (socklen < (socklen_t) sizeof(struct sockaddr_in6)) {
+            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                          "ConnectEx() IPv6 peer address is too short");
+            return NGX_ERROR;
+        }
+        break;
+#endif
+
+    default:
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "ConnectEx() does not support address family %d",
+                      sockaddr->sa_family);
+        return NGX_ERROR;
+    }
+
+    if (bind_socket) {
+        switch (sockaddr->sa_family) {
+
+        case AF_INET:
+            ngx_memzero(&sin, sizeof(struct sockaddr_in));
+            sin.sin_family = AF_INET;
+
+            if (bind(c->fd, (struct sockaddr *) &sin, sizeof(sin)) == -1) {
+                ngx_log_error(NGX_LOG_CRIT, c->log, ngx_socket_errno,
+                              "bind() before ConnectEx() failed");
+                return NGX_ERROR;
+            }
+
+            break;
+
+#if (NGX_HAVE_INET6)
+        case AF_INET6:
+            ngx_memzero(&sin6, sizeof(struct sockaddr_in6));
+            sin6.sin6_family = AF_INET6;
+
+            if (bind(c->fd, (struct sockaddr *) &sin6, sizeof(sin6)) == -1) {
+                ngx_log_error(NGX_LOG_CRIT, c->log, ngx_socket_errno,
+                              "bind() before ConnectEx() failed");
+                return NGX_ERROR;
+            }
+
+            break;
+#endif
+
+        default:
+            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                          "ConnectEx() does not support address family %d",
+                          sockaddr->sa_family);
+            return NGX_ERROR;
+        }
+    }
+
+    wev = c->write;
+
+    op = (ngx_iocp_connect_op_t *)
+         ngx_iocp_op_create(sizeof(ngx_iocp_connect_op_t), c->iocp, wev,
+                            NULL, NGX_IOCP_OP_CONNECT,
+                            ngx_event_connect_iocp_complete, NULL);
+    if (op == NULL) {
+        return NGX_ERROR;
+    }
+
+    op->socklen = socklen;
+    ngx_memcpy(&op->sockaddr, sockaddr, socklen);
+
+    bytes = 0;
+    rc = c->iocp->connectex(c->fd, &op->sockaddr.sockaddr, op->socklen,
+                            NULL, 0, &bytes, &op->op.overlapped);
+
+    wev->active = 1;
+    wev->ready = 0;
+    wev->complete = 0;
+
+    if (rc != 0) {
+        return NGX_AGAIN;
+    }
+
+    err = ngx_socket_errno;
+
+    if (err == WSA_IO_PENDING) {
+        return NGX_AGAIN;
+    }
+
+    wev->active = 0;
+    wev->ready = 1;
+    ngx_iocp_op_abort(&op->op);
+
+    if (err == NGX_ECONNREFUSED || err == NGX_ECONNRESET
+        || err == NGX_ENETDOWN || err == NGX_ENETUNREACH
+        || err == NGX_EHOSTDOWN || err == NGX_EHOSTUNREACH)
+    {
+        level = NGX_LOG_ERR;
+    } else {
+        level = NGX_LOG_CRIT;
+    }
+
+    if (name) {
+        ngx_log_error(level, c->log, err, "ConnectEx() to %V failed", name);
+
+    } else {
+        ngx_log_error(level, c->log, err, "ConnectEx() failed");
+    }
+
+    return NGX_DECLINED;
+}
+
+
+static void
+ngx_event_connect_iocp_complete(ngx_iocp_op_t *op)
+{
+    ngx_connection_t  *c;
+    ngx_event_t       *rev, *wev;
+
+    c = op->owner->connection;
+    rev = c->read;
+    wev = op->event;
+
+    if (op->error == 0
+        && setsockopt(c->fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0)
+           == -1)
+    {
+        op->error = ngx_socket_errno;
+    }
+
+    wev->iocp_op = NULL;
+    wev->iocp_error = op->error;
+    wev->active = 0;
+    wev->ready = 1;
+    wev->complete = 0;
+
+    rev->ready = 0;
+
+    if (op->error) {
+        wev->error = 1;
+        rev->error = 1;
+        rev->iocp_error = op->error;
+    }
+
+    if (wev->handler) {
+        wev->handler(wev);
+    }
+
+    if (op->error == 0 && c->fd != (ngx_socket_t) -1 && rev->handler) {
+        (void) ngx_iocp_post_read(rev);
+    }
+}
+
+#endif
 
 
 #if (NGX_HAVE_TRANSPARENT_PROXY)

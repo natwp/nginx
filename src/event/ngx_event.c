@@ -9,6 +9,10 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
+#if (NGX_QUIC)
+#include <ngx_event_quic.h>
+#endif
+
 
 #define DEFAULT_CONNECTIONS  512
 
@@ -340,6 +344,12 @@ ngx_handle_read_event(ngx_event_t *rev, ngx_uint_t flags)
 
     /* iocp */
 
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        return ngx_iocp_post_read(rev);
+    }
+#endif
+
     return NGX_OK;
 }
 
@@ -424,6 +434,12 @@ ngx_handle_write_event(ngx_event_t *wev, size_t lowat)
     }
 
     /* iocp */
+
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        return ngx_iocp_post_write(wev);
+    }
+#endif
 
     return NGX_OK;
 }
@@ -858,23 +874,51 @@ ngx_event_process_init(ngx_cycle_t *cycle)
         if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
             ngx_iocp_conf_t  *iocpcf;
 
-            rev->handler = ngx_event_acceptex;
-
             if (ngx_use_accept_mutex) {
                 continue;
             }
 
-            if (ngx_add_event(rev, 0, NGX_IOCP_ACCEPT) == NGX_ERROR) {
-                return NGX_ERROR;
-            }
-
-            ls[i].log.handler = ngx_acceptex_log_error;
-
             iocpcf = ngx_event_get_conf(cycle->conf_ctx, ngx_iocp_module);
-            if (ngx_event_post_acceptex(&ls[i], iocpcf->post_acceptex)
-                == NGX_ERROR)
-            {
-                return NGX_ERROR;
+
+            if (c->type == SOCK_STREAM) {
+                rev->handler = ngx_event_acceptex;
+
+                if (ngx_add_event(rev, 0, NGX_IOCP_ACCEPT) == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+
+                c->iocp->pool = cycle->pool;
+                ls[i].log.handler = ngx_acceptex_log_error;
+
+                if (ngx_event_post_acceptex(&ls[i],
+                                            (ngx_uint_t)
+                                            iocpcf->post_acceptex)
+                    == NGX_ERROR)
+                {
+                    return NGX_ERROR;
+                }
+
+            } else {
+#if (NGX_QUIC)
+                rev->handler = ls[i].quic ? ngx_quic_recvmsg
+                                           : ngx_event_recvmsg;
+#else
+                rev->handler = ngx_event_recvmsg;
+#endif
+
+                if (ngx_add_event(rev, 0, NGX_IOCP_IO) == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+
+                c->iocp->pool = cycle->pool;
+
+                if (ngx_iocp_post_udp_receives(&ls[i],
+                                               (ngx_uint_t)
+                                               iocpcf->udp_receives)
+                    == NGX_ERROR)
+                {
+                    return NGX_ERROR;
+                }
             }
 
         } else {

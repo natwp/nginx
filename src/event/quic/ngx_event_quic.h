@@ -12,6 +12,11 @@
 #include <ngx_core.h>
 
 
+#if (NGX_WIN32)
+struct ngx_listening_s;
+#endif
+
+
 #if (OPENSSL_VERSION_NUMBER >= 0x30500010L)
 #define NGX_QUIC_OPENSSL_API                 1
 
@@ -128,6 +133,12 @@ struct ngx_quic_stream_s {
 
 
 void ngx_quic_recvmsg(ngx_event_t *ev);
+#if (NGX_WIN32)
+void ngx_quic_iocp_dispatch(struct ngx_listening_s *ls, u_char *data,
+    size_t size,
+    struct sockaddr *sockaddr, socklen_t socklen,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen);
+#endif
 void ngx_quic_run(ngx_connection_t *c, ngx_quic_conf_t *conf);
 ngx_connection_t *ngx_quic_open_stream(ngx_connection_t *c, ngx_uint_t bidi);
 void ngx_quic_finalize_connection(ngx_connection_t *c, ngx_uint_t err,

@@ -29,6 +29,8 @@ static void ngx_mail_proxy_imap_handler(ngx_event_t *rev);
 static void ngx_mail_proxy_smtp_handler(ngx_event_t *rev);
 static void ngx_mail_proxy_write_handler(ngx_event_t *wev);
 static ngx_int_t ngx_mail_proxy_send_proxy_protocol(ngx_mail_session_t *s);
+static ssize_t ngx_mail_proxy_send_command(ngx_connection_t *c,
+    ngx_str_t *line);
 static ngx_int_t ngx_mail_proxy_read_response(ngx_mail_session_t *s,
     ngx_uint_t state);
 static void ngx_mail_proxy_handler(ngx_event_t *ev);
@@ -344,7 +346,7 @@ ngx_mail_proxy_pop3_handler(ngx_event_t *rev)
         break;
     }
 
-    if (c->send(c, line.data, line.len) < (ssize_t) line.len) {
+    if (ngx_mail_proxy_send_command(c, &line) < (ssize_t) line.len) {
         /*
          * we treat the incomplete sending as NGX_ERROR
          * because it is very strange here
@@ -505,7 +507,7 @@ ngx_mail_proxy_imap_handler(ngx_event_t *rev)
         break;
     }
 
-    if (c->send(c, line.data, line.len) < (ssize_t) line.len) {
+    if (ngx_mail_proxy_send_command(c, &line) < (ssize_t) line.len) {
         /*
          * we treat the incomplete sending as NGX_ERROR
          * because it is very strange here
@@ -854,7 +856,7 @@ ngx_mail_proxy_smtp_handler(ngx_event_t *rev)
         break;
     }
 
-    if (c->send(c, line.data, line.len) < (ssize_t) line.len) {
+    if (ngx_mail_proxy_send_command(c, &line) < (ssize_t) line.len) {
         /*
          * we treat the incomplete sending as NGX_ERROR
          * because it is very strange here
@@ -900,6 +902,19 @@ ngx_mail_proxy_write_handler(ngx_event_t *wev)
     if (c->read->ready) {
         ngx_post_event(c->read, &ngx_posted_events);
     }
+}
+
+
+static ssize_t
+ngx_mail_proxy_send_command(ngx_connection_t *c, ngx_str_t *line)
+{
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        return ngx_wsasend(c, line->data, line->len);
+    }
+#endif
+
+    return c->send(c, line->data, line->len);
 }
 
 

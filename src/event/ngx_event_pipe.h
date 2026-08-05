@@ -20,6 +20,10 @@ typedef ngx_int_t (*ngx_event_pipe_input_filter_pt)(ngx_event_pipe_t *p,
                                                     ngx_buf_t *buf);
 typedef ngx_int_t (*ngx_event_pipe_output_filter_pt)(void *data,
                                                      ngx_chain_t *chain);
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_COMPAT)
+typedef void (*ngx_event_pipe_aio_handler_pt)(ngx_event_pipe_t *p,
+                                              ngx_file_t *file);
+#endif
 
 
 struct ngx_event_pipe_s {
@@ -52,6 +56,10 @@ struct ngx_event_pipe_s {
                                                       ngx_file_t *file);
     void                             *thread_ctx;
     ngx_thread_task_t                *thread_task;
+#endif
+
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_COMPAT)
+    ngx_event_pipe_aio_handler_pt   aio_handler;
 #endif
 
     unsigned           read:1;

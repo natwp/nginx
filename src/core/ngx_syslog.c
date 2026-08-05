@@ -303,6 +303,12 @@ ngx_syslog_send(ngx_syslog_peer_t *peer, u_char *buf, size_t len)
         }
     }
 
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        n = ngx_wsasend(&peer->conn, buf, len);
+
+    } else
+#endif
     if (ngx_send) {
         n = ngx_send(&peer->conn, buf, len);
 

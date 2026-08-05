@@ -16,17 +16,6 @@
 #define NGX_INVALID_INDEX  0xd0d0d0d0
 
 
-#if (NGX_HAVE_IOCP)
-
-typedef struct {
-    WSAOVERLAPPED    ovlp;
-    ngx_event_t     *event;
-    int              error;
-} ngx_event_ovlp_t;
-
-#endif
-
-
 struct ngx_event_s {
     void            *data;
 
@@ -104,7 +93,14 @@ struct ngx_event_s {
 
 
 #if (NGX_HAVE_IOCP)
-    ngx_event_ovlp_t ovlp;
+    ngx_iocp_op_t   *iocp_op;
+    ngx_pool_t      *iocp_pool;
+    u_char          *iocp_buffer;
+    size_t           iocp_buffer_size;
+    size_t           iocp_buffer_pos;
+    size_t           iocp_bytes;
+    ngx_err_t        iocp_error;
+    size_t           iocp_expected;
 #endif
 
     ngx_uint_t       index;
@@ -158,6 +154,21 @@ struct ngx_event_aio_s {
 
     ngx_aiocb_t                aiocb;
     ngx_event_t                event;
+
+#if (NGX_WIN32)
+    ngx_iocp_owner_t          *iocp;
+    ngx_pool_t                *owner_pool;
+    ngx_pool_t                *pool;
+    ngx_chain_t               *write_chain;
+    u_char                    *write_pos;
+    off_t                      write_offset;
+    size_t                     write_remaining;
+    size_t                     write_total;
+    size_t                     write_expected;
+    ngx_uint_t                 access;
+    unsigned                   writing:1;
+    unsigned                   scalar:1;
+#endif
 };
 
 #endif

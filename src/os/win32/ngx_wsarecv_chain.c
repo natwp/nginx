@@ -13,18 +13,44 @@
 #define NGX_WSABUFS  64
 
 
+typedef struct {
+    ngx_iocp_op_t  op;
+    WSABUF         wsabuf;
+    u_char        *buffer;
+} ngx_iocp_wsarecv_chain_op_t;
+
+
+static void ngx_iocp_wsarecv_chain_complete(ngx_iocp_op_t *base);
+static void ngx_iocp_wsarecv_chain_cleanup(ngx_iocp_op_t *base);
+static ssize_t ngx_iocp_wsarecv_chain_copy(ngx_event_t *rev,
+    ngx_chain_t *chain, off_t limit);
+
+
 ssize_t
 ngx_wsarecv_chain(ngx_connection_t *c, ngx_chain_t *chain, off_t limit)
 {
     int           rc;
     u_char       *prev;
     u_long        bytes, flags;
-    size_t        n, size;
+    size_t        max, n, size;
     ngx_err_t     err;
     ngx_array_t   vec;
     ngx_event_t  *rev;
     LPWSABUF      wsabuf;
     WSABUF        wsabufs[NGX_WSABUFS];
+
+    if (limit < 0) {
+        c->read->error = 1;
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "negative receive chain limit");
+        return NGX_ERROR;
+    }
+
+    max = ngx_min((size_t) NGX_MAX_UINT32_VALUE,
+                  (size_t) NGX_MAX_SIZE_T_VALUE);
+    if (limit == 0 || (uint64_t) limit > (uint64_t) max) {
+        limit = (off_t) max;
+    }
 
     prev = NULL;
     wsabuf = NULL;
@@ -41,19 +67,40 @@ ngx_wsarecv_chain(ngx_connection_t *c, ngx_chain_t *chain, off_t limit)
     /* coalesce the neighbouring bufs */
 
     while (chain) {
-        n = chain->buf->end - chain->buf->last;
+        if (chain->buf == NULL || chain->buf->last == NULL
+            || chain->buf->end == NULL || chain->buf->end < chain->buf->last)
+        {
+            c->read->error = 1;
+            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                          "invalid buffer range in WSARecv chain");
+            return NGX_ERROR;
+        }
+
+        n = (size_t) (chain->buf->end - chain->buf->last);
 
         if (limit) {
             if (size >= (size_t) limit) {
                 break;
             }
 
-            if (size + n > (size_t) limit) {
+            if (n > (size_t) limit - size) {
                 n = (size_t) limit - size;
             }
         }
 
+        if (n == 0) {
+            chain = chain->next;
+            continue;
+        }
+
         if (prev == chain->buf->last) {
+            if (n > (size_t) NGX_MAX_UINT32_VALUE - wsabuf->len) {
+                c->read->error = 1;
+                ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                              "oversized WSARecv chain");
+                return NGX_ERROR;
+            }
+
             wsabuf->len += n;
 
         } else {
@@ -71,12 +118,16 @@ ngx_wsarecv_chain(ngx_connection_t *c, ngx_chain_t *chain, off_t limit)
         }
 
         size += n;
-        prev = chain->buf->end;
+        prev = chain->buf->last + n;
         chain = chain->next;
     }
 
+    if (vec.nelts == 0) {
+        return 0;
+    }
+
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
-                   "WSARecv: %d:%d", vec.nelts, wsabuf->len);
+                   "WSARecv: %ui:%ul", vec.nelts, wsabuf->len);
 
 
     rc = WSARecv(c->fd, vec.elts, vec.nelts, &bytes, &flags, NULL, NULL);
@@ -144,4 +195,302 @@ ngx_wsarecv_chain(ngx_connection_t *c, ngx_chain_t *chain, off_t limit)
     }
 
     return bytes;
+}
+
+
+ssize_t
+ngx_overlapped_wsarecv_chain(ngx_connection_t *c, ngx_chain_t *chain,
+    off_t limit)
+{
+    int                            rc;
+    u_long                         bytes, expected;
+    size_t                         max, n, size;
+    ngx_err_t                      err;
+    ngx_pool_t                    *pool;
+    ngx_event_t                   *rev;
+    ngx_iocp_wsarecv_chain_op_t   *op;
+
+    if (limit < 0) {
+        rev = c->read;
+        rev->error = 1;
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "negative receive chain limit");
+        return NGX_ERROR;
+    }
+
+    max = ngx_min((size_t) NGX_MAX_UINT32_VALUE,
+                  (size_t) NGX_MAX_SIZE_T_VALUE);
+    max = ngx_min(max, (size_t) NGX_IOCP_READ_LIMIT);
+    if (limit == 0 || (uint64_t) limit > (uint64_t) max) {
+        limit = (off_t) max;
+    }
+
+    rev = c->read;
+
+    if (!rev->complete && rev->iocp_error) {
+        err = rev->iocp_error;
+        rev->iocp_error = 0;
+        rev->error = 1;
+        (void) ngx_connection_error(c, err, "overlapped read failed");
+        return NGX_ERROR;
+    }
+
+    if (rev->complete) {
+        rev->complete = 0;
+        rev->active = 0;
+
+        err = rev->iocp_error;
+        rev->iocp_error = 0;
+
+        bytes = (u_long) rev->iocp_bytes;
+        rev->iocp_bytes = 0;
+        rev->available = 0;
+        expected = (u_long) rev->iocp_expected;
+        rev->iocp_expected = 0;
+
+        if (err) {
+            rev->error = 1;
+            ngx_connection_error(c, err, "WSARecv() failed");
+            return NGX_ERROR;
+        }
+
+        if (bytes > expected) {
+            rev->error = 1;
+            ngx_connection_error(c, WSAEMSGSIZE,
+                                 "WSARecv() chain returned too much data");
+            return NGX_ERROR;
+        }
+
+        if (bytes == 0) {
+            rev->ready = 0;
+            rev->eof = 1;
+        } else {
+            rev->ready = 1;
+
+            if (rev->iocp_buffer == NULL
+                || rev->iocp_buffer_size != bytes)
+            {
+                rev->error = 1;
+                ngx_connection_error(c, WSAEINVAL,
+                                     "WSARecv() chain lost completed data");
+                return NGX_ERROR;
+            }
+        }
+
+        return ngx_iocp_wsarecv_chain_copy(rev, chain, limit);
+    }
+
+    if (rev->iocp_buffer) {
+        return ngx_iocp_wsarecv_chain_copy(rev, chain, limit);
+    }
+
+    if (rev->iocp_op) {
+        return NGX_AGAIN;
+    }
+
+    if (c->iocp == NULL && ngx_iocp_add_connection(c) != NGX_OK) {
+        rev->error = 1;
+        return NGX_ERROR;
+    }
+
+    size = 0;
+
+    while (chain && size < max) {
+        if (chain->buf == NULL || chain->buf->last == NULL
+            || chain->buf->end == NULL || chain->buf->end < chain->buf->last)
+        {
+            rev->error = 1;
+            ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                          "invalid buffer range in overlapped WSARecv chain");
+            return NGX_ERROR;
+        }
+
+        n = (size_t) (chain->buf->end - chain->buf->last);
+
+        if (limit) {
+            if (size >= (size_t) limit) {
+                break;
+            }
+
+            if (n > (size_t) limit - size) {
+                n = (size_t) limit - size;
+            }
+        }
+
+        if (n == 0) {
+            chain = chain->next;
+            continue;
+        }
+
+        if (n > max - size) {
+            n = max - size;
+        }
+
+        size += n;
+        chain = chain->next;
+    }
+
+    if (size == 0) {
+        return 0;
+    }
+
+    pool = rev->iocp_pool ? rev->iocp_pool : c->pool;
+
+    op = (ngx_iocp_wsarecv_chain_op_t *)
+         ngx_iocp_op_create(sizeof(ngx_iocp_wsarecv_chain_op_t), c->iocp,
+                            rev, pool, NGX_IOCP_OP_RECV_CHAIN,
+                            ngx_iocp_wsarecv_chain_complete,
+                            ngx_iocp_wsarecv_chain_cleanup);
+    if (op == NULL) {
+        rev->error = 1;
+        return NGX_ERROR;
+    }
+
+    op->buffer = ngx_alloc(size, c->log);
+    if (op->buffer == NULL) {
+        ngx_iocp_op_abort(&op->op);
+        rev->error = 1;
+        return NGX_ERROR;
+    }
+
+    op->wsabuf.buf = (char *) op->buffer;
+    op->wsabuf.len = (u_long) size;
+
+    op->op.flags = 0;
+    op->op.bytes = 0;
+    op->op.expected = (DWORD) size;
+
+    rc = WSARecv(c->fd, &op->wsabuf, 1, &op->op.bytes,
+                 &op->op.flags, &op->op.overlapped, NULL);
+
+    rev->complete = 0;
+    rev->active = 1;
+    rev->ready = 0;
+
+    ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "WSARecv chain ovlp: fd:%d rc:%d size:%uz",
+                   c->fd, rc, size);
+
+    if (rc == -1) {
+        err = ngx_socket_errno;
+
+        if (err == WSA_IO_PENDING) {
+            return NGX_AGAIN;
+        }
+
+        rev->active = 0;
+        rev->ready = 1;
+        rev->error = 1;
+        ngx_iocp_op_abort(&op->op);
+        ngx_connection_error(c, err, "WSARecv() failed");
+
+        return NGX_ERROR;
+    }
+
+    return NGX_AGAIN;
+}
+
+
+static void
+ngx_iocp_wsarecv_chain_complete(ngx_iocp_op_t *base)
+{
+    ngx_event_t                   *rev;
+    ngx_iocp_wsarecv_chain_op_t   *op;
+
+    op = (ngx_iocp_wsarecv_chain_op_t *) base;
+    rev = base->event;
+
+    if (base->error == 0 && base->bytes) {
+        if (rev->iocp_buffer) {
+            base->error = WSAEINVAL;
+
+        } else {
+            rev->iocp_buffer = op->buffer;
+            rev->iocp_buffer_size = base->bytes;
+            rev->iocp_buffer_pos = 0;
+            op->buffer = NULL;
+        }
+    }
+
+    ngx_iocp_event_complete(base);
+}
+
+
+static void
+ngx_iocp_wsarecv_chain_cleanup(ngx_iocp_op_t *base)
+{
+    ngx_iocp_wsarecv_chain_op_t  *op;
+
+    op = (ngx_iocp_wsarecv_chain_op_t *) base;
+
+    if (op->buffer) {
+        ngx_free(op->buffer);
+        op->buffer = NULL;
+    }
+}
+
+
+static ssize_t
+ngx_iocp_wsarecv_chain_copy(ngx_event_t *rev, ngx_chain_t *chain,
+    off_t limit)
+{
+    size_t       available, copied, n, size;
+    ngx_buf_t   *b;
+
+    if (rev->iocp_buffer_pos > rev->iocp_buffer_size) {
+        rev->error = 1;
+        return NGX_ERROR;
+    }
+
+    available = rev->iocp_buffer_size - rev->iocp_buffer_pos;
+
+    if (available == 0) {
+        return rev->eof ? 0 : NGX_AGAIN;
+    }
+    copied = 0;
+
+    while (chain && copied < available) {
+        b = chain->buf;
+
+        if (b == NULL || b->last == NULL || b->end == NULL
+            || b->end < b->last)
+        {
+            rev->error = 1;
+            return NGX_ERROR;
+        }
+
+        size = (size_t) (b->end - b->last);
+
+        if (limit) {
+            if ((off_t) copied >= limit) {
+                break;
+            }
+
+            if (size > (size_t) (limit - (off_t) copied)) {
+                size = (size_t) (limit - copied);
+            }
+        }
+
+        n = ngx_min(size, available - copied);
+
+        if (n) {
+            ngx_memcpy(b->last,
+                       rev->iocp_buffer + rev->iocp_buffer_pos + copied, n);
+            copied += n;
+        }
+
+        chain = chain->next;
+    }
+
+    rev->iocp_buffer_pos += copied;
+
+    if (rev->iocp_buffer_pos == rev->iocp_buffer_size) {
+        ngx_free(rev->iocp_buffer);
+        rev->iocp_buffer = NULL;
+        rev->iocp_buffer_size = 0;
+        rev->iocp_buffer_pos = 0;
+        rev->ready = 0;
+    }
+
+    return copied ? (ssize_t) copied : (rev->eof ? 0 : NGX_AGAIN);
 }

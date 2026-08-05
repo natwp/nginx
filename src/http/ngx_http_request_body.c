@@ -26,6 +26,10 @@ static ngx_int_t ngx_http_request_body_length_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_request_body_chunked_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+static void ngx_http_request_body_aio_handler(ngx_http_request_t *r);
+static void ngx_http_request_body_aio_event_handler(ngx_event_t *ev);
+#endif
 
 
 ngx_int_t
@@ -277,6 +281,12 @@ ngx_http_read_client_request_body_handler(ngx_http_request_t *r)
 {
     ngx_int_t  rc;
 
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+    if (r->aio) {
+        return;
+    }
+#endif
+
     if (r->connection->read->timedout) {
         r->connection->timedout = 1;
         ngx_http_finalize_request(r, NGX_HTTP_REQUEST_TIME_OUT);
@@ -374,7 +384,15 @@ ngx_http_do_read_client_request_body(ngx_http_request_t *r)
                 break;
             }
 
+#if (NGX_HAVE_IOCP)
+            c->read->iocp_pool = r->pool;
+#endif
+
             n = c->recv(c, rb->buf->last, size);
+
+#if (NGX_HAVE_IOCP)
+            c->read->iocp_pool = NULL;
+#endif
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                            "http client request body recv %z", n);
@@ -548,7 +566,7 @@ static ngx_int_t
 ngx_http_write_request_body(ngx_http_request_t *r)
 {
     ssize_t                    n;
-    ngx_chain_t               *cl, *ln;
+    ngx_chain_t               *chain, *cl, *ln;
     ngx_temp_file_t           *tf;
     ngx_http_request_body_t   *rb;
     ngx_http_core_loc_conf_t  *clcf;
@@ -574,6 +592,12 @@ ngx_http_write_request_body(ngx_http_request_t *r)
         tf->log_level = r->request_body_file_log_level;
         tf->persistent = r->request_body_in_persistent_file;
         tf->clean = r->request_body_in_clean_file;
+
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+        if (clcf->aio == NGX_HTTP_AIO_ON && clcf->aio_write) {
+            tf->aio_write = 1;
+        }
+#endif
 
         if (r->request_body_file_group_access) {
             tf->access = 0660;
@@ -601,12 +625,35 @@ ngx_http_write_request_body(ngx_http_request_t *r)
         return NGX_OK;
     }
 
-    n = ngx_write_chain_to_temp_file(rb->temp_file, rb->bufs);
+    chain = rb->bufs;
+
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+    if (rb->temp_file->file.aio) {
+        if (!rb->temp_file->file.aio->event.ready) {
+            return NGX_AGAIN;
+        }
+
+        if (rb->temp_file->file.aio->event.complete) {
+            chain = NULL;
+        }
+    }
+#endif
+
+    n = ngx_write_chain_to_temp_file(rb->temp_file, chain);
 
     /* TODO: n == 0 or not complete and level event */
 
     if (n == NGX_ERROR) {
         return NGX_ERROR;
+    }
+
+    if (n == NGX_AGAIN) {
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+        if (rb->temp_file->aio_write) {
+            ngx_http_request_body_aio_handler(r);
+        }
+#endif
+        return NGX_AGAIN;
     }
 
     rb->temp_file->offset += n;
@@ -626,6 +673,114 @@ ngx_http_write_request_body(ngx_http_request_t *r)
 
     return NGX_OK;
 }
+
+
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+
+static void
+ngx_http_request_body_aio_handler(ngx_http_request_t *r)
+{
+    ngx_event_aio_t  *aio;
+
+    aio = r->request_body->temp_file->file.aio;
+
+    if (r->aio) {
+        return;
+    }
+
+    aio->data = r;
+    aio->handler = ngx_http_request_body_aio_event_handler;
+
+    r->read_event_handler = ngx_http_read_client_request_body_handler;
+    r->write_event_handler = ngx_http_request_empty_handler;
+
+    if (r->connection->read->timer_set) {
+        ngx_del_timer(r->connection->read);
+    }
+
+    ngx_add_timer(&aio->event, 60000);
+
+    r->main->blocked++;
+    r->aio = 1;
+}
+
+
+static void
+ngx_http_request_body_aio_event_handler(ngx_event_t *ev)
+{
+    ngx_int_t                  rc;
+    ngx_event_aio_t           *aio;
+    ngx_connection_t          *c;
+    ngx_http_request_t        *r;
+    ngx_http_request_body_t   *rb;
+
+    aio = ev->data;
+    r = aio->data;
+    c = r->connection;
+
+    ngx_http_set_log_request(c->log, r);
+
+    if (ev->timedout) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "request body file AIO operation took too long");
+        ev->timedout = 0;
+        return;
+    }
+
+    if (ev->timer_set) {
+        ngx_del_timer(ev);
+    }
+
+    r->main->blocked--;
+    r->aio = 0;
+
+    if (r->done || r->main->terminated) {
+        c->write->handler(c->write);
+        return;
+    }
+
+    rc = ngx_http_request_body_filter(r, NULL);
+
+    if (rc == NGX_AGAIN) {
+        return;
+    }
+
+    if (rc != NGX_OK) {
+        ngx_http_finalize_request(r, rc >= NGX_HTTP_SPECIAL_RESPONSE
+                                     ? rc : NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    rb = r->request_body;
+
+    if (rb->rest == 0 && rb->last_saved) {
+        if (rb->buf
+            && ngx_http_copy_pipelined_header(r, rb->buf) != NGX_OK)
+        {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        if (c->read->timer_set) {
+            ngx_del_timer(c->read);
+        }
+
+        r->request_body_no_buffering = 0;
+        r->read_event_handler = ngx_http_block_reading;
+        rb->post_handler(r);
+        ngx_http_run_posted_requests(c);
+        return;
+    }
+
+    rc = ngx_http_do_read_client_request_body(r);
+
+    if (rc >= NGX_HTTP_SPECIAL_RESPONSE || rc == NGX_ERROR) {
+        ngx_http_finalize_request(r, rc == NGX_ERROR
+                                     ? NGX_HTTP_INTERNAL_SERVER_ERROR : rc);
+    }
+}
+
+#endif
 
 
 ngx_int_t
@@ -971,9 +1126,19 @@ ngx_http_test_expect(ngx_http_request_t *r)
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "send 100 Continue");
 
-    n = r->connection->send(r->connection,
-                            (u_char *) "HTTP/1.1 100 Continue" CRLF CRLF,
-                            sizeof("HTTP/1.1 100 Continue" CRLF CRLF) - 1);
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        n = ngx_wsasend(r->connection,
+                        (u_char *) "HTTP/1.1 100 Continue" CRLF CRLF,
+                        sizeof("HTTP/1.1 100 Continue" CRLF CRLF) - 1);
+
+    } else
+#endif
+    {
+        n = r->connection->send(r->connection,
+                                (u_char *) "HTTP/1.1 100 Continue" CRLF CRLF,
+                                sizeof("HTTP/1.1 100 Continue" CRLF CRLF) - 1);
+    }
 
     if (n == sizeof("HTTP/1.1 100 Continue" CRLF CRLF) - 1) {
         return NGX_OK;
@@ -1274,6 +1439,7 @@ ngx_int_t
 ngx_http_request_body_save_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
     ngx_buf_t                 *b;
+    ngx_int_t                  rc;
     ngx_chain_t               *cl, *tl, **ll;
     ngx_http_request_body_t   *rb;
 
@@ -1339,10 +1505,13 @@ ngx_http_request_body_save_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     if (rb->rest > 0) {
 
-        if (rb->bufs && rb->buf && rb->buf->last == rb->buf->end
-            && ngx_http_write_request_body(r) != NGX_OK)
-        {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        if (rb->bufs && rb->buf && rb->buf->last == rb->buf->end) {
+            rc = ngx_http_write_request_body(r);
+
+            if (rc != NGX_OK) {
+                return (rc == NGX_AGAIN) ? NGX_AGAIN
+                                         : NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
         }
 
         return NGX_OK;
@@ -1360,8 +1529,11 @@ ngx_http_request_body_save_filter(ngx_http_request_t *r, ngx_chain_t *in)
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
-        if (ngx_http_write_request_body(r) != NGX_OK) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        rc = ngx_http_write_request_body(r);
+
+        if (rc != NGX_OK) {
+            return (rc == NGX_AGAIN) ? NGX_AGAIN
+                                     : NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
 
         if (rb->temp_file->file.offset != 0) {

@@ -1040,12 +1040,10 @@ ngx_stream_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-#if !(NGX_WIN32)
         if (ngx_strcmp(value[i].data, "udp") == 0) {
             lsopt.type = SOCK_DGRAM;
             continue;
         }
-#endif
 
         if (ngx_strcmp(value[i].data, "bind") == 0) {
             lsopt.set = 1;

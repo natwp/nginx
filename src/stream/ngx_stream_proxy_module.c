@@ -1856,6 +1856,17 @@ ngx_stream_proxy_test_connect(ngx_connection_t *c)
     int        err;
     socklen_t  len;
 
+#if (NGX_HAVE_IOCP)
+
+    if ((ngx_event_flags & NGX_USE_IOCP_EVENT) && c->write->iocp_error) {
+        err = c->write->iocp_error;
+        c->write->iocp_error = 0;
+        (void) ngx_connection_error(c, err, "ConnectEx() failed");
+        return NGX_ERROR;
+    }
+
+#endif
+
 #if (NGX_HAVE_KQUEUE)
 
     if (ngx_event_flags & NGX_USE_KQUEUE_EVENT)  {

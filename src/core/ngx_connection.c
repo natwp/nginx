@@ -72,9 +72,7 @@ ngx_create_listening(ngx_conf_t *cf, struct sockaddr *sockaddr,
 
     ngx_memcpy(ls->addr_text.data, text, len);
 
-#if !(NGX_WIN32)
     ngx_rbtree_init(&ls->rbtree, &ls->sentinel, ngx_udp_rbtree_insert_value);
-#endif
 
     ls->fd = (ngx_socket_t) -1;
     ls->type = SOCK_STREAM;
@@ -1131,18 +1129,44 @@ ngx_close_listening_sockets(ngx_cycle_t *cycle)
     ngx_listening_t   *ls;
     ngx_connection_t  *c;
 
-    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
-        return;
-    }
-
     ngx_accept_mutex_held = 0;
     ngx_use_accept_mutex = 0;
 
     ls = cycle->listening.elts;
     for (i = 0; i < cycle->listening.nelts; i++) {
 
+#if (NGX_HAVE_IOCP)
+
+        if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
 #if (NGX_QUIC)
+            if (ls[i].quic && ngx_process != NGX_PROCESS_MASTER) {
+                continue;
+            }
+#endif
+
+            c = ls[i].connection;
+
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                           "close IOCP listening %V #%d ",
+                           &ls[i].addr_text, ls[i].fd);
+
+            if (c && c->fd != (ngx_socket_t) -1) {
+                ngx_close_connection(c);
+                ls[i].connection = NULL;
+            }
+
+            ls[i].fd = (ngx_socket_t) -1;
+            continue;
+        }
+
+#endif
+
+#if (NGX_QUIC)
+#if (NGX_WIN32)
+        if (ls[i].quic && ngx_process != NGX_PROCESS_MASTER) {
+#else
         if (ls[i].quic) {
+#endif
             continue;
         }
 #endif
@@ -1276,7 +1300,9 @@ ngx_free_connection(ngx_connection_t *c)
     ngx_cycle->free_connections = c;
     ngx_cycle->free_connection_n++;
 
-    if (ngx_cycle->files && ngx_cycle->files[c->fd] == c) {
+    if (c->fd != (ngx_socket_t) -1
+        && ngx_cycle->files && ngx_cycle->files[c->fd] == c)
+    {
         ngx_cycle->files[c->fd] = NULL;
     }
 }
@@ -1329,6 +1355,15 @@ ngx_close_connection(ngx_connection_t *c)
     c->write->closed = 1;
 
     ngx_reusable_connection(c, 0);
+
+#if (NGX_HAVE_IOCP)
+
+    if (c->iocp) {
+        ngx_iocp_close_connection(c);
+        return;
+    }
+
+#endif
 
     log_error = c->log_error;
 

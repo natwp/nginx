@@ -11,7 +11,7 @@
 
 #undef  WIN32
 #define WIN32         0x0400
-#define _WIN32_WINNT  0x0501
+#define _WIN32_WINNT  0x0602
 
 
 #define STRICT
@@ -136,6 +136,11 @@ typedef long  time_t;
 
 
 #include <ngx_auto_config.h>
+
+
+#if (NGX_HAVE_FILE_AIO)
+typedef OVERLAPPED  ngx_aiocb_t;
+#endif
 
 
 #define ngx_inline          __inline

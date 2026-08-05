@@ -80,6 +80,11 @@ static void
 static void
     ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
     ngx_uint_t do_write);
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+static void ngx_http_upstream_aio_write_handler(ngx_event_pipe_t *p,
+    ngx_file_t *file);
+static void ngx_http_upstream_aio_write_event_handler(ngx_event_t *ev);
+#endif
 #if (NGX_THREADS)
 static ngx_int_t ngx_http_upstream_thread_handler(ngx_thread_task_t *task,
     ngx_file_t *file);
@@ -1643,6 +1648,13 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
     c = u->peer.connection;
 
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        c->read->iocp_pool = r->pool;
+        c->write->iocp_pool = r->pool;
+    }
+#endif
+
     c->requests++;
 
     c->data = r;
@@ -3027,6 +3039,18 @@ ngx_http_upstream_test_connect(ngx_connection_t *c)
     int        err;
     socklen_t  len;
 
+#if (NGX_HAVE_IOCP)
+
+    if ((ngx_event_flags & NGX_USE_IOCP_EVENT) && c->write->iocp_error) {
+        err = c->write->iocp_error;
+        c->write->iocp_error = 0;
+        c->log->action = "connecting to upstream";
+        (void) ngx_connection_error(c, err, "ConnectEx() failed");
+        return NGX_ERROR;
+    }
+
+#endif
+
 #if (NGX_HAVE_KQUEUE)
 
     if (ngx_event_flags & NGX_USE_KQUEUE_EVENT)  {
@@ -3533,6 +3557,13 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     p->max_temp_file_size = u->conf->max_temp_file_size;
     p->temp_file_write_size = u->conf->temp_file_write_size;
 
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+    if (clcf->aio == NGX_HTTP_AIO_ON && clcf->aio_write) {
+        p->temp_file->aio_write = 1;
+        p->aio_handler = ngx_http_upstream_aio_write_handler;
+    }
+#endif
+
 #if (NGX_THREADS)
     if (clcf->aio == NGX_HTTP_AIO_THREADS && clcf->aio_write) {
         p->thread_handler = ngx_http_upstream_thread_handler;
@@ -3640,6 +3671,13 @@ ngx_http_upstream_upgrade(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->write_event_handler = ngx_http_upstream_upgraded_write_upstream;
     r->read_event_handler = ngx_http_upstream_upgraded_read_downstream;
     r->write_event_handler = ngx_http_upstream_upgraded_write_downstream;
+
+#if (NGX_HAVE_IOCP)
+    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+        c->read->iocp_pool = r->pool;
+        c->write->iocp_pool = r->pool;
+    }
+#endif
 
     if (clcf->tcp_nodelay) {
 
@@ -4145,6 +4183,83 @@ ngx_http_upstream_non_buffered_filter(void *data, ssize_t bytes)
 }
 
 
+#if (NGX_HAVE_FILE_AIO && NGX_WIN32)
+
+static void
+ngx_http_upstream_aio_write_handler(ngx_event_pipe_t *p, ngx_file_t *file)
+{
+    ngx_http_request_t  *r;
+
+    r = p->output_ctx;
+
+    file->aio->data = r;
+    file->aio->handler = ngx_http_upstream_aio_write_event_handler;
+
+    ngx_add_timer(&file->aio->event, 60000);
+
+    r->main->blocked++;
+    r->aio = 1;
+    p->aio = 1;
+}
+
+
+static void
+ngx_http_upstream_aio_write_event_handler(ngx_event_t *ev)
+{
+    ngx_event_aio_t     *aio;
+    ngx_event_pipe_t    *p;
+    ngx_connection_t    *c;
+    ngx_http_request_t  *r;
+
+    aio = ev->data;
+    r = aio->data;
+    c = r->connection;
+    p = r->upstream ? r->upstream->pipe : NULL;
+
+    ngx_http_set_log_request(c->log, r);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http upstream file aio: \"%V?%V\"", &r->uri, &r->args);
+
+    if (ev->timedout) {
+        ngx_log_error(NGX_LOG_ALERT, c->log, 0,
+                      "file AIO operation took too long");
+        ev->timedout = 0;
+        return;
+    }
+
+    if (ev->timer_set) {
+        ngx_del_timer(ev);
+    }
+
+    r->main->blocked--;
+    r->aio = 0;
+
+    if (p) {
+        p->aio = 0;
+    }
+
+#if (NGX_HTTP_V2)
+
+    if (r->stream) {
+        c->write->ready = 1;
+        c->write->active = 0;
+    }
+
+#endif
+
+    if (r->done || r->main->terminated) {
+        c->write->handler(c->write);
+
+    } else {
+        r->write_event_handler(r);
+        ngx_http_run_posted_requests(c);
+    }
+}
+
+#endif
+
+
 #if (NGX_THREADS)
 
 static ngx_int_t
@@ -4313,7 +4428,7 @@ ngx_http_upstream_process_downstream(ngx_http_request_t *r)
 
     c->log->action = "sending to client";
 
-#if (NGX_THREADS)
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_THREADS)
     p->aio = r->aio;
 #endif
 
@@ -4402,7 +4517,7 @@ ngx_http_upstream_process_request(ngx_http_request_t *r,
 
     p = u->pipe;
 
-#if (NGX_THREADS)
+#if ((NGX_HAVE_FILE_AIO && NGX_WIN32) || NGX_THREADS)
 
     if (p->writing && !p->aio) {
 
@@ -4609,6 +4724,11 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
 
         if (u->peer.connection) {
             u->state->bytes_sent = u->peer.connection->sent;
+
+#if (NGX_HAVE_IOCP)
+            u->peer.connection->read->iocp_pool = NULL;
+            u->peer.connection->write->iocp_pool = NULL;
+#endif
         }
 
         if (ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_403
@@ -4733,6 +4853,10 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "close http upstream connection: %d",
                        u->peer.connection->fd);
+#if (NGX_HAVE_IOCP)
+        u->peer.connection->read->iocp_pool = NULL;
+        u->peer.connection->write->iocp_pool = NULL;
+#endif
 #if (NGX_HTTP_SSL)
 
         if (u->peer.connection->ssl) {
@@ -4785,6 +4909,16 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     *u->cleanup = NULL;
     u->cleanup = NULL;
 
+#if (NGX_HAVE_IOCP)
+    if (r->connection->read->iocp_pool == r->pool) {
+        r->connection->read->iocp_pool = NULL;
+    }
+
+    if (r->connection->write->iocp_pool == r->pool) {
+        r->connection->write->iocp_pool = NULL;
+    }
+#endif
+
     if (u->resolved && u->resolved->ctx) {
         ngx_resolve_name_done(u->resolved->ctx);
         u->resolved->ctx = NULL;
@@ -4807,6 +4941,13 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     u->finalize_request(r, rc);
 
     if (u->peer.free && u->peer.sockaddr) {
+#if (NGX_HAVE_IOCP)
+        if (u->peer.connection) {
+            u->peer.connection->read->iocp_pool = NULL;
+            u->peer.connection->write->iocp_pool = NULL;
+        }
+#endif
+
         u->peer.free(&u->peer, u->peer.data, 0);
         u->peer.sockaddr = NULL;
 
@@ -4816,6 +4957,11 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     }
 
     if (u->peer.connection) {
+
+#if (NGX_HAVE_IOCP)
+        u->peer.connection->read->iocp_pool = NULL;
+        u->peer.connection->write->iocp_pool = NULL;
+#endif
 
 #if (NGX_HTTP_SSL)
 

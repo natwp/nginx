@@ -82,5 +82,11 @@ struct ngx_peer_connection_s {
 ngx_int_t ngx_event_connect_peer(ngx_peer_connection_t *pc);
 ngx_int_t ngx_event_get_peer(ngx_peer_connection_t *pc, void *data);
 
+#if (NGX_HAVE_IOCP)
+ngx_int_t ngx_event_connect_iocp(ngx_connection_t *c,
+    struct sockaddr *sockaddr, socklen_t socklen, ngx_str_t *name,
+    ngx_uint_t bind_socket);
+#endif
+
 
 #endif /* _NGX_EVENT_CONNECT_H_INCLUDED_ */
