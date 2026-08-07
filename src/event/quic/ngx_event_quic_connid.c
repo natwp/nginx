@@ -9,6 +9,10 @@
 #include <ngx_event.h>
 #include <ngx_event_quic_connection.h>
 
+#if (NGX_WIN32)
+#include <ngx_win32_worker.h>
+#endif
+
 #define NGX_QUIC_MAX_SERVER_IDS   8
 
 
@@ -29,6 +33,10 @@ ngx_quic_create_server_id(ngx_connection_t *c, u_char *id)
     if (RAND_bytes(id, NGX_QUIC_SERVER_CID_LEN) != 1) {
         return NGX_ERROR;
     }
+
+#if (NGX_WIN32)
+    ngx_win32_worker_quic_route_id(id, NGX_QUIC_SERVER_CID_LEN);
+#endif
 
 #if (NGX_QUIC_BPF)
     if (ngx_quic_bpf_attach_id(c, id) != NGX_OK) {

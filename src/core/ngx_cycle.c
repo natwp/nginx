@@ -7,6 +7,10 @@
 
 #include <ngx_config.h>
 #include <ngx_core.h>
+
+#if (NGX_WIN32)
+#include <ngx_win32_worker.h>
+#endif
 #include <ngx_event.h>
 
 
@@ -628,6 +632,17 @@ ngx_init_cycle(ngx_cycle_t *old_cycle)
         }
 #endif
     }
+
+#if (NGX_WIN32)
+
+    if (ngx_process == NGX_PROCESS_WORKER
+        && ngx_win32_worker_bootstrap_active
+        && ngx_win32_worker_validate_listeners(cycle) != NGX_OK)
+    {
+        goto failed;
+    }
+
+#endif
 
     if (ngx_open_listening_sockets(cycle) != NGX_OK) {
         goto failed;

@@ -9,6 +9,10 @@
 #include <ngx_event.h>
 #include <ngx_event_quic_connection.h>
 
+#if (NGX_WIN32)
+#include <ngx_win32_worker.h>
+#endif
+
 
 #define NGX_QUIC_MAX_UDP_SEGMENT_BUF  65487 /* 65K - IPv6 header */
 #define NGX_QUIC_MAX_SEGMENTS            64 /* UDP_MAX_SEGMENTS */
@@ -1089,6 +1093,10 @@ ngx_quic_send_retry(ngx_connection_t *c, ngx_quic_conf_t *conf,
     if (RAND_bytes(dcid, NGX_QUIC_SERVER_CID_LEN) != 1) {
         return NGX_ERROR;
     }
+
+#if (NGX_WIN32)
+    ngx_win32_worker_quic_route_id(dcid, NGX_QUIC_SERVER_CID_LEN);
+#endif
 
     pkt.scid.len = NGX_QUIC_SERVER_CID_LEN;
     pkt.scid.data = dcid;

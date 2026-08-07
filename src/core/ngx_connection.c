@@ -424,6 +424,10 @@ ngx_int_t
 ngx_open_listening_sockets(ngx_cycle_t *cycle)
 {
     int               reuseaddr;
+#if (NGX_WIN32)
+    int               exclusiveaddruse;
+    ngx_core_conf_t   *ccf;
+#endif
     ngx_uint_t        i, tries, failed;
     ngx_err_t         err;
     ngx_log_t        *log;
@@ -431,6 +435,10 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
     ngx_listening_t  *ls;
 
     reuseaddr = 1;
+#if (NGX_WIN32)
+    exclusiveaddruse = 1;
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+#endif
 #if (NGX_SUPPRESS_WARN)
     failed = 0;
 #endif
@@ -519,6 +527,23 @@ ngx_open_listening_sockets(ngx_cycle_t *cycle)
 
             if (ls[i].type != SOCK_DGRAM || !ngx_test_config) {
 
+#if (NGX_WIN32)
+                if (ccf && ccf->worker_processes > 1) {
+                    if (setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                                   (const void *) &exclusiveaddruse,
+                                   sizeof(int))
+                        == -1)
+                    {
+                        ngx_log_error(NGX_LOG_EMERG, log, ngx_socket_errno,
+                                      "setsockopt(SO_EXCLUSIVEADDRUSE) %V "
+                                      "failed", &ls[i].addr_text);
+
+                        ngx_close_socket(s);
+                        return NGX_ERROR;
+                    }
+
+                } else
+#endif
                 if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
                                (const void *) &reuseaddr, sizeof(int))
                     == -1)

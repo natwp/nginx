@@ -9,6 +9,9 @@
 #define _NGX_PROCESS_H_INCLUDED_
 
 
+typedef struct ngx_win32_worker_bootstrap_s ngx_win32_worker_bootstrap_t;
+
+
 typedef DWORD               ngx_pid_t;
 #define NGX_INVALID_PID     0
 
@@ -19,7 +22,7 @@ typedef DWORD               ngx_pid_t;
 
 
 #define NGX_PROCESS_SYNC_NAME                                                 \
-    (sizeof("ngx_cache_manager_mutex_") + NGX_INT32_LEN)
+    256
 
 
 typedef uint64_t            ngx_cpuset_t;
@@ -33,6 +36,13 @@ typedef struct {
     HANDLE                  term;
     HANDLE                  quit;
     HANDLE                  reopen;
+    HANDLE                  wait;
+
+    ngx_win32_worker_bootstrap_t *bootstrap;
+
+    ngx_uint_t              slot;
+    ngx_uint_t              generation;
+    ngx_uint_t              role;
 
     u_char                  term_event[NGX_PROCESS_SYNC_NAME];
     u_char                  quit_event[NGX_PROCESS_SYNC_NAME];
@@ -40,6 +50,7 @@ typedef struct {
 
     unsigned                just_spawn:1;
     unsigned                exiting:1;
+    unsigned                ready_state:1;
 } ngx_process_t;
 
 
@@ -49,18 +60,21 @@ typedef struct {
     char                   *args;
     char *const            *argv;
     char *const            *envp;
+    char                   *environment;
     HANDLE                  child;
 } ngx_exec_ctx_t;
 
 
 ngx_pid_t ngx_spawn_process(ngx_cycle_t *cycle, char *name, ngx_int_t respawn);
+ngx_pid_t ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
+    ngx_uint_t slot, ngx_uint_t generation, ngx_uint_t role);
 ngx_pid_t ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx);
 
 #define ngx_debug_point()
 #define ngx_sched_yield()   SwitchToThread()
 
 
-#define NGX_MAX_PROCESSES         (MAXIMUM_WAIT_OBJECTS - 4)
+#define NGX_MAX_PROCESSES         1024
 
 #define NGX_PROCESS_RESPAWN       -2
 #define NGX_PROCESS_JUST_RESPAWN  -3
@@ -72,6 +86,7 @@ extern char               **ngx_os_argv;
 
 extern ngx_int_t            ngx_last_process;
 extern ngx_process_t        ngx_processes[NGX_MAX_PROCESSES];
+extern HANDLE               ngx_process_exit_event;
 
 extern ngx_pid_t            ngx_pid;
 extern ngx_pid_t            ngx_parent;

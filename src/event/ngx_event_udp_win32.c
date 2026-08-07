@@ -13,6 +13,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_event.h>
+#include <ngx_win32_worker.h>
 
 #if (NGX_QUIC)
 #include <ngx_event_quic.h>
@@ -407,16 +408,7 @@ ngx_iocp_udp_recv_complete(ngx_iocp_op_t *base)
         }
     }
 
-#if (NGX_QUIC)
-    if (ls->quic) {
-        ngx_quic_iocp_dispatch(ls, op->data, base->bytes,
-                               (struct sockaddr *) &op->remote, socklen,
-                               local_sockaddr, local_socklen);
-        return;
-    }
-#endif
-
-    (void) ngx_iocp_udp_dispatch(ls, op->data, base->bytes,
+    (void) ngx_iocp_udp_dispatch_datagram(ls, op->data, base->bytes,
                                  (struct sockaddr *) &op->remote, socklen,
                                  local_sockaddr, local_socklen);
 }
@@ -427,6 +419,24 @@ ngx_iocp_udp_recv_cleanup(ngx_iocp_op_t *base)
 {
     /* The receive buffer and WSAMSG are part of the operation allocation. */
     (void) base;
+}
+
+
+ngx_int_t
+ngx_iocp_udp_dispatch_datagram(ngx_listening_t *ls, u_char *data, size_t size,
+    struct sockaddr *sockaddr, socklen_t socklen,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen)
+{
+#if (NGX_QUIC)
+    if (ls->quic) {
+        ngx_quic_iocp_dispatch(ls, data, size, sockaddr, socklen,
+                               local_sockaddr, local_socklen);
+        return NGX_OK;
+    }
+#endif
+
+    return ngx_iocp_udp_dispatch(ls, data, size, sockaddr, socklen,
+                                 local_sockaddr, local_socklen);
 }
 
 
@@ -546,7 +556,9 @@ ngx_iocp_udp_dispatch(ngx_listening_t *ls, u_char *data, size_t size,
 
     c->local_socklen = local_socklen;
 
-    if (ngx_iocp_create_shared_owner(c, lc->iocp) == NULL) {
+    if (!ngx_win32_worker_routed
+        && ngx_iocp_create_shared_owner(c, lc->iocp) == NULL)
+    {
         ngx_iocp_close_accepted_udp_connection(c);
         return NGX_ERROR;
     }
@@ -932,6 +944,12 @@ ngx_sendmsg(ngx_connection_t *c, struct msghdr *msg, int flags)
     ngx_pool_t              *pool;
     ngx_iocp_owner_t        *owner;
     ngx_iocp_udp_send_op_t  *op;
+
+    if (ngx_win32_worker_routed && c->listening
+        && c->listening->type == SOCK_DGRAM)
+    {
+        return ngx_win32_worker_udp_sendmsg(c, msg, flags);
+    }
 
     owner = c->iocp;
 

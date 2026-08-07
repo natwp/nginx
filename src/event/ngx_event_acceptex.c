@@ -22,6 +22,8 @@ typedef struct {
 static void ngx_event_acceptex_complete(ngx_iocp_op_t *base);
 static void ngx_event_acceptex_cleanup(ngx_iocp_op_t *base);
 static void ngx_close_iocp_accepted_connection(ngx_connection_t *c);
+static ngx_int_t ngx_acceptex_sockaddr_valid(struct sockaddr *sockaddr,
+    socklen_t socklen, int family);
 static ngx_int_t ngx_acceptex_address_valid(ngx_iocp_accept_op_t *op,
     struct sockaddr *sockaddr, int socklen, int family);
 
@@ -377,6 +379,213 @@ ngx_event_acceptex_complete(ngx_iocp_op_t *base)
     log->handler = NULL;
 
     ls->handler(c);
+}
+
+
+ngx_int_t
+ngx_event_acceptex_import(ngx_listening_t *ls, ngx_socket_t s,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen,
+    struct sockaddr *sockaddr, socklen_t socklen, u_char *data, size_t size)
+{
+    ngx_log_t         *log;
+    ngx_event_t       *rev;
+    ngx_connection_t  *c;
+
+    if (ls == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                      "missing listener for a routed AcceptEx connection");
+
+        if (s != (ngx_socket_t) -1) {
+            (void) ngx_close_socket(s);
+        }
+
+        return NGX_ERROR;
+    }
+
+    if (s == (ngx_socket_t) -1 || ls->sockaddr == NULL
+        || ls->type != SOCK_STREAM
+        || ngx_acceptex_sockaddr_valid(local_sockaddr, local_socklen,
+                                       ls->sockaddr->sa_family)
+           != NGX_OK
+        || ngx_acceptex_sockaddr_valid(sockaddr, socklen,
+                                       ls->sockaddr->sa_family)
+           != NGX_OK
+        || size > ls->post_accept_buffer_size || (size && data == NULL))
+    {
+        ngx_log_error(NGX_LOG_ALERT, &ls->log, 0,
+                      "invalid routed AcceptEx connection for %V",
+                      &ls->addr_text);
+        (void) ngx_close_socket(s);
+        return NGX_ERROR;
+    }
+
+    if (ngx_nonblocking(s) == -1) {
+        ngx_log_error(NGX_LOG_CRIT, &ls->log, ngx_socket_errno,
+                      ngx_nonblocking_n " failed for %V", &ls->addr_text);
+        (void) ngx_close_socket(s);
+        return NGX_ERROR;
+    }
+
+    if (SetHandleInformation((HANDLE) s, HANDLE_FLAG_INHERIT, 0) == 0) {
+        ngx_log_error(NGX_LOG_CRIT, &ls->log, ngx_errno,
+                      "SetHandleInformation() failed for %V",
+                      &ls->addr_text);
+        (void) ngx_close_socket(s);
+        return NGX_ERROR;
+    }
+
+#if (NGX_STAT_STUB)
+    (void) ngx_atomic_fetch_add(ngx_stat_accepted, 1);
+#endif
+
+    ngx_accept_disabled = ngx_cycle->connection_n / 8
+                          - ngx_cycle->free_connection_n;
+
+    c = ngx_get_connection(s, &ls->log);
+    if (c == NULL) {
+        (void) ngx_close_socket(s);
+        return NGX_ERROR;
+    }
+
+    c->type = SOCK_STREAM;
+    c->pool = ngx_create_pool(ls->pool_size, &ls->log);
+    if (c->pool == NULL) {
+        ngx_close_iocp_accepted_connection(c);
+        return NGX_ERROR;
+    }
+
+    log = ngx_palloc(c->pool, sizeof(ngx_log_t));
+    if (log == NULL) {
+        ngx_close_iocp_accepted_connection(c);
+        return NGX_ERROR;
+    }
+
+    *log = ls->log;
+    c->log = log;
+    c->pool->log = log;
+
+    c->local_sockaddr = ngx_palloc(c->pool, (size_t) local_socklen);
+    c->sockaddr = ngx_palloc(c->pool, (size_t) socklen);
+
+    if (c->local_sockaddr == NULL || c->sockaddr == NULL) {
+        ngx_close_iocp_accepted_connection(c);
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(c->local_sockaddr, local_sockaddr, (size_t) local_socklen);
+    ngx_memcpy(c->sockaddr, sockaddr, (size_t) socklen);
+
+    c->local_socklen = local_socklen;
+    c->socklen = socklen;
+    c->listening = ls;
+
+    if (ls->post_accept_buffer_size) {
+        c->buffer = ngx_create_temp_buf(c->pool,
+                                        ls->post_accept_buffer_size);
+        if (c->buffer == NULL) {
+            ngx_close_iocp_accepted_connection(c);
+            return NGX_ERROR;
+        }
+
+        if (size) {
+            rev = c->read;
+            rev->iocp_buffer = ngx_alloc(size, log);
+            if (rev->iocp_buffer == NULL) {
+                ngx_close_iocp_accepted_connection(c);
+                return NGX_ERROR;
+            }
+
+            ngx_memcpy(rev->iocp_buffer, data, size);
+            rev->iocp_buffer_size = size;
+            rev->iocp_buffer_pos = 0;
+            rev->available = (int) ngx_min(size, NGX_MAX_INT32_VALUE);
+        }
+    }
+
+    c->recv = ngx_recv;
+    c->send = ngx_send;
+    c->recv_chain = ngx_recv_chain;
+    c->send_chain = ngx_send_chain;
+    c->sendfile = 1;
+
+    c->read->ready = 1;
+    c->write->ready = 1;
+    c->read->log = log;
+    c->write->log = log;
+
+    if (ls->addr_ntop) {
+        c->addr_text.data = ngx_pnalloc(c->pool, ls->addr_text_max_len);
+        if (c->addr_text.data == NULL) {
+            ngx_close_iocp_accepted_connection(c);
+            return NGX_ERROR;
+        }
+
+        c->addr_text.len = ngx_sock_ntop(c->sockaddr, c->socklen,
+                                         c->addr_text.data,
+                                         ls->addr_text_max_len, 0);
+        if (c->addr_text.len == 0) {
+            ngx_close_iocp_accepted_connection(c);
+            return NGX_ERROR;
+        }
+    }
+
+    if (ngx_iocp_add_connection(c) != NGX_OK) {
+        ngx_close_iocp_accepted_connection(c);
+        return NGX_ERROR;
+    }
+
+    c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
+    c->start_time = ngx_current_msec;
+
+#if (NGX_DEBUG)
+    {
+        ngx_event_conf_t  *ecf;
+
+        ecf = ngx_event_get_conf(ngx_cycle->conf_ctx, ngx_event_core_module);
+        ngx_debug_accepted_connection(ecf, c);
+    }
+#endif
+
+#if (NGX_STAT_STUB)
+    (void) ngx_atomic_fetch_add(ngx_stat_handled, 1);
+    (void) ngx_atomic_fetch_add(ngx_stat_active, 1);
+#endif
+
+    log->data = NULL;
+    log->handler = NULL;
+
+    ls->handler(c);
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_acceptex_sockaddr_valid(struct sockaddr *sockaddr, socklen_t socklen,
+    int family)
+{
+    if (sockaddr == NULL || socklen <= 0
+        || socklen > (socklen_t) sizeof(ngx_sockaddr_t)
+        || sockaddr->sa_family != family)
+    {
+        return NGX_ERROR;
+    }
+
+    switch (family) {
+
+    case AF_INET:
+        return socklen >= (socklen_t) sizeof(struct sockaddr_in)
+               ? NGX_OK : NGX_ERROR;
+
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+        return socklen >= (socklen_t) sizeof(struct sockaddr_in6)
+               ? NGX_OK : NGX_ERROR;
+#endif
+
+    default:
+        return NGX_ERROR;
+    }
 }
 
 

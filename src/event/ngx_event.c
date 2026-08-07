@@ -9,6 +9,10 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
+#if (NGX_WIN32)
+#include <ngx_win32_worker.h>
+#endif
+
 #if (NGX_QUIC)
 #include <ngx_event_quic.h>
 #endif
@@ -259,7 +263,7 @@ ngx_process_events_and_timers(ngx_cycle_t *cycle)
     ngx_event_process_posted(cycle, &ngx_posted_accept_events);
 
     if (ngx_accept_mutex_held) {
-        ngx_shmtx_unlock(&ngx_accept_mutex);
+        ngx_unlock_accept_mutex();
     }
 
     ngx_event_expire_timers();
@@ -662,7 +666,15 @@ ngx_event_process_init(ngx_cycle_t *cycle)
     ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
     ecf = ngx_event_get_conf(cycle->conf_ctx, ngx_event_core_module);
 
-    if (ccf->master && ccf->worker_processes > 1 && ecf->accept_mutex) {
+#if (NGX_WIN32)
+
+    if (ccf->master && ccf->worker_processes > 1
+        && ecf->use != ngx_iocp_module.ctx_index)
+    {
+        if (ngx_win32_accept_mutex_init(cycle) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
         ngx_use_accept_mutex = 1;
         ngx_accept_mutex_held = 0;
         ngx_accept_mutex_delay = ecf->accept_mutex_delay;
@@ -671,14 +683,16 @@ ngx_event_process_init(ngx_cycle_t *cycle)
         ngx_use_accept_mutex = 0;
     }
 
-#if (NGX_WIN32)
+#else
 
-    /*
-     * disable accept mutex on win32 as it may cause deadlock if
-     * grabbed by a process which can't accept connections
-     */
+    if (ccf->master && ccf->worker_processes > 1 && ecf->accept_mutex) {
+        ngx_use_accept_mutex = 1;
+        ngx_accept_mutex_held = 0;
+        ngx_accept_mutex_delay = ecf->accept_mutex_delay;
 
-    ngx_use_accept_mutex = 0;
+    } else {
+        ngx_use_accept_mutex = 0;
+    }
 
 #endif
 
@@ -873,6 +887,10 @@ ngx_event_process_init(ngx_cycle_t *cycle)
 
         if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
             ngx_iocp_conf_t  *iocpcf;
+
+            if (ngx_win32_worker_routed) {
+                continue;
+            }
 
             if (ngx_use_accept_mutex) {
                 continue;

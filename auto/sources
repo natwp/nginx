@@ -228,7 +228,9 @@ WIN32_DEPS="$CORE_DEPS $EVENT_DEPS \
             src/os/win32/ngx_os.h \
             src/os/win32/ngx_user.h \
             src/os/win32/ngx_dlopen.h \
-            src/os/win32/ngx_process_cycle.h"
+            src/os/win32/ngx_process_cycle.h \
+            src/os/win32/ngx_win32_worker.h \
+            src/os/win32/ngx_win32_router.h"
 
 WIN32_CONFIG=src/os/win32/ngx_win32_config.h
 
@@ -240,6 +242,8 @@ WIN32_SRCS="$CORE_SRCS $EVENT_SRCS \
             src/os/win32/ngx_shmem.c \
             src/os/win32/ngx_time.c \
             src/os/win32/ngx_process.c \
+            src/os/win32/ngx_win32_worker.c \
+            src/os/win32/ngx_win32_router.c \
             src/os/win32/ngx_thread.c \
             src/os/win32/ngx_socket.c \
             src/os/win32/ngx_wsarecv.c \

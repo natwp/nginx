@@ -506,6 +506,7 @@ extern ngx_module_t           ngx_event_core_module;
 
 void ngx_event_accept(ngx_event_t *ev);
 ngx_int_t ngx_trylock_accept_mutex(ngx_cycle_t *cycle);
+void ngx_unlock_accept_mutex(void);
 ngx_int_t ngx_enable_accept_events(ngx_cycle_t *cycle);
 u_char *ngx_accept_log_error(ngx_log_t *log, u_char *buf, size_t len);
 #if (NGX_DEBUG)
@@ -521,6 +522,16 @@ ngx_int_t ngx_handle_write_event(ngx_event_t *wev, size_t lowat);
 #if (NGX_WIN32)
 void ngx_event_acceptex(ngx_event_t *ev);
 ngx_int_t ngx_event_post_acceptex(ngx_listening_t *ls, ngx_uint_t n);
+ngx_int_t ngx_event_acceptex_import(ngx_listening_t *ls, ngx_socket_t s,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen,
+    struct sockaddr *sockaddr, socklen_t socklen, u_char *data, size_t size);
+ngx_int_t ngx_iocp_udp_dispatch_datagram(ngx_listening_t *ls, u_char *data,
+    size_t size, struct sockaddr *sockaddr, socklen_t socklen,
+    struct sockaddr *local_sockaddr, socklen_t local_socklen);
+ngx_int_t ngx_get_srcaddr_cmsg(struct cmsghdr *cmsg,
+    struct sockaddr *local_sockaddr);
+size_t ngx_set_srcaddr_cmsg(struct cmsghdr *cmsg,
+    struct sockaddr *local_sockaddr);
 u_char *ngx_acceptex_log_error(ngx_log_t *log, u_char *buf, size_t len);
 #endif
 

@@ -9,6 +9,10 @@
 #include <ngx_core.h>
 #include <nginx.h>
 
+#if (NGX_WIN32)
+#include <ngx_win32_worker.h>
+#endif
+
 
 static void ngx_show_version_info(void);
 static ngx_int_t ngx_add_inherited_sockets(ngx_cycle_t *cycle);
@@ -268,6 +272,16 @@ main(int argc, char *const *argv)
         return 1;
     }
 
+#if (NGX_WIN32)
+
+    if (ngx_process == NGX_PROCESS_WORKER
+        && ngx_win32_worker_bootstrap_init(log) == NGX_ERROR)
+    {
+        return 1;
+    }
+
+#endif
+
     /*
      * ngx_crc32_table_init() requires ngx_cacheline_size set in ngx_os_init()
      */
@@ -335,6 +349,16 @@ main(int argc, char *const *argv)
     ngx_cycle = cycle;
 
     ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+
+#if (NGX_WIN32)
+
+    if (ngx_process == NGX_PROCESS_WORKER
+        && ngx_win32_worker_validate_listeners(cycle) != NGX_OK)
+    {
+        return 1;
+    }
+
+#endif
 
     if (ccf->master && ngx_process == NGX_PROCESS_SINGLE) {
         ngx_process = NGX_PROCESS_MASTER;
@@ -462,6 +486,14 @@ ngx_add_inherited_sockets(ngx_cycle_t *cycle)
     u_char           *p, *v, *inherited;
     ngx_int_t         s;
     ngx_listening_t  *ls;
+
+#if (NGX_WIN32)
+
+    if (ngx_win32_worker_bootstrap_active) {
+        return ngx_win32_worker_import_listeners(cycle);
+    }
+
+#endif
 
     inherited = (u_char *) getenv(NGINX_VAR);
 

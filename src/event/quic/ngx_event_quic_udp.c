@@ -10,6 +10,10 @@
 #include <ngx_event.h>
 #include <ngx_event_quic_connection.h>
 
+#if (NGX_WIN32)
+#include <ngx_win32_worker.h>
+#endif
+
 
 static void ngx_quic_close_accepted_connection(ngx_connection_t *c);
 static ngx_connection_t *ngx_quic_lookup_connection(ngx_listening_t *ls,
@@ -472,7 +476,9 @@ ngx_quic_iocp_dispatch(ngx_listening_t *ls, u_char *data, size_t size,
 
     c->local_socklen = local_socklen;
 
-    if (ngx_iocp_create_shared_owner(c, lc->iocp) == NULL) {
+    if (!ngx_win32_worker_routed
+        && ngx_iocp_create_shared_owner(c, lc->iocp) == NULL)
+    {
         ngx_quic_close_accepted_connection(c);
         return;
     }

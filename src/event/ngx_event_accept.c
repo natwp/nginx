@@ -9,6 +9,10 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
+#if (NGX_WIN32)
+#include <ngx_win32_worker.h>
+#endif
+
 
 static ngx_int_t ngx_disable_accept_events(ngx_cycle_t *cycle, ngx_uint_t all);
 #if (NGX_HAVE_EPOLLEXCLUSIVE)
@@ -118,7 +122,7 @@ ngx_event_accept(ngx_event_t *ev)
 
                 if (ngx_use_accept_mutex) {
                     if (ngx_accept_mutex_held) {
-                        ngx_shmtx_unlock(&ngx_accept_mutex);
+                        ngx_unlock_accept_mutex();
                         ngx_accept_mutex_held = 0;
                     }
 
@@ -344,7 +348,19 @@ ngx_event_accept(ngx_event_t *ev)
 ngx_int_t
 ngx_trylock_accept_mutex(ngx_cycle_t *cycle)
 {
-    if (ngx_shmtx_trylock(&ngx_accept_mutex)) {
+    ngx_int_t  locked;
+
+#if (NGX_WIN32)
+    locked = ngx_win32_accept_mutex_trylock(cycle);
+
+    if (locked == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+#else
+    locked = ngx_shmtx_trylock(&ngx_accept_mutex);
+#endif
+
+    if (locked) {
 
         ngx_log_debug0(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                        "accept mutex locked");
@@ -354,7 +370,7 @@ ngx_trylock_accept_mutex(ngx_cycle_t *cycle)
         }
 
         if (ngx_enable_accept_events(cycle) == NGX_ERROR) {
-            ngx_shmtx_unlock(&ngx_accept_mutex);
+            ngx_unlock_accept_mutex();
             return NGX_ERROR;
         }
 
@@ -376,6 +392,17 @@ ngx_trylock_accept_mutex(ngx_cycle_t *cycle)
     }
 
     return NGX_OK;
+}
+
+
+void
+ngx_unlock_accept_mutex(void)
+{
+#if (NGX_WIN32)
+    ngx_win32_accept_mutex_unlock();
+#else
+    ngx_shmtx_unlock(&ngx_accept_mutex);
+#endif
 }
 
 

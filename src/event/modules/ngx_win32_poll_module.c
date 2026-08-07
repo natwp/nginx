@@ -282,7 +282,20 @@ ngx_poll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
 
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0, "poll timer: %M", timer);
 
-    ready = WSAPoll(event_list, (u_int) nevents, (int) timer);
+    if (nevents) {
+        ready = WSAPoll(event_list, (u_int) nevents, (int) timer);
+
+    } else {
+
+        /*
+         * Winsock WSAPoll() requires at least one socket and returns
+         * WSAEINVAL for an empty descriptor list.
+         */
+
+        ngx_msleep(timer);
+
+        ready = 0;
+    }
 
     err = (ready == -1) ? ngx_errno : 0;
 
