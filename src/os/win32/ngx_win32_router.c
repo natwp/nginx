@@ -345,7 +345,13 @@ ngx_win32_router_required(ngx_cycle_t *cycle)
     ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
     ecf = ngx_event_get_conf(cycle->conf_ctx, ngx_event_core_module);
 
-    return ccf && ecf && ccf->master && ccf->worker_processes > 1
+    /*
+     * A listening socket can be associated with only one IOCP.  A reload
+     * overlaps worker generations, so the master must retain ownership of
+     * IOCP listeners even when there is only one worker.
+     */
+
+    return ccf && ecf && ccf->master && ccf->worker_processes > 0
            && ecf->use == ngx_iocp_module.ctx_index;
 }
 

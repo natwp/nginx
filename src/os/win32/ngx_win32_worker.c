@@ -22,6 +22,7 @@
 #define NGX_WIN32_CHANNEL_WRITE_LIMIT  (8 * 1024 * 1024)
 #define NGX_WIN32_CHANNEL_WRITE_RESERVE (64 * 1024)
 #define NGX_WIN32_CHANNEL_WRITE_MESSAGES 4096
+#define NGX_WIN32_CHANNEL_WRITE_RESERVE_MESSAGES 64
 #define NGX_WIN32_CHANNEL_READ_LIMIT   (8 * 1024 * 1024)
 #define NGX_WIN32_CHANNEL_QUEUE_LIMIT  4096
 #define NGX_WIN32_CHANNEL_DISPATCH_MAX 64
@@ -54,6 +55,7 @@ static HANDLE  ngx_win32_channel_write_ready;
 static ngx_uint_t ngx_win32_channel_stopping;
 static ngx_queue_t ngx_win32_channel_queue;
 static ngx_queue_t ngx_win32_channel_write_queue;
+static ngx_queue_t ngx_win32_channel_write_priority_queue;
 static ngx_uint_t ngx_win32_channel_queued;
 static size_t ngx_win32_channel_read_queued;
 static size_t ngx_win32_channel_write_queued;
@@ -459,6 +461,7 @@ ngx_win32_worker_channel_init(ngx_cycle_t *cycle)
 
     ngx_queue_init(&ngx_win32_channel_queue);
     ngx_queue_init(&ngx_win32_channel_write_queue);
+    ngx_queue_init(&ngx_win32_channel_write_priority_queue);
     InitializeCriticalSection(&ngx_win32_channel_lock);
     InitializeCriticalSection(&ngx_win32_channel_write_lock);
     ngx_win32_channel_initialized = 1;
@@ -606,8 +609,12 @@ ngx_win32_worker_channel_done(void)
 
     EnterCriticalSection(&ngx_win32_channel_write_lock);
 
-    while (!ngx_queue_empty(&ngx_win32_channel_write_queue)) {
-        q = ngx_queue_head(&ngx_win32_channel_write_queue);
+    while (!ngx_queue_empty(&ngx_win32_channel_write_priority_queue)
+           || !ngx_queue_empty(&ngx_win32_channel_write_queue))
+    {
+        q = !ngx_queue_empty(&ngx_win32_channel_write_priority_queue)
+            ? ngx_queue_head(&ngx_win32_channel_write_priority_queue)
+            : ngx_queue_head(&ngx_win32_channel_write_queue);
         ngx_queue_remove(q);
         write = ngx_queue_data(q, ngx_win32_channel_write_node_t, queue);
         ngx_free(write);
@@ -676,13 +683,17 @@ ngx_win32_worker_channel_write_thread(void *data)
                 return 0;
             }
 
-            if (ngx_queue_empty(&ngx_win32_channel_write_queue)) {
+            if (ngx_queue_empty(&ngx_win32_channel_write_priority_queue)
+                && ngx_queue_empty(&ngx_win32_channel_write_queue))
+            {
                 (void) ResetEvent(ngx_win32_channel_write_ready);
                 LeaveCriticalSection(&ngx_win32_channel_write_lock);
                 break;
             }
 
-            q = ngx_queue_head(&ngx_win32_channel_write_queue);
+            q = !ngx_queue_empty(&ngx_win32_channel_write_priority_queue)
+                ? ngx_queue_head(&ngx_win32_channel_write_priority_queue)
+                : ngx_queue_head(&ngx_win32_channel_write_queue);
             ngx_queue_remove(q);
             node = ngx_queue_data(q, ngx_win32_channel_write_node_t, queue);
             ngx_win32_channel_write_queued -= node->size;
@@ -735,6 +746,8 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
     if (ngx_win32_channel_stopping
         || ngx_win32_channel_write_messages
            >= NGX_WIN32_CHANNEL_WRITE_MESSAGES
+              + (priority
+                 ? NGX_WIN32_CHANNEL_WRITE_RESERVE_MESSAGES : 0)
         || (!priority && size > NGX_WIN32_CHANNEL_WRITE_LIMIT)
         || (priority
             && size > NGX_WIN32_CHANNEL_WRITE_LIMIT
@@ -755,7 +768,8 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
     }
 
     if (priority) {
-        ngx_queue_insert_head(&ngx_win32_channel_write_queue, &node->queue);
+        ngx_queue_insert_tail(&ngx_win32_channel_write_priority_queue,
+                              &node->queue);
 
     } else {
         ngx_queue_insert_tail(&ngx_win32_channel_write_queue, &node->queue);
