@@ -89,6 +89,8 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
 
     ngx_console_init(cycle);
 
+    (void) ngx_win32_job_init(cycle);
+
     SetEnvironmentVariable("ngx_unique", ngx_unique);
 
     ngx_master_process_event = CreateEvent(NULL, 1, 0,
@@ -181,6 +183,12 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
             }
 
             ngx_terminate = 1;
+
+            if (ngx_win32_router_pause(cycle) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                              "could not pause the Win32 network router");
+            }
+
             ngx_quit_worker_processes(cycle, 0);
 
             continue;
@@ -195,6 +203,12 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
             }
 
             ngx_quit = 1;
+
+            if (ngx_win32_router_drain(cycle) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                              "could not drain the Win32 network router");
+            }
+
             ngx_quit_worker_processes(cycle, 0);
 
             continue;
@@ -574,6 +588,8 @@ ngx_quit_worker_processes(ngx_cycle_t *cycle, ngx_uint_t old)
 
         ngx_processes[n].exiting = 1;
     }
+
+    ngx_win32_router_update_workers(cycle, ngx_master_generation);
 }
 
 
@@ -705,6 +721,7 @@ ngx_master_process_exit(ngx_cycle_t *cycle)
     ngx_delete_pidfile(cycle);
 
     ngx_win32_router_stop(cycle);
+    ngx_win32_job_done();
 
     ngx_close_handle(ngx_cache_manager_mutex);
     ngx_close_handle(ngx_stop_event);
@@ -1009,13 +1026,19 @@ ngx_worker_process_exit(ngx_cycle_t *cycle)
 
     ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "exit");
 
+    /*
+     * Stop the routed channel before event modules tear down their IOCP.
+     * The channel reader may otherwise post a notification into a port that
+     * ngx_iocp_done() has already started closing.
+     */
+    ngx_win32_worker_channel_done();
+
     for (i = 0; cycle->modules[i]; i++) {
         if (cycle->modules[i]->exit_process) {
             cycle->modules[i]->exit_process(cycle);
         }
     }
 
-    ngx_win32_worker_channel_done();
     ngx_win32_accept_mutex_done();
 
     if (ngx_exiting && !ngx_terminate) {

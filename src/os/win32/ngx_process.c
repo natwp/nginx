@@ -17,10 +17,13 @@ char           **ngx_os_argv;
 ngx_int_t        ngx_last_process;
 ngx_process_t    ngx_processes[NGX_MAX_PROCESSES];
 HANDLE           ngx_process_exit_event;
+static HANDLE    ngx_win32_worker_job;
 
 
 static char *ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
     ngx_win32_worker_bootstrap_t *bootstrap);
+static ngx_uint_t ngx_win32_worker_environment_variable(u_char *entry,
+    size_t len);
 static VOID CALLBACK ngx_win32_process_wait_handler(PVOID data,
     BOOLEAN timed_out);
 
@@ -324,14 +327,17 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
 {
     STARTUPINFO          si;
     PROCESS_INFORMATION  pi;
+    u_long               flags;
 
     ngx_memzero(&si, sizeof(STARTUPINFO));
     si.cb = sizeof(STARTUPINFO);
 
     ngx_memzero(&pi, sizeof(PROCESS_INFORMATION));
 
+    flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+
     if (CreateProcess(ctx->path, ctx->args,
-                      NULL, NULL, 0, CREATE_NO_WINDOW, ctx->environment,
+                      NULL, NULL, 0, flags, ctx->environment,
                       NULL, &si, &pi)
         == 0)
     {
@@ -339,6 +345,26 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
                       "CreateProcess(\"%s\") failed", ngx_argv[0]);
 
         return 0;
+    }
+
+    if (ngx_win32_worker_job
+        && AssignProcessToJobObject(ngx_win32_worker_job, pi.hProcess) == 0)
+    {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "AssignProcessToJobObject() failed");
+        (void) TerminateProcess(pi.hProcess, 2);
+        ngx_close_handle(pi.hThread);
+        ngx_close_handle(pi.hProcess);
+        return NGX_INVALID_PID;
+    }
+
+    if (ResumeThread(pi.hThread) == (DWORD) -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "ResumeThread() failed");
+        (void) TerminateProcess(pi.hProcess, 2);
+        ngx_close_handle(pi.hThread);
+        ngx_close_handle(pi.hProcess);
+        return NGX_INVALID_PID;
     }
 
     ctx->child = pi.hProcess;
@@ -352,6 +378,68 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
                   "start %s process %P", ctx->name, pi.dwProcessId);
 
     return pi.dwProcessId;
+}
+
+
+ngx_int_t
+ngx_win32_job_init(ngx_cycle_t *cycle)
+{
+    BOOL                                  in_job;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+
+    if (ngx_win32_worker_job) {
+        return NGX_OK;
+    }
+
+    in_job = FALSE;
+
+    if (IsProcessInJob(GetCurrentProcess(), NULL, &in_job) == 0) {
+        ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
+                      "IsProcessInJob() failed, worker crash cleanup "
+                      "is unavailable");
+        return NGX_DECLINED;
+    }
+
+    if (in_job) {
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "master process is already contained in a Job Object");
+        return NGX_DECLINED;
+    }
+
+    ngx_win32_worker_job = CreateJobObject(NULL, NULL);
+    if (ngx_win32_worker_job == NULL) {
+        ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
+                      "CreateJobObject() failed, worker crash cleanup "
+                      "is unavailable");
+        return NGX_DECLINED;
+    }
+
+    ngx_memzero(&info, sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    if (SetInformationJobObject(ngx_win32_worker_job,
+                                JobObjectExtendedLimitInformation, &info,
+                                sizeof(info)) == 0)
+    {
+        ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
+                      "SetInformationJobObject() failed, worker crash "
+                      "cleanup is unavailable");
+        ngx_close_handle(ngx_win32_worker_job);
+        ngx_win32_worker_job = NULL;
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
+}
+
+
+void
+ngx_win32_job_done(void)
+{
+    if (ngx_win32_worker_job) {
+        ngx_close_handle(ngx_win32_worker_job);
+        ngx_win32_worker_job = NULL;
+    }
 }
 
 
@@ -378,7 +466,11 @@ ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
 
     while (*p) {
         len = ngx_strlen(p) + 1;
-        size += len;
+
+        if (!ngx_win32_worker_environment_variable(p, len - 1)) {
+            size += len;
+        }
+
         p += len;
     }
 
@@ -401,8 +493,25 @@ ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
         return NULL;
     }
 
-    ngx_memcpy(env, base, size);
-    p = (u_char *) (env + size);
+    p = (u_char *) base;
+    env[0] = '\0';
+    {
+        u_char *dst;
+
+        dst = (u_char *) env;
+
+        while (*p) {
+            len = ngx_strlen(p) + 1;
+
+            if (!ngx_win32_worker_environment_variable(p, len - 1)) {
+                dst = ngx_cpymem(dst, p, len);
+            }
+
+            p += len;
+        }
+
+        p = dst;
+    }
 
     p = ngx_sprintf((u_char *) p, NGX_WIN32_WORKER_SLOT_ENV "=%s%Z", slot);
     p = ngx_sprintf((u_char *) p,
@@ -415,6 +524,30 @@ ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
     FreeEnvironmentStrings(base);
 
     return env;
+}
+
+
+static ngx_uint_t
+ngx_win32_worker_environment_variable(u_char *entry, size_t len)
+{
+    static ngx_str_t  names[] = {
+        ngx_string(NGX_WIN32_WORKER_SLOT_ENV),
+        ngx_string(NGX_WIN32_WORKER_GENERATION_ENV),
+        ngx_string(NGX_WIN32_WORKER_PIPE_ENV),
+        ngx_string(NGX_WIN32_WORKER_ROLE_ENV)
+    };
+
+    ngx_uint_t  i;
+
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (len > names[i].len && entry[names[i].len] == '='
+            && ngx_strncasecmp(entry, names[i].data, names[i].len) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 

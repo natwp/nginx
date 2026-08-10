@@ -128,7 +128,11 @@ ngx_os_init(ngx_log_t *log)
     GetSystemInfo(&si);
     ngx_pagesize = si.dwPageSize;
     ngx_allocation_granularity = si.dwAllocationGranularity;
-    ngx_ncpu = si.dwNumberOfProcessors;
+    ngx_ncpu = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+
+    if (ngx_ncpu == 0) {
+        ngx_ncpu = si.dwNumberOfProcessors;
+    }
     ngx_cacheline_size = NGX_CPU_CACHE_LINE;
 
     for (n = ngx_pagesize; n >>= 1; ngx_pagesize_shift++) { /* void */ }

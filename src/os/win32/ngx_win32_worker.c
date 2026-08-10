@@ -10,10 +10,22 @@
 #include <ngx_win32_router.h>
 #include <ngx_win32_worker.h>
 #include <ntsecapi.h>
+#include <sddl.h>
+
+
+#ifndef PIPE_REJECT_REMOTE_CLIENTS
+#define PIPE_REJECT_REMOTE_CLIENTS  0x00000008
+#endif
 
 
 #define NGX_WIN32_CHANNEL_UDP_BUFS     64
 #define NGX_WIN32_CHANNEL_WRITE_LIMIT  (8 * 1024 * 1024)
+#define NGX_WIN32_CHANNEL_WRITE_RESERVE (64 * 1024)
+#define NGX_WIN32_CHANNEL_WRITE_MESSAGES 4096
+#define NGX_WIN32_CHANNEL_READ_LIMIT   (8 * 1024 * 1024)
+#define NGX_WIN32_CHANNEL_QUEUE_LIMIT  4096
+#define NGX_WIN32_CHANNEL_DISPATCH_MAX 64
+#define NGX_WIN32_CHANNEL_DISPATCH_SIZE (1024 * 1024)
 
 #define NGX_WIN32_QUIC_ROUTE_TAG_OFFSET  6
 #define NGX_WIN32_QUIC_ROUTE_TAG_LEN     6
@@ -42,7 +54,10 @@ static HANDLE  ngx_win32_channel_write_ready;
 static ngx_uint_t ngx_win32_channel_stopping;
 static ngx_queue_t ngx_win32_channel_queue;
 static ngx_queue_t ngx_win32_channel_write_queue;
+static ngx_uint_t ngx_win32_channel_queued;
+static size_t ngx_win32_channel_read_queued;
 static size_t ngx_win32_channel_write_queued;
+static ngx_uint_t ngx_win32_channel_write_messages;
 static CRITICAL_SECTION ngx_win32_channel_lock;
 static CRITICAL_SECTION ngx_win32_channel_write_lock;
 static ngx_uint_t ngx_win32_channel_initialized;
@@ -77,6 +92,8 @@ static ngx_int_t ngx_win32_bootstrap_read(HANDLE pipe, void *data,
 static ngx_int_t ngx_win32_bootstrap_write(HANDLE pipe, const void *data,
     size_t size, ngx_log_t *log);
 static ngx_int_t ngx_win32_worker_pipe_io(HANDLE pipe, void *data,
+    size_t size, ngx_uint_t write, ngx_log_t *log);
+static ngx_int_t ngx_win32_master_pipe_io(HANDLE pipe, void *data,
     size_t size, ngx_uint_t write, ngx_log_t *log);
 static ngx_int_t ngx_win32_bootstrap_read_header(HANDLE pipe,
     ngx_win32_bootstrap_header_t *header, ngx_log_t *log);
@@ -447,7 +464,10 @@ ngx_win32_worker_channel_init(ngx_cycle_t *cycle)
     ngx_win32_channel_initialized = 1;
     ngx_win32_channel_stopping = 0;
     ngx_win32_channel_posted = 0;
+    ngx_win32_channel_queued = 0;
+    ngx_win32_channel_read_queued = 0;
     ngx_win32_channel_write_queued = 0;
+    ngx_win32_channel_write_messages = 0;
 
     ngx_win32_channel_write_ready = CreateEvent(NULL, 1, 0, NULL);
     if (ngx_win32_channel_write_ready == NULL) {
@@ -489,7 +509,15 @@ failed:
     }
 
     if (ngx_win32_channel_write_thread) {
-        (void) WaitForSingleObject(ngx_win32_channel_write_thread, 5000);
+        if (WaitForSingleObject(ngx_win32_channel_write_thread,
+                                NGX_WIN32_BOOTSTRAP_TIMEOUT)
+            != WAIT_OBJECT_0)
+        {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "could not stop the Win32 worker channel writer");
+            exit(2);
+        }
+
         ngx_close_handle(ngx_win32_channel_write_thread);
         ngx_win32_channel_write_thread = NULL;
     }
@@ -510,6 +538,7 @@ failed:
 void
 ngx_win32_worker_channel_done(void)
 {
+    u_long                           wait;
     ngx_queue_t                     *q;
     ngx_win32_channel_accept_node_t *node;
     ngx_win32_channel_write_node_t  *write;
@@ -529,16 +558,35 @@ ngx_win32_worker_channel_done(void)
             (void) CancelIoEx(ngx_win32_worker_pipe, NULL);
         }
 
-        (void) WaitForSingleObject(ngx_win32_channel_thread, 5000);
+        wait = WaitForSingleObject(ngx_win32_channel_thread,
+                                   NGX_WIN32_BOOTSTRAP_TIMEOUT);
+        if (wait != WAIT_OBJECT_0) {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log,
+                          wait == WAIT_FAILED ? ngx_errno : 0,
+                          "could not stop the Win32 worker channel reader");
+            exit(2);
+        }
+
         ngx_close_handle(ngx_win32_channel_thread);
         ngx_win32_channel_thread = NULL;
     }
 
     if (ngx_win32_channel_write_thread) {
-        (void) WaitForSingleObject(ngx_win32_channel_write_thread, 5000);
+        wait = WaitForSingleObject(ngx_win32_channel_write_thread,
+                                   NGX_WIN32_BOOTSTRAP_TIMEOUT);
+        if (wait != WAIT_OBJECT_0) {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log,
+                          wait == WAIT_FAILED ? ngx_errno : 0,
+                          "could not stop the Win32 worker channel writer");
+            exit(2);
+        }
+
         ngx_close_handle(ngx_win32_channel_write_thread);
         ngx_win32_channel_write_thread = NULL;
     }
+
+    ngx_win32_channel_queued = 0;
+    ngx_win32_channel_read_queued = 0;
 
     EnterCriticalSection(&ngx_win32_channel_lock);
 
@@ -566,6 +614,7 @@ ngx_win32_worker_channel_done(void)
     }
 
     ngx_win32_channel_write_queued = 0;
+    ngx_win32_channel_write_messages = 0;
 
     LeaveCriticalSection(&ngx_win32_channel_write_lock);
 
@@ -637,6 +686,7 @@ ngx_win32_worker_channel_write_thread(void *data)
             ngx_queue_remove(q);
             node = ngx_queue_data(q, ngx_win32_channel_write_node_t, queue);
             ngx_win32_channel_write_queued -= node->size;
+            ngx_win32_channel_write_messages--;
 
             LeaveCriticalSection(&ngx_win32_channel_write_lock);
 
@@ -683,10 +733,15 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
     EnterCriticalSection(&ngx_win32_channel_write_lock);
 
     if (ngx_win32_channel_stopping
-        || (!priority
-            && (size > NGX_WIN32_CHANNEL_WRITE_LIMIT
-                || ngx_win32_channel_write_queued
-                   > NGX_WIN32_CHANNEL_WRITE_LIMIT - size)))
+        || ngx_win32_channel_write_messages
+           >= NGX_WIN32_CHANNEL_WRITE_MESSAGES
+        || (!priority && size > NGX_WIN32_CHANNEL_WRITE_LIMIT)
+        || (priority
+            && size > NGX_WIN32_CHANNEL_WRITE_LIMIT
+                      + NGX_WIN32_CHANNEL_WRITE_RESERVE)
+        || ngx_win32_channel_write_queued
+           > NGX_WIN32_CHANNEL_WRITE_LIMIT
+             + (priority ? NGX_WIN32_CHANNEL_WRITE_RESERVE : 0) - size)
     {
         LeaveCriticalSection(&ngx_win32_channel_write_lock);
         ngx_free(node);
@@ -707,10 +762,12 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
     }
 
     ngx_win32_channel_write_queued += size;
+    ngx_win32_channel_write_messages++;
 
     if (SetEvent(ngx_win32_channel_write_ready) == 0) {
         ngx_queue_remove(&node->queue);
         ngx_win32_channel_write_queued -= size;
+        ngx_win32_channel_write_messages--;
         LeaveCriticalSection(&ngx_win32_channel_write_lock);
         ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
                       "SetEvent(worker channel write) failed");
@@ -727,6 +784,7 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
 static ngx_thread_value_t __stdcall
 ngx_win32_worker_channel_thread(void *data)
 {
+    size_t                           queued_size;
     ngx_int_t                        notify;
     ngx_socket_t                     s;
     ngx_cycle_t                     *cycle;
@@ -823,6 +881,8 @@ ngx_win32_worker_channel_thread(void *data)
                 goto failed;
             }
 
+            queued_size = sizeof(ngx_win32_channel_accept_node_t)
+                          + udp.data_len;
             goto queue;
         }
 
@@ -848,10 +908,12 @@ ngx_win32_worker_channel_thread(void *data)
         }
 
         if (accept.local_socklen > sizeof(ngx_sockaddr_t)
-            || accept.remote_socklen > sizeof(ngx_sockaddr_t))
+            || accept.remote_socklen > sizeof(ngx_sockaddr_t)
+            || ngx_exiting || ngx_quit || ngx_terminate)
         {
             (void) ngx_win32_worker_channel_ack(header.id,
-                                                ERROR_INVALID_DATA);
+                         ngx_exiting || ngx_quit || ngx_terminate
+                         ? ERROR_OPERATION_ABORTED : ERROR_INVALID_DATA);
             continue;
         }
 
@@ -881,19 +943,50 @@ ngx_win32_worker_channel_thread(void *data)
         node->remote_socklen = (socklen_t) accept.remote_socklen;
         ngx_memcpy(&node->local, &accept.local, accept.local_socklen);
         ngx_memcpy(&node->remote, &accept.remote, accept.remote_socklen);
-
-        if (ngx_win32_worker_channel_ack(header.id, 0) != NGX_OK) {
-            (void) ngx_close_socket(s);
-            ngx_free(node);
-            goto failed;
-        }
+        queued_size = sizeof(ngx_win32_channel_accept_node_t);
 
     queue:
 
         notify = 0;
 
         EnterCriticalSection(&ngx_win32_channel_lock);
+
+        if (ngx_win32_channel_stopping
+            || ngx_win32_channel_queued >= NGX_WIN32_CHANNEL_QUEUE_LIMIT
+            || queued_size > NGX_WIN32_CHANNEL_READ_LIMIT
+            || ngx_win32_channel_read_queued
+               > NGX_WIN32_CHANNEL_READ_LIMIT - queued_size)
+        {
+            LeaveCriticalSection(&ngx_win32_channel_lock);
+
+            if (node->socket != (ngx_socket_t) -1) {
+                (void) ngx_win32_worker_channel_ack(header.id,
+                                                    ERROR_NOT_ENOUGH_QUOTA);
+                (void) ngx_close_socket(node->socket);
+            }
+
+            ngx_free(node);
+
+            if (!ngx_win32_channel_stopping) {
+                ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                              "Win32 worker channel read queue is full");
+            }
+
+            continue;
+        }
+
+        if (node->socket != (ngx_socket_t) -1
+            && ngx_win32_worker_channel_ack(header.id, 0) != NGX_OK)
+        {
+            LeaveCriticalSection(&ngx_win32_channel_lock);
+            (void) ngx_close_socket(node->socket);
+            ngx_free(node);
+            goto failed;
+        }
+
         ngx_queue_insert_tail(&ngx_win32_channel_queue, &node->queue);
+        ngx_win32_channel_queued++;
+        ngx_win32_channel_read_queued += queued_size;
 
         if (!ngx_win32_channel_posted) {
             ngx_win32_channel_posted = 1;
@@ -996,6 +1089,9 @@ ngx_win32_worker_listener_matches(ngx_listening_t *ls, int type,
 static void
 ngx_win32_worker_channel_handler(ngx_event_t *ev)
 {
+    size_t                           dispatched, node_size;
+    ngx_int_t                        notify;
+    ngx_uint_t                       messages;
     ngx_queue_t                     *q;
     ngx_cycle_t                     *cycle;
     ngx_listening_t                 *ls;
@@ -1004,6 +1100,8 @@ ngx_win32_worker_channel_handler(ngx_event_t *ev)
     (void) ev;
 
     cycle = (ngx_cycle_t *) ngx_cycle;
+    dispatched = 0;
+    messages = 0;
 
     for ( ;; ) {
         EnterCriticalSection(&ngx_win32_channel_lock);
@@ -1014,11 +1112,36 @@ ngx_win32_worker_channel_handler(ngx_event_t *ev)
             return;
         }
 
+        if (messages >= NGX_WIN32_CHANNEL_DISPATCH_MAX
+            || dispatched >= NGX_WIN32_CHANNEL_DISPATCH_SIZE)
+        {
+            notify = 1;
+            LeaveCriticalSection(&ngx_win32_channel_lock);
+
+            if (notify
+                && ngx_notify(ngx_win32_worker_channel_handler) != NGX_OK)
+            {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                              "could not continue the Win32 worker channel");
+
+                EnterCriticalSection(&ngx_win32_channel_lock);
+                ngx_win32_channel_posted = 0;
+                LeaveCriticalSection(&ngx_win32_channel_lock);
+            }
+
+            return;
+        }
+
         q = ngx_queue_head(&ngx_win32_channel_queue);
         ngx_queue_remove(q);
+        node = ngx_queue_data(q, ngx_win32_channel_accept_node_t, queue);
+        node_size = sizeof(ngx_win32_channel_accept_node_t) + node->size;
+        ngx_win32_channel_queued--;
+        ngx_win32_channel_read_queued -= node_size;
         LeaveCriticalSection(&ngx_win32_channel_lock);
 
-        node = ngx_queue_data(q, ngx_win32_channel_accept_node_t, queue);
+        messages++;
+        dispatched += node_size;
 
         ls = ngx_win32_worker_find_listener(cycle, node->listener,
                            node->type == NGX_WIN32_CHANNEL_UDP_RECV
@@ -1243,22 +1366,56 @@ ngx_win32_master_create_bootstrap(ngx_cycle_t *cycle,
     ngx_win32_worker_bootstrap_t *bootstrap, ngx_uint_t slot,
     ngx_uint_t generation, ngx_uint_t role)
 {
+    u_char                *p;
+    u_char                 random[16];
+    SECURITY_ATTRIBUTES    sa;
+    PSECURITY_DESCRIPTOR   descriptor;
+
     ngx_memzero(bootstrap, sizeof(ngx_win32_worker_bootstrap_t));
 
     bootstrap->slot = slot;
     bootstrap->generation = generation;
     bootstrap->role = role;
 
-    ngx_sprintf(bootstrap->name,
-                "\\\\.\\pipe\\nginx_worker_%s_%ui_%ui%Z",
-                ngx_unique, generation, slot);
+    if (RtlGenRandom(random, sizeof(random)) == 0) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "RtlGenRandom(worker pipe name) failed");
+        return NGX_ERROR;
+    }
+
+    p = ngx_sprintf(bootstrap->name,
+                    "\\\\.\\pipe\\nginx_worker_%s_%ui_%ui_",
+                    ngx_unique, generation, slot);
+    p = ngx_hex_dump(p, random, sizeof(random));
+    *p = '\0';
+
+    descriptor = NULL;
+
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)",
+            SDDL_REVISION_1, &descriptor, NULL)
+        == 0)
+    {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "could not create worker pipe security descriptor");
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(&sa, sizeof(SECURITY_ATTRIBUTES));
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = descriptor;
 
     bootstrap->pipe = CreateNamedPipe((char *) bootstrap->name,
-                                      PIPE_ACCESS_DUPLEX,
+                                      PIPE_ACCESS_DUPLEX
+                                      | FILE_FLAG_OVERLAPPED
+                                      | FILE_FLAG_FIRST_PIPE_INSTANCE,
                                       PIPE_TYPE_BYTE | PIPE_READMODE_BYTE
-                                      | PIPE_NOWAIT,
+                                      | PIPE_WAIT
+                                      | PIPE_REJECT_REMOTE_CLIENTS,
                                       1, 65536, 65536,
-                                      NGX_WIN32_BOOTSTRAP_TIMEOUT, NULL);
+                                      NGX_WIN32_BOOTSTRAP_TIMEOUT, &sa);
+
+    LocalFree(descriptor);
 
     if (bootstrap->pipe == INVALID_HANDLE_VALUE) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
@@ -1453,15 +1610,34 @@ ngx_win32_master_close_bootstrap(ngx_win32_worker_bootstrap_t *bootstrap)
 ngx_int_t
 ngx_win32_accept_mutex_init(ngx_cycle_t *cycle)
 {
-    u_char  name[NGX_PROCESS_SYNC_NAME];
+    u_char                name[NGX_PROCESS_SYNC_NAME];
+    SECURITY_ATTRIBUTES   sa;
+    PSECURITY_DESCRIPTOR  descriptor;
 
     if (ngx_win32_accept_mutex) {
         return NGX_OK;
     }
 
-    ngx_sprintf(name, "Global\\ngx_accept_%s%Z", ngx_unique);
+    ngx_sprintf(name, "Local\\ngx_accept_%s%Z", ngx_unique);
 
-    ngx_win32_accept_mutex = CreateMutex(NULL, 0, (char *) name);
+    descriptor = NULL;
+
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)",
+            SDDL_REVISION_1, &descriptor, NULL)
+        == 0)
+    {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "could not create accept mutex security descriptor");
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(&sa, sizeof(SECURITY_ATTRIBUTES));
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.lpSecurityDescriptor = descriptor;
+
+    ngx_win32_accept_mutex = CreateMutex(&sa, 0, (char *) name);
+    LocalFree(descriptor);
     if (ngx_win32_accept_mutex == NULL) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
                       "CreateMutex(\"%s\") failed", name);
@@ -1522,35 +1698,11 @@ ngx_win32_accept_mutex_done(void)
 static ngx_int_t
 ngx_win32_bootstrap_read(HANDLE pipe, void *data, size_t size, ngx_log_t *log)
 {
-    u_char  *p;
-    DWORD    n;
-
     if (pipe == ngx_win32_worker_pipe) {
         return ngx_win32_worker_pipe_io(pipe, data, size, 0, log);
     }
 
-    p = data;
-
-    while (size) {
-        if (ReadFile(pipe, p, (DWORD) ngx_min(size, 0xffffffff), &n, NULL)
-            == 0)
-        {
-            ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
-                          "ReadFile(worker bootstrap) failed");
-            return NGX_ERROR;
-        }
-
-        if (n == 0) {
-            ngx_log_error(NGX_LOG_EMERG, log, 0,
-                          "worker bootstrap pipe was closed");
-            return NGX_ERROR;
-        }
-
-        p += n;
-        size -= n;
-    }
-
-    return NGX_OK;
+    return ngx_win32_master_pipe_io(pipe, data, size, 0, log);
 }
 
 
@@ -1558,33 +1710,88 @@ static ngx_int_t
 ngx_win32_bootstrap_write(HANDLE pipe, const void *data, size_t size,
     ngx_log_t *log)
 {
-    const u_char  *p;
-    DWORD          n;
-
     if (pipe == ngx_win32_worker_pipe) {
         return ngx_win32_worker_pipe_io(pipe, (void *) data, size, 1, log);
+    }
+
+    return ngx_win32_master_pipe_io(pipe, (void *) data, size, 1, log);
+}
+
+
+static ngx_int_t
+ngx_win32_master_pipe_io(HANDLE pipe, void *data, size_t size,
+    ngx_uint_t write, ngx_log_t *log)
+{
+    BOOL        rc;
+    DWORD       chunk, error, n;
+    HANDLE      event;
+    u_long      wait;
+    u_char     *p;
+    OVERLAPPED  overlapped;
+
+    event = CreateEvent(NULL, 1, 0, NULL);
+    if (event == NULL) {
+        ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
+                      "CreateEvent(worker bootstrap pipe) failed");
+        return NGX_ERROR;
     }
 
     p = data;
 
     while (size) {
-        if (WriteFile(pipe, p, (DWORD) ngx_min(size, 0xffffffff), &n, NULL)
-            == 0)
-        {
-            ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
-                          "WriteFile(worker bootstrap) failed");
-            return NGX_ERROR;
+        ngx_memzero(&overlapped, sizeof(OVERLAPPED));
+        overlapped.hEvent = event;
+        (void) ResetEvent(event);
+        chunk = (DWORD) ngx_min(size, 0xffffffff);
+        n = 0;
+
+        rc = write ? WriteFile(pipe, p, chunk, &n, &overlapped)
+                   : ReadFile(pipe, p, chunk, &n, &overlapped);
+
+        if (rc == 0) {
+            error = ngx_errno;
+
+            if (error != ERROR_IO_PENDING) {
+                ngx_log_error(NGX_LOG_EMERG, log, error,
+                              "%s(worker bootstrap) failed",
+                              write ? "WriteFile" : "ReadFile");
+                ngx_close_handle(event);
+                return NGX_ERROR;
+            }
+
+            wait = WaitForSingleObject(event, NGX_WIN32_BOOTSTRAP_TIMEOUT);
+            if (wait != WAIT_OBJECT_0) {
+                error = wait == WAIT_FAILED ? ngx_errno : WAIT_TIMEOUT;
+                (void) CancelIoEx(pipe, &overlapped);
+                (void) GetOverlappedResult(pipe, &overlapped, &n, TRUE);
+                ngx_log_error(NGX_LOG_EMERG, log, error,
+                              "%s(worker bootstrap) failed",
+                              write ? "WriteFile" : "ReadFile");
+                ngx_close_handle(event);
+                return NGX_ERROR;
+            }
+
+            if (GetOverlappedResult(pipe, &overlapped, &n, FALSE) == 0) {
+                ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
+                              "%s(worker bootstrap) failed",
+                              write ? "WriteFile" : "ReadFile");
+                ngx_close_handle(event);
+                return NGX_ERROR;
+            }
         }
 
         if (n == 0) {
             ngx_log_error(NGX_LOG_EMERG, log, 0,
                           "worker bootstrap pipe accepted no data");
+            ngx_close_handle(event);
             return NGX_ERROR;
         }
 
         p += n;
         size -= n;
     }
+
+    ngx_close_handle(event);
 
     return NGX_OK;
 }
@@ -1733,49 +1940,66 @@ static ngx_int_t
 ngx_win32_master_connect(ngx_cycle_t *cycle,
     ngx_win32_worker_bootstrap_t *bootstrap, HANDLE process)
 {
-    DWORD   err, mode, start;
-    u_long  rc;
+    BOOL        connected;
+    DWORD       bytes, err, mode;
+    HANDLE      event, events[2];
+    OVERLAPPED  overlapped;
+    u_long      rc;
 
-    start = GetTickCount();
+    event = CreateEvent(NULL, 1, 0, NULL);
+    if (event == NULL) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                      "CreateEvent(worker pipe connect) failed");
+        return NGX_ERROR;
+    }
 
-    for ( ;; ) {
-        if (ConnectNamedPipe(bootstrap->pipe, NULL)) {
-            break;
-        }
+    ngx_memzero(&overlapped, sizeof(OVERLAPPED));
+    overlapped.hEvent = event;
+    connected = ConnectNamedPipe(bootstrap->pipe, &overlapped);
 
+    if (!connected) {
         err = ngx_errno;
 
-        if (err == ERROR_PIPE_CONNECTED) {
-            break;
-        }
+        if (err == ERROR_IO_PENDING) {
+            events[0] = event;
+            events[1] = process;
+            rc = WaitForMultipleObjects(2, events, FALSE,
+                                        NGX_WIN32_BOOTSTRAP_TIMEOUT);
 
-        if (err != ERROR_PIPE_LISTENING && err != ERROR_NO_DATA) {
+            if (rc != WAIT_OBJECT_0) {
+                err = rc == WAIT_FAILED ? ngx_errno : 0;
+                (void) CancelIoEx(bootstrap->pipe, &overlapped);
+                (void) GetOverlappedResult(bootstrap->pipe, &overlapped,
+                                           &bytes, TRUE);
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
+                              "worker %ui generation %ui did not connect "
+                              "its bootstrap pipe", bootstrap->slot,
+                              bootstrap->generation);
+                ngx_close_handle(event);
+                return NGX_ERROR;
+            }
+
+            if (GetOverlappedResult(bootstrap->pipe, &overlapped, &err,
+                                    FALSE)
+                == 0)
+            {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                              "ConnectNamedPipe(\"%s\") failed",
+                              bootstrap->name);
+                ngx_close_handle(event);
+                return NGX_ERROR;
+            }
+
+        } else if (err != ERROR_PIPE_CONNECTED) {
             ngx_log_error(NGX_LOG_EMERG, cycle->log, err,
                           "ConnectNamedPipe(\"%s\") failed",
                           bootstrap->name);
+            ngx_close_handle(event);
             return NGX_ERROR;
         }
-
-        rc = WaitForSingleObject(process, 0);
-        if (rc == WAIT_OBJECT_0) {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                          "worker %ui generation %ui exited before "
-                          "connecting its bootstrap pipe", bootstrap->slot,
-                          bootstrap->generation);
-            return NGX_ERROR;
-        }
-
-        if ((DWORD) (GetTickCount() - start) >= NGX_WIN32_BOOTSTRAP_TIMEOUT) {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                          "worker %ui generation %ui did not connect its "
-                          "bootstrap pipe within %dms", bootstrap->slot,
-                          bootstrap->generation,
-                          NGX_WIN32_BOOTSTRAP_TIMEOUT);
-            return NGX_ERROR;
-        }
-
-        Sleep(10);
     }
+
+    ngx_close_handle(event);
 
     mode = PIPE_READMODE_BYTE | PIPE_WAIT;
 

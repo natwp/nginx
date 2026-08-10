@@ -69,6 +69,8 @@ ngx_pid_t ngx_spawn_process(ngx_cycle_t *cycle, char *name, ngx_int_t respawn);
 ngx_pid_t ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
     ngx_uint_t slot, ngx_uint_t generation, ngx_uint_t role);
 ngx_pid_t ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx);
+ngx_int_t ngx_win32_job_init(ngx_cycle_t *cycle);
+void ngx_win32_job_done(void);
 
 #define ngx_debug_point()
 #define ngx_sched_yield()   SwitchToThread()

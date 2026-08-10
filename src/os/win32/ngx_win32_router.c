@@ -15,21 +15,28 @@
 #endif
 
 
-#define NGX_WIN32_ROUTER_WAIT          50
 #define NGX_WIN32_ROUTER_PAUSE_TIMEOUT 30000
 #define NGX_WIN32_ROUTER_ACK_TIMEOUT   10000
 #define NGX_WIN32_ROUTER_ACCEPTS       32
+#define NGX_WIN32_ROUTER_BATCH         64
 #define NGX_WIN32_ROUTER_UDP_SIZE      65535
 #define NGX_WIN32_ROUTER_CONTROL_SIZE  512
 #define NGX_WIN32_ROUTER_FLOW_TIMEOUT  600000
 #define NGX_WIN32_ROUTER_FLOW_BUCKETS  4096
 #define NGX_WIN32_ROUTER_FLOW_MAX      65536
+#define NGX_WIN32_ROUTER_ACCEPT_BUCKETS 1024
+#define NGX_WIN32_ROUTER_CHANNEL_LIMIT (8 * 1024 * 1024)
+#define NGX_WIN32_ROUTER_CHANNEL_MESSAGES 4096
+#define NGX_WIN32_ROUTER_UDP_SEND_LIMIT (8 * 1024 * 1024)
+#define NGX_WIN32_ROUTER_UDP_SENDS     4096
 
 #define NGX_WIN32_ROUTER_FLOW_TUPLE    1
 #define NGX_WIN32_ROUTER_FLOW_QUIC     2
 
 
 typedef struct ngx_win32_router_listener_s ngx_win32_router_listener_t;
+typedef struct ngx_win32_router_worker_s ngx_win32_router_worker_t;
+typedef struct ngx_win32_router_control_s ngx_win32_router_control_t;
 
 
 typedef struct {
@@ -42,11 +49,22 @@ typedef struct {
 #define NGX_WIN32_ROUTER_OP_ACCEPT    1
 #define NGX_WIN32_ROUTER_OP_UDP_RECV  2
 #define NGX_WIN32_ROUTER_OP_UDP_SEND  3
+#define NGX_WIN32_ROUTER_OP_CONTROL   4
+#define NGX_WIN32_ROUTER_OP_PIPE_READ 5
+#define NGX_WIN32_ROUTER_OP_PIPE_WRITE 6
+
+
+#define NGX_WIN32_ROUTER_CONTROL_PAUSE  1
+#define NGX_WIN32_ROUTER_CONTROL_RESUME 2
+#define NGX_WIN32_ROUTER_CONTROL_UPDATE 3
+#define NGX_WIN32_ROUTER_CONTROL_DRAIN  4
+#define NGX_WIN32_ROUTER_CONTROL_STOP   5
 
 
 typedef struct {
     ngx_win32_router_op_t       op;
     ngx_queue_t                  queue;
+    ngx_queue_t                  id_queue;
     ngx_socket_t                 socket;
     ngx_pid_t                    target;
     uint64_t                     id;
@@ -74,6 +92,7 @@ typedef struct {
     WSABUF                       wsabuf;
     ngx_sockaddr_t               remote;
     DWORD                        expected;
+    DWORD                        size;
     u_char                       control[NGX_WIN32_ROUTER_CONTROL_SIZE];
     u_char                       data[1];
 } ngx_win32_router_udp_send_t;
@@ -100,11 +119,65 @@ struct ngx_win32_router_listener_s {
 
 
 typedef struct {
-    ngx_pid_t       pid;
-    ngx_uint_t      slot;
-    ngx_uint_t      generation;
-    HANDLE          pipe;
-} ngx_win32_router_worker_t;
+    ngx_win32_router_op_t  op;
+    ngx_win32_router_worker_t *worker;
+    u_char                *data;
+    size_t                 size;
+    size_t                 offset;
+    u_char                 header[sizeof(ngx_win32_channel_header_t)];
+} ngx_win32_router_pipe_read_t;
+
+
+typedef struct {
+    ngx_win32_router_op_t  op;
+    ngx_queue_t            queue;
+    ngx_win32_router_worker_t *worker;
+    size_t                 size;
+    size_t                 offset;
+    uint64_t               accept_id;
+    u_char                 data[1];
+} ngx_win32_router_pipe_write_t;
+
+
+struct ngx_win32_router_worker_s {
+    ngx_pid_t                    pid;
+    ngx_uint_t                   slot;
+    ngx_uint_t                   generation;
+    HANDLE                       pipe;
+    ngx_queue_t                  writes;
+    ngx_win32_router_pipe_read_t read;
+    ngx_uint_t                   read_pending;
+    ngx_uint_t                   write_pending;
+    ngx_uint_t                   ready;
+    ngx_uint_t                   active;
+    ngx_uint_t                   seen;
+    ngx_uint_t                   removing;
+    ngx_uint_t                   failed;
+    ngx_uint_t                   queued_messages;
+    size_t                       queued_bytes;
+};
+
+
+typedef struct {
+    ngx_pid_t   pid;
+    ngx_uint_t  slot;
+    ngx_uint_t  generation;
+    HANDLE      pipe;
+    ngx_uint_t  exiting;
+} ngx_win32_router_worker_snapshot_t;
+
+
+struct ngx_win32_router_control_s {
+    ngx_win32_router_op_t              op;
+    volatile LONG                      refs;
+    HANDLE                             event;
+    ngx_uint_t                         command;
+    ngx_uint_t                         generation;
+    ngx_cycle_t                       *cycle;
+    ngx_int_t                          status;
+    ngx_uint_t                         worker_n;
+    ngx_win32_router_worker_snapshot_t workers[NGX_MAX_PROCESSES];
+};
 
 
 typedef struct {
@@ -136,6 +209,18 @@ typedef struct {
 
 
 static ngx_thread_value_t __stdcall ngx_win32_router_thread(void *data);
+static ngx_int_t ngx_win32_router_command(ngx_cycle_t *cycle,
+    ngx_uint_t command, ngx_uint_t generation, ngx_uint_t workers);
+static void ngx_win32_router_complete_control(
+    ngx_win32_router_control_t *control);
+static void ngx_win32_router_release_control(
+    ngx_win32_router_control_t *control);
+static void ngx_win32_router_process_control(
+    ngx_win32_router_control_t *control);
+static ngx_uint_t ngx_win32_router_control_ready(void);
+static void ngx_win32_router_cancel_io(ngx_uint_t streams_only);
+static ngx_err_t ngx_win32_router_result(ngx_win32_router_op_t *op,
+    OVERLAPPED_ENTRY *entry, DWORD *bytes);
 static ngx_int_t ngx_win32_router_configure(ngx_cycle_t *cycle);
 static ngx_win32_router_listener_t *ngx_win32_router_find_listener(
     ngx_socket_t socket);
@@ -163,7 +248,25 @@ static ngx_int_t ngx_win32_router_dispatch_accept(
 static ngx_int_t ngx_win32_router_dispatch_udp(
     ngx_win32_router_udp_recv_t *op, DWORD bytes,
     struct sockaddr *local, socklen_t local_socklen);
-static void ngx_win32_router_service_channels(void);
+static ngx_int_t ngx_win32_router_apply_workers(
+    ngx_win32_router_control_t *control);
+static ngx_int_t ngx_win32_router_post_pipe_read(
+    ngx_win32_router_worker_t *worker);
+static void ngx_win32_router_complete_pipe_read(
+    ngx_win32_router_pipe_read_t *read, DWORD bytes, ngx_err_t error);
+static ngx_int_t ngx_win32_router_handle_channel(
+    ngx_win32_router_worker_t *worker, u_char *message, size_t size);
+static ngx_int_t ngx_win32_router_queue_write(
+    ngx_win32_router_worker_t *worker, const void *data, size_t size,
+    uint64_t accept_id);
+static ngx_int_t ngx_win32_router_post_pipe_write(
+    ngx_win32_router_worker_t *worker);
+static void ngx_win32_router_complete_pipe_write(
+    ngx_win32_router_pipe_write_t *write, DWORD bytes, ngx_err_t error);
+static ngx_uint_t ngx_win32_router_pipe_ended(ngx_err_t error);
+static void ngx_win32_router_drop_writes(ngx_win32_router_worker_t *worker,
+    ngx_uint_t pending);
+static void ngx_win32_router_fail_accept(uint64_t id, ngx_pid_t pid);
 static ngx_int_t ngx_win32_router_send_udp(
     ngx_win32_router_worker_t *worker, ngx_win32_channel_udp_t *udp,
     u_char *data);
@@ -192,29 +295,32 @@ static void ngx_win32_router_expire_accepts(void);
 static void ngx_win32_router_expire_flows(void);
 static void ngx_win32_router_finish_accept(
     ngx_win32_router_accept_t *accept);
-static ngx_int_t ngx_win32_router_read(HANDLE pipe, void *data, size_t size);
-static ngx_int_t ngx_win32_router_write(HANDLE pipe, const void *data,
-    size_t size);
 static void ngx_win32_router_free_listeners(void);
 static void ngx_win32_router_free_flows(void);
 
 
 static HANDLE           ngx_win32_router_port;
 static HANDLE           ngx_win32_router_thread_handle;
-static HANDLE           ngx_win32_router_paused_event;
 static ngx_log_t       *ngx_win32_router_log;
 static ngx_queue_t      ngx_win32_router_listeners;
 static ngx_queue_t      ngx_win32_router_handoffs;
-static ngx_uint_t       ngx_win32_router_accepting;
+static ngx_queue_t      ngx_win32_router_accept_buckets[
+                                               NGX_WIN32_ROUTER_ACCEPT_BUCKETS];
+static ngx_uint_t       ngx_win32_router_stream_accepting;
+static ngx_uint_t       ngx_win32_router_udp_accepting;
+static ngx_uint_t       ngx_win32_router_new_flows;
+static ngx_uint_t       ngx_win32_router_channels;
 static ngx_uint_t       ngx_win32_router_stopping;
 static ngx_uint_t       ngx_win32_router_pending;
+static ngx_uint_t       ngx_win32_router_channel_pending;
+static ngx_uint_t       ngx_win32_router_udp_sends;
+static size_t           ngx_win32_router_udp_send_bytes;
 static ngx_uint_t       ngx_win32_router_next_worker;
 static uint64_t         ngx_win32_router_next_id;
 static ngx_uint_t       ngx_win32_router_initialized;
 static ngx_uint_t       ngx_win32_router_generation;
-static CRITICAL_SECTION ngx_win32_router_worker_lock;
 static ngx_win32_router_worker_t ngx_win32_router_workers[NGX_MAX_PROCESSES];
-static ngx_uint_t       ngx_win32_router_worker_n;
+static ngx_win32_router_control_t *ngx_win32_router_pending_control;
 static ngx_queue_t      ngx_win32_router_flow_buckets[
                                                  NGX_WIN32_ROUTER_FLOW_BUCKETS];
 static ngx_queue_t      ngx_win32_router_flows;
@@ -263,12 +369,26 @@ ngx_win32_router_start(ngx_cycle_t *cycle, ngx_uint_t generation)
     ngx_queue_init(&ngx_win32_router_handoffs);
     ngx_queue_init(&ngx_win32_router_flows);
 
+    for (i = 0; i < NGX_WIN32_ROUTER_ACCEPT_BUCKETS; i++) {
+        ngx_queue_init(&ngx_win32_router_accept_buckets[i]);
+    }
+
     for (i = 0; i < NGX_WIN32_ROUTER_FLOW_BUCKETS; i++) {
         ngx_queue_init(&ngx_win32_router_flow_buckets[i]);
     }
 
     ngx_win32_router_flow_n = 0;
-    InitializeCriticalSection(&ngx_win32_router_worker_lock);
+
+    ngx_memzero(ngx_win32_router_workers,
+                sizeof(ngx_win32_router_workers));
+
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        ngx_queue_init(&ngx_win32_router_workers[i].writes);
+        ngx_win32_router_workers[i].read.worker =
+            &ngx_win32_router_workers[i];
+        ngx_win32_router_workers[i].read.op.type =
+            NGX_WIN32_ROUTER_OP_PIPE_READ;
+    }
 
     ngx_win32_router_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE,
                                                     NULL, 0, 1);
@@ -278,33 +398,26 @@ ngx_win32_router_start(ngx_cycle_t *cycle, ngx_uint_t generation)
         goto failed;
     }
 
-    ngx_win32_router_paused_event = CreateEvent(NULL, 1, 0, NULL);
-    if (ngx_win32_router_paused_event == NULL) {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                      "CreateEvent(network router pause) failed");
-        goto failed;
-    }
-
     ngx_win32_router_initialized = 1;
-    ngx_win32_router_accepting = 0;
+    ngx_win32_router_stream_accepting = 0;
+    ngx_win32_router_udp_accepting = 0;
+    ngx_win32_router_new_flows = 0;
+    ngx_win32_router_channels = 0;
     ngx_win32_router_stopping = 0;
     ngx_win32_router_pending = 0;
+    ngx_win32_router_channel_pending = 0;
+    ngx_win32_router_udp_sends = 0;
+    ngx_win32_router_udp_send_bytes = 0;
     ngx_win32_router_next_id = 1;
+    ngx_win32_router_pending_control = NULL;
 
-    if (ngx_win32_router_configure(cycle) != NGX_OK) {
-        goto failed;
-    }
-
-    ngx_win32_router_update_workers(cycle, generation);
-
-    if (ngx_create_thread(&tid, ngx_win32_router_thread, cycle, cycle->log)
+    if (ngx_create_thread(&tid, ngx_win32_router_thread, NULL, cycle->log)
         != 0)
     {
         goto failed;
     }
 
     ngx_win32_router_thread_handle = tid;
-    ngx_win32_router_accepting = 1;
 
     if (ngx_win32_router_resume(cycle, generation) != NGX_OK) {
         goto failed;
@@ -325,75 +438,452 @@ failed:
 ngx_int_t
 ngx_win32_router_pause(ngx_cycle_t *cycle)
 {
-    ngx_queue_t                 *q;
-    ngx_win32_router_listener_t *listener;
-
     if (!ngx_win32_router_initialized) {
         return NGX_OK;
     }
 
-    if (ngx_win32_router_accepting) {
-        ngx_win32_router_accepting = 0;
-        (void) ResetEvent(ngx_win32_router_paused_event);
+    return ngx_win32_router_command(cycle, NGX_WIN32_ROUTER_CONTROL_PAUSE,
+                                    ngx_win32_router_generation, 0);
+}
 
-        for (q = ngx_queue_head(&ngx_win32_router_listeners);
-             q != ngx_queue_sentinel(&ngx_win32_router_listeners);
-             q = ngx_queue_next(q))
-        {
-            listener = ngx_queue_data(q, ngx_win32_router_listener_t, queue);
 
-            if (listener->pending) {
-                (void) CancelIoEx((HANDLE) listener->socket, NULL);
-            }
-        }
+ngx_int_t
+ngx_win32_router_drain(ngx_cycle_t *cycle)
+{
+    if (!ngx_win32_router_initialized) {
+        return NGX_OK;
     }
 
-    if (ngx_win32_router_pending == 0) {
-        (void) SetEvent(ngx_win32_router_paused_event);
-    }
-
-    if (WaitForSingleObject(ngx_win32_router_paused_event,
-                            NGX_WIN32_ROUTER_PAUSE_TIMEOUT)
-        != WAIT_OBJECT_0)
-    {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                      "timed out pausing the Win32 network router");
-        return NGX_ERROR;
-    }
-
-    return NGX_OK;
+    return ngx_win32_router_command(cycle, NGX_WIN32_ROUTER_CONTROL_DRAIN,
+                                    ngx_win32_router_generation, 1);
 }
 
 
 ngx_int_t
 ngx_win32_router_resume(ngx_cycle_t *cycle, ngx_uint_t generation)
 {
-    ngx_queue_t                 *q;
-    ngx_uint_t                   i, n;
-    ngx_win32_router_listener_t *listener;
-    ngx_iocp_conf_t             *iocpcf;
-
     if (!ngx_win32_router_initialized) {
         return NGX_ERROR;
     }
 
-    if (ngx_win32_router_pending != 0) {
+    return ngx_win32_router_command(cycle, NGX_WIN32_ROUTER_CONTROL_RESUME,
+                                    generation, 1);
+}
+
+
+void
+ngx_win32_router_update_workers(ngx_cycle_t *cycle, ngx_uint_t generation)
+{
+    if (!ngx_win32_router_initialized) {
+        return;
+    }
+
+    if (ngx_win32_router_command(cycle, NGX_WIN32_ROUTER_CONTROL_UPDATE,
+                                 generation, 1)
+        != NGX_OK)
+    {
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "could not update Win32 network router workers");
+    }
+}
+
+
+void
+ngx_win32_router_stop(ngx_cycle_t *cycle)
+{
+    u_long                      wait;
+    ngx_uint_t                  i;
+    ngx_queue_t                *q;
+    ngx_win32_router_accept_t  *accept;
+
+    if (!ngx_win32_router_initialized) {
+        return;
+    }
+
+    if (ngx_win32_router_thread_handle
+        && ngx_win32_router_command(cycle, NGX_WIN32_ROUTER_CONTROL_STOP,
+                                    ngx_win32_router_generation, 0)
+           != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "could not stop the Win32 network router safely");
+        return;
+    }
+
+    if (ngx_win32_router_thread_handle) {
+        wait = WaitForSingleObject(ngx_win32_router_thread_handle,
+                                   NGX_WIN32_ROUTER_PAUSE_TIMEOUT);
+        if (wait != WAIT_OBJECT_0) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log,
+                          wait == WAIT_FAILED ? ngx_errno : 0,
+                          "could not join the Win32 network router thread");
+            return;
+        }
+
+        ngx_close_handle(ngx_win32_router_thread_handle);
+        ngx_win32_router_thread_handle = NULL;
+    }
+
+    while (!ngx_queue_empty(&ngx_win32_router_handoffs)) {
+        q = ngx_queue_head(&ngx_win32_router_handoffs);
+        ngx_queue_remove(q);
+        accept = ngx_queue_data(q, ngx_win32_router_accept_t, queue);
+        ngx_queue_remove(&accept->id_queue);
+        ngx_win32_router_finish_accept(accept);
+    }
+
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        ngx_win32_router_drop_writes(&ngx_win32_router_workers[i], 0);
+
+        if (ngx_win32_router_workers[i].read.data
+            != ngx_win32_router_workers[i].read.header)
+        {
+            ngx_free(ngx_win32_router_workers[i].read.data);
+        }
+    }
+
+    ngx_win32_router_free_listeners();
+    ngx_win32_router_free_flows();
+
+    if (ngx_win32_router_port) {
+        ngx_close_handle(ngx_win32_router_port);
+        ngx_win32_router_port = NULL;
+    }
+
+    ngx_win32_router_initialized = 0;
+    ngx_win32_router_stopping = 0;
+    ngx_win32_router_log = NULL;
+}
+
+
+static ngx_thread_value_t __stdcall
+ngx_win32_router_thread(void *data)
+{
+    BOOL                         rc;
+    ULONG                        i, events;
+    ngx_err_t                    error;
+    OVERLAPPED_ENTRY             entries[NGX_WIN32_ROUTER_BATCH];
+    ngx_win32_router_op_t       *op;
+    ngx_win32_router_accept_t   *accept;
+    ngx_win32_router_control_t  *control;
+    ngx_win32_router_pipe_read_t *read;
+    ngx_win32_router_pipe_write_t *write;
+    ngx_win32_router_udp_recv_t *udp;
+    ngx_win32_router_udp_send_t *send;
+
+    (void) data;
+
+    while (!ngx_win32_router_stopping) {
+        events = 0;
+        rc = GetQueuedCompletionStatusEx(ngx_win32_router_port, entries,
+                                         NGX_WIN32_ROUTER_BATCH, &events,
+                                         1000, FALSE);
+
+        if (rc == 0) {
+            error = ngx_errno;
+
+            if (error != WAIT_TIMEOUT && ngx_win32_router_log) {
+                ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, error,
+                              "GetQueuedCompletionStatusEx(network router) "
+                              "failed");
+            }
+
+        } else {
+            for (i = 0; i < events; i++) {
+                op = (ngx_win32_router_op_t *) entries[i].lpOverlapped;
+                error = 0;
+
+                if (op == NULL) {
+                    continue;
+                }
+
+                if (op->type != NGX_WIN32_ROUTER_OP_CONTROL) {
+                    error = ngx_win32_router_result(op, &entries[i], NULL);
+                }
+
+                if (op->type == NGX_WIN32_ROUTER_OP_ACCEPT) {
+                    accept = (ngx_win32_router_accept_t *) op;
+                    ngx_win32_router_complete_accept(accept,
+                                               entries[i].dwNumberOfBytesTransferred,
+                                               error);
+
+                } else if (op->type == NGX_WIN32_ROUTER_OP_UDP_RECV) {
+                    udp = (ngx_win32_router_udp_recv_t *) op;
+                    ngx_win32_router_complete_udp_recv(udp,
+                                               entries[i].dwNumberOfBytesTransferred,
+                                               error);
+
+                } else if (op->type == NGX_WIN32_ROUTER_OP_UDP_SEND) {
+                    send = (ngx_win32_router_udp_send_t *) op;
+                    ngx_win32_router_complete_udp_send(send,
+                                               entries[i].dwNumberOfBytesTransferred,
+                                               error);
+
+                } else if (op->type == NGX_WIN32_ROUTER_OP_PIPE_READ) {
+                    read = (ngx_win32_router_pipe_read_t *) op;
+                    ngx_win32_router_complete_pipe_read(read,
+                                               entries[i].dwNumberOfBytesTransferred,
+                                               error);
+
+                } else if (op->type == NGX_WIN32_ROUTER_OP_PIPE_WRITE) {
+                    write = (ngx_win32_router_pipe_write_t *) op;
+                    ngx_win32_router_complete_pipe_write(write,
+                                               entries[i].dwNumberOfBytesTransferred,
+                                               error);
+
+                } else if (op->type == NGX_WIN32_ROUTER_OP_CONTROL) {
+                    control = (ngx_win32_router_control_t *) op;
+                    ngx_win32_router_process_control(control);
+
+                } else if (ngx_win32_router_log) {
+                    ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
+                                  "unknown Win32 router operation %ui",
+                                  op->type);
+                }
+            }
+        }
+
+        ngx_win32_router_expire_accepts();
+        ngx_win32_router_expire_flows();
+
+        if (ngx_win32_router_pending_control
+            && ngx_win32_router_control_ready())
+        {
+            control = ngx_win32_router_pending_control;
+            ngx_win32_router_pending_control = NULL;
+
+            if (control->command == NGX_WIN32_ROUTER_CONTROL_PAUSE) {
+                ngx_win32_router_log = NULL;
+            }
+
+            if (control->command == NGX_WIN32_ROUTER_CONTROL_STOP) {
+                ngx_win32_router_stopping = 1;
+            }
+
+            ngx_win32_router_complete_control(control);
+        }
+    }
+
+    return 0;
+}
+
+
+static ngx_int_t
+ngx_win32_router_command(ngx_cycle_t *cycle, ngx_uint_t command,
+    ngx_uint_t generation, ngx_uint_t workers)
+{
+    u_long                         wait;
+    ngx_int_t                      i, rc;
+    ngx_win32_router_control_t    *control;
+    ngx_win32_router_worker_snapshot_t *snapshot;
+
+    control = ngx_calloc(sizeof(ngx_win32_router_control_t), cycle->log);
+    if (control == NULL) {
+        return NGX_ERROR;
+    }
+
+    control->event = CreateEvent(NULL, 1, 0, NULL);
+    if (control->event == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "CreateEvent(network router control) failed");
+        ngx_free(control);
+        return NGX_ERROR;
+    }
+
+    control->op.type = NGX_WIN32_ROUTER_OP_CONTROL;
+    control->refs = 2;
+    control->command = command;
+    control->generation = generation;
+    control->cycle = cycle;
+    control->status = NGX_ERROR;
+
+    if (workers) {
+        for (i = 0; i < ngx_last_process; i++) {
+            if (ngx_processes[i].handle == NULL
+                || !ngx_processes[i].ready_state
+                || ngx_processes[i].bootstrap == NULL
+                || !ngx_processes[i].bootstrap->routed
+                || ngx_processes[i].bootstrap->pipe == NULL)
+            {
+                continue;
+            }
+
+            snapshot = &control->workers[control->worker_n++];
+            snapshot->pid = ngx_processes[i].pid;
+            snapshot->slot = ngx_processes[i].slot;
+            snapshot->generation = ngx_processes[i].generation;
+            snapshot->pipe = ngx_processes[i].bootstrap->pipe;
+            snapshot->exiting = ngx_processes[i].exiting;
+        }
+    }
+
+    if (PostQueuedCompletionStatus(ngx_win32_router_port, 0, 0,
+                                   &control->op.overlapped)
+        == 0)
+    {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "PostQueuedCompletionStatus(network router control) "
+                      "failed");
+        ngx_win32_router_release_control(control);
+        ngx_win32_router_release_control(control);
+        return NGX_ERROR;
+    }
+
+    wait = WaitForSingleObject(control->event,
+                               NGX_WIN32_ROUTER_PAUSE_TIMEOUT);
+
+    if (wait == WAIT_TIMEOUT) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "Win32 network router control %ui exceeded %dms",
+                      command, NGX_WIN32_ROUTER_PAUSE_TIMEOUT);
+        wait = WaitForSingleObject(control->event, INFINITE);
+    }
+
+    if (wait == WAIT_OBJECT_0) {
+        rc = control->status;
+
+    } else {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "WaitForSingleObject(network router control %ui) "
+                      "failed", command);
+        rc = NGX_ERROR;
+    }
+
+    ngx_win32_router_release_control(control);
+
+    return rc;
+}
+
+
+static void
+ngx_win32_router_complete_control(ngx_win32_router_control_t *control)
+{
+    if (SetEvent(control->event) == 0 && ngx_win32_router_log) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, ngx_errno,
+                      "SetEvent(network router control) failed");
+    }
+
+    ngx_win32_router_release_control(control);
+}
+
+
+static void
+ngx_win32_router_release_control(ngx_win32_router_control_t *control)
+{
+    if (InterlockedDecrement(&control->refs) != 0) {
+        return;
+    }
+
+    ngx_close_handle(control->event);
+    ngx_free(control);
+}
+
+
+static void
+ngx_win32_router_process_control(ngx_win32_router_control_t *control)
+{
+    ngx_queue_t                 *q;
+    ngx_uint_t                   i, n;
+    ngx_iocp_conf_t             *iocpcf;
+    ngx_win32_router_listener_t *listener;
+    ngx_win32_router_worker_t   *worker;
+
+    ngx_win32_router_log = control->cycle->log;
+
+    if (ngx_win32_router_pending_control) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
+                      "concurrent Win32 network router controls");
+        control->status = NGX_ERROR;
+        ngx_win32_router_complete_control(control);
+        return;
+    }
+
+    if (control->command == NGX_WIN32_ROUTER_CONTROL_DRAIN) {
+        ngx_win32_router_stream_accepting = 0;
+        ngx_win32_router_new_flows = 0;
+        ngx_win32_router_cancel_io(1);
+        control->status = NGX_OK;
+        ngx_win32_router_complete_control(control);
+        return;
+    }
+
+    if (control->command == NGX_WIN32_ROUTER_CONTROL_UPDATE) {
+        control->status = ngx_win32_router_apply_workers(control);
+
+        if (control->status == NGX_OK
+            && !ngx_win32_router_control_ready())
+        {
+            ngx_win32_router_pending_control = control;
+            return;
+        }
+
+        ngx_win32_router_complete_control(control);
+        return;
+    }
+
+    if (control->command == NGX_WIN32_ROUTER_CONTROL_PAUSE
+        || control->command == NGX_WIN32_ROUTER_CONTROL_STOP)
+    {
+        ngx_win32_router_stream_accepting = 0;
+        ngx_win32_router_udp_accepting = 0;
+        ngx_win32_router_new_flows = 0;
+        ngx_win32_router_channels = 0;
+        ngx_win32_router_cancel_io(0);
+        control->status = NGX_OK;
+
+        if (!ngx_win32_router_control_ready()) {
+            ngx_win32_router_pending_control = control;
+            return;
+        }
+
+        if (control->command == NGX_WIN32_ROUTER_CONTROL_PAUSE) {
+            ngx_win32_router_log = NULL;
+
+        } else {
+            ngx_win32_router_stopping = 1;
+        }
+
+        ngx_win32_router_complete_control(control);
+        return;
+    }
+
+    if (control->command != NGX_WIN32_ROUTER_CONTROL_RESUME
+        || ngx_win32_router_pending != 0
+        || ngx_win32_router_channel_pending != 0)
+    {
+        ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
                       "cannot resume a busy Win32 network router");
-        return NGX_ERROR;
+        control->status = NGX_ERROR;
+        ngx_win32_router_complete_control(control);
+        return;
     }
 
-    ngx_win32_router_log = cycle->log;
-
-    if (ngx_win32_router_configure(cycle) != NGX_OK) {
-        return NGX_ERROR;
+    if (ngx_win32_router_configure(control->cycle) != NGX_OK
+        || ngx_win32_router_apply_workers(control) != NGX_OK)
+    {
+        control->status = NGX_ERROR;
+        ngx_win32_router_complete_control(control);
+        return;
     }
 
-    ngx_win32_router_update_workers(cycle, generation);
-    iocpcf = ngx_event_get_conf(cycle->conf_ctx, ngx_iocp_module);
+    ngx_win32_router_generation = control->generation;
+    ngx_win32_router_stream_accepting = 1;
+    ngx_win32_router_udp_accepting = 1;
+    ngx_win32_router_new_flows = 1;
+    ngx_win32_router_channels = 1;
 
-    (void) ResetEvent(ngx_win32_router_paused_event);
-    ngx_win32_router_accepting = 1;
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        worker = &ngx_win32_router_workers[i];
+
+        if (worker->ready
+            && (ngx_win32_router_post_pipe_read(worker) != NGX_OK
+                || ngx_win32_router_post_pipe_write(worker) != NGX_OK))
+        {
+            goto failed;
+        }
+    }
+
+    iocpcf = ngx_event_get_conf(control->cycle->conf_ctx, ngx_iocp_module);
 
     for (q = ngx_queue_head(&ngx_win32_router_listeners);
          q != ngx_queue_sentinel(&ngx_win32_router_listeners);
@@ -413,171 +903,137 @@ ngx_win32_router_resume(ngx_cycle_t *cycle, ngx_uint_t generation)
                  ? ngx_win32_router_post_accept(listener)
                  : ngx_win32_router_post_udp_recv(listener)) != NGX_OK)
             {
-                ngx_win32_router_accepting = 0;
-                return NGX_ERROR;
+                goto failed;
             }
         }
     }
 
-    return NGX_OK;
-}
+    control->status = NGX_OK;
+    ngx_win32_router_complete_control(control);
+    return;
 
+failed:
 
-void
-ngx_win32_router_update_workers(ngx_cycle_t *cycle, ngx_uint_t generation)
-{
-    ngx_int_t  i;
+    ngx_win32_router_stream_accepting = 0;
+    ngx_win32_router_udp_accepting = 0;
+    ngx_win32_router_new_flows = 0;
+    ngx_win32_router_channels = 0;
+    ngx_win32_router_cancel_io(0);
+    control->status = NGX_ERROR;
 
-    (void) cycle;
-
-    if (!ngx_win32_router_initialized) {
+    if (!ngx_win32_router_control_ready()) {
+        ngx_win32_router_pending_control = control;
         return;
     }
 
-    EnterCriticalSection(&ngx_win32_router_worker_lock);
+    ngx_win32_router_complete_control(control);
+}
 
-    ngx_win32_router_generation = generation;
-    ngx_win32_router_worker_n = 0;
 
-    for (i = 0; i < ngx_last_process; i++) {
-        if (ngx_processes[i].handle == NULL
-            || !ngx_processes[i].ready_state
-            || ngx_processes[i].bootstrap == NULL
-            || !ngx_processes[i].bootstrap->routed
-            || ngx_processes[i].bootstrap->pipe == NULL)
+static ngx_uint_t
+ngx_win32_router_control_ready(void)
+{
+    ngx_uint_t                  i;
+    ngx_win32_router_worker_t  *worker;
+
+    if (ngx_win32_router_pending_control
+        && ngx_win32_router_pending_control->command
+           == NGX_WIN32_ROUTER_CONTROL_UPDATE)
+    {
+        for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+            worker = &ngx_win32_router_workers[i];
+
+            if (worker->removing
+                && (worker->read_pending || worker->write_pending))
+            {
+                return 0;
+            }
+        }
+
+        return 1;
+    }
+
+    return ngx_win32_router_pending == 0
+           && ngx_win32_router_channel_pending == 0;
+}
+
+
+static void
+ngx_win32_router_cancel_io(ngx_uint_t streams_only)
+{
+    ngx_queue_t                 *q;
+    ngx_uint_t                   i;
+    ngx_win32_router_listener_t *listener;
+    ngx_win32_router_worker_t   *worker;
+
+    for (q = ngx_queue_head(&ngx_win32_router_listeners);
+         q != ngx_queue_sentinel(&ngx_win32_router_listeners);
+         q = ngx_queue_next(q))
+    {
+        listener = ngx_queue_data(q, ngx_win32_router_listener_t, queue);
+
+        if (listener->pending
+            && (!streams_only || listener->type == SOCK_STREAM))
         {
-            continue;
+            (void) CancelIoEx((HANDLE) listener->socket, NULL);
         }
-
-        ngx_win32_router_workers[ngx_win32_router_worker_n].pid =
-            ngx_processes[i].pid;
-        ngx_win32_router_workers[ngx_win32_router_worker_n].slot =
-            ngx_processes[i].slot;
-        ngx_win32_router_workers[ngx_win32_router_worker_n].generation =
-            ngx_processes[i].generation;
-        ngx_win32_router_workers[ngx_win32_router_worker_n].pipe =
-            ngx_processes[i].bootstrap->pipe;
-
-        ngx_win32_router_worker_n++;
     }
 
-    if (ngx_win32_router_next_worker >= ngx_win32_router_worker_n) {
-        ngx_win32_router_next_worker = 0;
-    }
-
-    LeaveCriticalSection(&ngx_win32_router_worker_lock);
-}
-
-
-void
-ngx_win32_router_stop(ngx_cycle_t *cycle)
-{
-    ngx_queue_t                *q;
-    ngx_win32_router_accept_t  *accept;
-
-    if (!ngx_win32_router_initialized) {
+    if (streams_only) {
         return;
     }
 
-    (void) ngx_win32_router_pause(cycle);
-    ngx_win32_router_stopping = 1;
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        worker = &ngx_win32_router_workers[i];
 
-    if (ngx_win32_router_port) {
-        (void) PostQueuedCompletionStatus(ngx_win32_router_port, 0, 0, NULL);
+        if (worker->ready && (worker->read_pending || worker->write_pending)) {
+            (void) CancelIoEx(worker->pipe, NULL);
+        }
     }
-
-    if (ngx_win32_router_thread_handle) {
-        (void) WaitForSingleObject(ngx_win32_router_thread_handle, 5000);
-        ngx_close_handle(ngx_win32_router_thread_handle);
-        ngx_win32_router_thread_handle = NULL;
-    }
-
-    while (!ngx_queue_empty(&ngx_win32_router_handoffs)) {
-        q = ngx_queue_head(&ngx_win32_router_handoffs);
-        ngx_queue_remove(q);
-        accept = ngx_queue_data(q, ngx_win32_router_accept_t, queue);
-        ngx_win32_router_finish_accept(accept);
-    }
-
-    ngx_win32_router_free_listeners();
-    ngx_win32_router_free_flows();
-
-    if (ngx_win32_router_paused_event) {
-        ngx_close_handle(ngx_win32_router_paused_event);
-        ngx_win32_router_paused_event = NULL;
-    }
-
-    if (ngx_win32_router_port) {
-        ngx_close_handle(ngx_win32_router_port);
-        ngx_win32_router_port = NULL;
-    }
-
-    DeleteCriticalSection(&ngx_win32_router_worker_lock);
-    ngx_win32_router_worker_n = 0;
-    ngx_win32_router_initialized = 0;
-    ngx_win32_router_stopping = 0;
 }
 
 
-static ngx_thread_value_t __stdcall
-ngx_win32_router_thread(void *data)
+static ngx_err_t
+ngx_win32_router_result(ngx_win32_router_op_t *op,
+    OVERLAPPED_ENTRY *entry, DWORD *result_bytes)
 {
-    BOOL                         rc;
-    DWORD                        bytes;
-    ngx_err_t                    error;
-    ULONG_PTR                    key;
-    LPOVERLAPPED                 overlapped;
-    ngx_cycle_t                 *cycle;
-    ngx_win32_router_op_t       *op;
-    ngx_win32_router_accept_t   *accept;
-    ngx_win32_router_udp_recv_t *udp;
-    ngx_win32_router_udp_send_t *send;
+    BOOL                          rc;
+    DWORD                         bytes, flags;
+    HANDLE                        handle;
+    ngx_win32_router_pipe_read_t *read;
+    ngx_win32_router_pipe_write_t *write;
 
-    cycle = data;
+    bytes = entry->dwNumberOfBytesTransferred;
+    flags = 0;
 
-    while (!ngx_win32_router_stopping) {
-        bytes = 0;
-        key = 0;
-        overlapped = NULL;
-
-        rc = GetQueuedCompletionStatus(ngx_win32_router_port, &bytes, &key,
-                                       &overlapped, NGX_WIN32_ROUTER_WAIT);
-
-        if (overlapped) {
-            op = (ngx_win32_router_op_t *) overlapped;
-            error = rc ? 0 : ngx_errno;
-
-            if (op->type == NGX_WIN32_ROUTER_OP_ACCEPT) {
-                accept = (ngx_win32_router_accept_t *) op;
-                ngx_win32_router_complete_accept(accept, bytes, error);
-
-            } else if (op->type == NGX_WIN32_ROUTER_OP_UDP_RECV) {
-                udp = (ngx_win32_router_udp_recv_t *) op;
-                ngx_win32_router_complete_udp_recv(udp, bytes, error);
-
-            } else if (op->type == NGX_WIN32_ROUTER_OP_UDP_SEND) {
-                send = (ngx_win32_router_udp_send_t *) op;
-                ngx_win32_router_complete_udp_send(send, bytes, error);
-
-            } else {
-                ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                              "unknown Win32 router operation %ui",
-                              op->type);
-            }
-
-        } else if (rc == 0 && ngx_errno != WAIT_TIMEOUT) {
-            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                          "GetQueuedCompletionStatus(network router) "
-                          "failed");
+    if (op->type == NGX_WIN32_ROUTER_OP_ACCEPT
+        || op->type == NGX_WIN32_ROUTER_OP_UDP_RECV
+        || op->type == NGX_WIN32_ROUTER_OP_UDP_SEND)
+    {
+        rc = WSAGetOverlappedResult(op->listener->socket, &op->overlapped,
+                                    &bytes, FALSE, &flags);
+        if (rc == 0) {
+            return ngx_socket_errno;
         }
 
-        ngx_win32_router_service_channels();
-        ngx_win32_router_expire_accepts();
-        ngx_win32_router_expire_flows();
+    } else {
+        if (op->type == NGX_WIN32_ROUTER_OP_PIPE_READ) {
+            read = (ngx_win32_router_pipe_read_t *) op;
+            handle = read->worker->pipe;
 
-        if (!ngx_win32_router_accepting && ngx_win32_router_pending == 0) {
-            (void) SetEvent(ngx_win32_router_paused_event);
+        } else {
+            write = (ngx_win32_router_pipe_write_t *) op;
+            handle = write->worker->pipe;
         }
+
+        rc = GetOverlappedResult(handle, &op->overlapped, &bytes, FALSE);
+        if (rc == 0) {
+            return ngx_errno;
+        }
+    }
+
+    if (result_bytes) {
+        *result_bytes = bytes;
     }
 
     return 0;
@@ -877,7 +1333,7 @@ ngx_win32_router_post_accept(ngx_win32_router_listener_t *listener)
     ngx_err_t                  error;
     ngx_win32_router_accept_t *accept;
 
-    if (!ngx_win32_router_accepting) {
+    if (!ngx_win32_router_stream_accepting) {
         return NGX_OK;
     }
 
@@ -936,7 +1392,7 @@ ngx_win32_router_post_udp_recv(ngx_win32_router_listener_t *listener)
     ngx_err_t                   error;
     ngx_win32_router_udp_recv_t *op;
 
-    if (!ngx_win32_router_accepting) {
+    if (!ngx_win32_router_udp_accepting) {
         return NGX_OK;
     }
 
@@ -1007,7 +1463,7 @@ ngx_win32_router_complete_accept(ngx_win32_router_accept_t *accept,
     listener->pending--;
     ngx_win32_router_pending--;
 
-    if (ngx_win32_router_accepting
+    if (ngx_win32_router_stream_accepting
         && ngx_win32_router_post_accept(listener) != NGX_OK)
     {
         ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
@@ -1022,6 +1478,11 @@ ngx_win32_router_complete_accept(ngx_win32_router_accept_t *accept,
                           listener->addr_text);
         }
 
+        ngx_win32_router_finish_accept(accept);
+        return;
+    }
+
+    if (!ngx_win32_router_stream_accepting) {
         ngx_win32_router_finish_accept(accept);
         return;
     }
@@ -1060,7 +1521,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
     listener->pending--;
     ngx_win32_router_pending--;
 
-    if (ngx_win32_router_accepting
+    if (ngx_win32_router_udp_accepting
         && ngx_win32_router_post_udp_recv(listener) != NGX_OK)
     {
         ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
@@ -1075,6 +1536,11 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
                           listener->addr_text);
         }
 
+        ngx_free(op);
+        return;
+    }
+
+    if (!ngx_win32_router_udp_accepting) {
         ngx_free(op);
         return;
     }
@@ -1167,6 +1633,8 @@ ngx_win32_router_complete_udp_send(ngx_win32_router_udp_send_t *op,
     listener = op->op.listener;
     listener->pending--;
     ngx_win32_router_pending--;
+    ngx_win32_router_udp_sends--;
+    ngx_win32_router_udp_send_bytes -= op->size;
 
     if (error) {
         if (error != ERROR_OPERATION_ABORTED) {
@@ -1219,8 +1687,6 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
 
     ngx_memzero(message, sizeof(ngx_win32_channel_udp_t));
 
-    EnterCriticalSection(&ngx_win32_router_worker_lock);
-
     worker = NULL;
 
     if (route_slot != NGX_CONF_UNSET_UINT) {
@@ -1236,7 +1702,7 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
                                                    flow->generation);
         }
 
-        if (worker == NULL) {
+        if (worker == NULL && ngx_win32_router_new_flows) {
             worker = ngx_win32_router_select_worker(hash, 0);
 
             if (worker
@@ -1249,7 +1715,6 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
     }
 
     if (worker == NULL) {
-        LeaveCriticalSection(&ngx_win32_router_worker_lock);
         ngx_free(message);
         return NGX_ERROR;
     }
@@ -1272,16 +1737,14 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
     data = (u_char *) message + sizeof(ngx_win32_channel_udp_t);
     ngx_memcpy(data, op->data, bytes);
 
-    if (ngx_win32_router_write(worker->pipe, message,
-                               message->header.length)
+    if (ngx_win32_router_queue_write(worker, message,
+                                     message->header.length, 0)
         != NGX_OK)
     {
-        LeaveCriticalSection(&ngx_win32_router_worker_lock);
         ngx_free(message);
         return NGX_ERROR;
     }
 
-    LeaveCriticalSection(&ngx_win32_router_worker_lock);
     ngx_free(message);
 
     return NGX_OK;
@@ -1311,12 +1774,9 @@ ngx_win32_router_dispatch_accept(ngx_win32_router_accept_t *accept)
         return NGX_ERROR;
     }
 
-    EnterCriticalSection(&ngx_win32_router_worker_lock);
-
     worker = ngx_win32_router_select_worker(0, 1);
 
     if (worker == NULL) {
-        LeaveCriticalSection(&ngx_win32_router_worker_lock);
         ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
                       "no ready workers for a routed connection");
         return NGX_ERROR;
@@ -1337,15 +1797,6 @@ ngx_win32_router_dispatch_accept(ngx_win32_router_accept_t *accept)
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, ngx_socket_errno,
                       "WSADuplicateSocket(%P) failed for routed connection",
                       worker->pid);
-        LeaveCriticalSection(&ngx_win32_router_worker_lock);
-        return NGX_ERROR;
-    }
-
-    if (ngx_win32_router_write(worker->pipe, &message,
-                               sizeof(ngx_win32_channel_accept_t))
-        != NGX_OK)
-    {
-        LeaveCriticalSection(&ngx_win32_router_worker_lock);
         return NGX_ERROR;
     }
 
@@ -1353,153 +1804,699 @@ ngx_win32_router_dispatch_accept(ngx_win32_router_accept_t *accept)
     accept->id = message.header.id;
     accept->deadline = GetTickCount64() + NGX_WIN32_ROUTER_ACK_TIMEOUT;
     ngx_queue_insert_tail(&ngx_win32_router_handoffs, &accept->queue);
+    ngx_queue_insert_tail(
+        &ngx_win32_router_accept_buckets[accept->id
+                                        % NGX_WIN32_ROUTER_ACCEPT_BUCKETS],
+        &accept->id_queue);
 
-    LeaveCriticalSection(&ngx_win32_router_worker_lock);
+    if (ngx_win32_router_queue_write(worker, &message,
+                                     sizeof(ngx_win32_channel_accept_t),
+                                     accept->id)
+        != NGX_OK)
+    {
+        ngx_queue_remove(&accept->queue);
+        ngx_queue_remove(&accept->id_queue);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_win32_router_apply_workers(ngx_win32_router_control_t *control)
+{
+    ngx_uint_t                         i, n;
+    ngx_win32_router_worker_t         *worker;
+    ngx_win32_router_worker_snapshot_t *snapshot;
+
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        ngx_win32_router_workers[i].seen = 0;
+    }
+
+    for (n = 0; n < control->worker_n; n++) {
+        snapshot = &control->workers[n];
+        worker = NULL;
+
+        for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+            if (ngx_win32_router_workers[i].pid == snapshot->pid
+                && ngx_win32_router_workers[i].slot == snapshot->slot
+                && ngx_win32_router_workers[i].generation
+                   == snapshot->generation
+                && (ngx_win32_router_workers[i].ready
+                    || ngx_win32_router_workers[i].removing
+                    || ngx_win32_router_workers[i].failed))
+            {
+                worker = &ngx_win32_router_workers[i];
+                break;
+            }
+        }
+
+        if (worker == NULL) {
+            for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+                if (!ngx_win32_router_workers[i].ready
+                    && !ngx_win32_router_workers[i].removing
+                    && !ngx_win32_router_workers[i].failed
+                    && !ngx_win32_router_workers[i].read_pending
+                    && !ngx_win32_router_workers[i].write_pending
+                    && ngx_queue_empty(&ngx_win32_router_workers[i].writes))
+                {
+                    worker = &ngx_win32_router_workers[i];
+                    break;
+                }
+            }
+
+            if (worker == NULL) {
+                ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
+                              "no room for another Win32 routed worker");
+                return NGX_ERROR;
+            }
+
+            if (CreateIoCompletionPort(snapshot->pipe,
+                                       ngx_win32_router_port, 0, 0)
+                == NULL)
+            {
+                ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, ngx_errno,
+                              "CreateIoCompletionPort(worker %P pipe) failed",
+                              snapshot->pid);
+                return NGX_ERROR;
+            }
+
+            worker->pid = snapshot->pid;
+            worker->slot = snapshot->slot;
+            worker->generation = snapshot->generation;
+            worker->pipe = snapshot->pipe;
+            worker->failed = 0;
+            worker->read.data = worker->read.header;
+            worker->read.size = sizeof(ngx_win32_channel_header_t);
+            worker->read.offset = 0;
+        }
+
+        worker->seen = 1;
+
+        if (worker->failed) {
+            continue;
+        }
+
+        worker->ready = 1;
+        worker->removing = 0;
+        worker->active = !snapshot->exiting
+                         && snapshot->generation == control->generation;
+
+        if (ngx_win32_router_channels
+            && (ngx_win32_router_post_pipe_read(worker) != NGX_OK
+                || ngx_win32_router_post_pipe_write(worker) != NGX_OK))
+        {
+            return NGX_ERROR;
+        }
+    }
+
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        worker = &ngx_win32_router_workers[i];
+
+        if ((!worker->ready && !worker->failed) || worker->seen) {
+            continue;
+        }
+
+        worker->ready = 0;
+        worker->active = 0;
+        worker->removing = 1;
+        ngx_win32_router_drop_writes(worker, worker->write_pending);
+
+        if (worker->read_pending || worker->write_pending) {
+            (void) CancelIoEx(worker->pipe, NULL);
+
+        } else {
+            worker->pipe = NULL;
+            worker->removing = 0;
+            worker->failed = 0;
+
+            if (worker->read.data != worker->read.header) {
+                ngx_free(worker->read.data);
+                worker->read.data = worker->read.header;
+                worker->read.size = sizeof(ngx_win32_channel_header_t);
+                worker->read.offset = 0;
+            }
+        }
+    }
+
+    ngx_win32_router_generation = control->generation;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_win32_router_post_pipe_read(ngx_win32_router_worker_t *worker)
+{
+    BOOL                           rc;
+    DWORD                          bytes, error;
+    ngx_uint_t                     expected;
+    ngx_win32_router_pipe_read_t  *read;
+
+    if (!ngx_win32_router_channels || !worker->ready
+        || worker->read_pending)
+    {
+        return NGX_OK;
+    }
+
+    read = &worker->read;
+
+    if (read->data == NULL) {
+        read->data = read->header;
+        read->size = sizeof(ngx_win32_channel_header_t);
+        read->offset = 0;
+    }
+
+    ngx_memzero(&read->op.overlapped, sizeof(OVERLAPPED));
+    worker->read_pending = 1;
+    ngx_win32_router_channel_pending++;
+    bytes = 0;
+
+    rc = ReadFile(worker->pipe, read->data + read->offset,
+                  (DWORD) (read->size - read->offset), &bytes,
+                  &read->op.overlapped);
+
+    if (rc == 0) {
+        error = ngx_errno;
+
+        if (error != ERROR_IO_PENDING) {
+            worker->read_pending = 0;
+            ngx_win32_router_channel_pending--;
+            expected = !worker->active
+                       && ngx_win32_router_pipe_ended(error);
+
+            if (!expected) {
+                ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, error,
+                              "ReadFile(worker %P channel) failed",
+                              worker->pid);
+            }
+
+            worker->ready = 0;
+            worker->active = 0;
+            worker->removing = 1;
+            worker->failed = 1;
+            ngx_win32_router_drop_writes(worker, worker->write_pending);
+
+            if (worker->write_pending) {
+                (void) CancelIoEx(worker->pipe, NULL);
+            }
+
+            return expected ? NGX_OK : NGX_ERROR;
+        }
+    }
 
     return NGX_OK;
 }
 
 
 static void
-ngx_win32_router_service_channels(void)
+ngx_win32_router_complete_pipe_read(ngx_win32_router_pipe_read_t *read,
+    DWORD bytes, ngx_err_t error)
 {
-    DWORD                          available, peeked;
-    ngx_uint_t                     i;
-    ngx_queue_t                   *q, *next;
-    u_char                        *message;
-    ngx_win32_channel_header_t     header;
-    ngx_win32_channel_udp_t       *udp;
-    ngx_win32_router_accept_t     *accept;
-    ngx_win32_router_worker_t     *worker;
+    ngx_win32_channel_header_t *header;
+    ngx_win32_router_worker_t  *worker;
+    u_char                     *message;
 
-    EnterCriticalSection(&ngx_win32_router_worker_lock);
+    worker = read->worker;
+    worker->read_pending = 0;
+    ngx_win32_router_channel_pending--;
 
-    for (i = 0; i < ngx_win32_router_worker_n; i++) {
-        worker = &ngx_win32_router_workers[i];
+    if (bytes > read->size - read->offset) {
+        error = ERROR_INVALID_DATA;
+        bytes = 0;
+    }
 
-        for ( ;; ) {
-            available = 0;
-            peeked = 0;
+    read->offset += bytes;
 
-            if (PeekNamedPipe(worker->pipe, &header, sizeof(header), &peeked,
-                              &available, NULL)
-                == 0)
+    if (error) {
+        if (error != ERROR_OPERATION_ABORTED
+            && worker->ready && ngx_win32_router_channels)
+        {
+            if (worker->active
+                || !ngx_win32_router_pipe_ended(error))
             {
-                break;
+                ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, error,
+                              "worker %P channel read failed", worker->pid);
             }
 
-            if (available < sizeof(ngx_win32_channel_header_t)
-                || peeked < sizeof(ngx_win32_channel_header_t))
-            {
-                break;
+            worker->ready = 0;
+            worker->active = 0;
+            worker->removing = 1;
+            worker->failed = 1;
+            ngx_win32_router_drop_writes(worker, worker->write_pending);
+
+            if (worker->write_pending) {
+                (void) CancelIoEx(worker->pipe, NULL);
+            }
+        }
+
+        goto done;
+    }
+
+    if (bytes == 0) {
+        if (worker->ready && ngx_win32_router_channels) {
+            if (worker->active) {
+                ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
+                              "worker %P channel was closed", worker->pid);
             }
 
-            if (header.magic != NGX_WIN32_CHANNEL_MAGIC
-                || header.version != NGX_WIN32_CHANNEL_VERSION
-                || header.slot != worker->slot
-                || header.generation != worker->generation
-                || header.length < sizeof(ngx_win32_channel_header_t)
-                || header.length > NGX_WIN32_CHANNEL_MAX_MESSAGE)
-            {
-                ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
-                              "invalid Win32 worker channel message");
-                break;
-            }
+            worker->ready = 0;
+            worker->active = 0;
+            worker->removing = 1;
+            worker->failed = 1;
+            ngx_win32_router_drop_writes(worker, worker->write_pending);
+        }
 
-            if (available < header.length) {
-                break;
-            }
+        goto done;
+    }
 
-            if (!ngx_win32_router_accepting
-                && header.type == NGX_WIN32_CHANNEL_UDP_SEND)
-            {
-                break;
-            }
+    if (read->offset != read->size) {
+        (void) ngx_win32_router_post_pipe_read(worker);
+        return;
+    }
 
-            if (header.type == NGX_WIN32_CHANNEL_ACCEPT_ACK) {
-                if (header.length != sizeof(ngx_win32_channel_header_t)
-                    || ngx_win32_router_read(worker->pipe, &header,
-                                      sizeof(ngx_win32_channel_header_t))
-                       != NGX_OK)
-                {
-                    ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
-                                  "invalid Win32 worker channel "
-                                  "acknowledgement");
-                    break;
-                }
+    if (read->data == read->header) {
+        header = (ngx_win32_channel_header_t *) read->header;
 
-                for (q = ngx_queue_head(&ngx_win32_router_handoffs);
-                     q != ngx_queue_sentinel(&ngx_win32_router_handoffs);
-                     q = next)
-                {
-                    next = ngx_queue_next(q);
-                    accept = ngx_queue_data(q, ngx_win32_router_accept_t,
-                                            queue);
+        if (header->magic != NGX_WIN32_CHANNEL_MAGIC
+            || header->version != NGX_WIN32_CHANNEL_VERSION
+            || header->slot != worker->slot
+            || header->generation != worker->generation
+            || header->length < sizeof(ngx_win32_channel_header_t)
+            || header->length > NGX_WIN32_CHANNEL_MAX_MESSAGE)
+        {
+            ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
+                          "invalid worker %P channel message", worker->pid);
+            worker->ready = 0;
+            worker->active = 0;
+            worker->removing = 1;
+            worker->failed = 1;
+            goto done;
+        }
 
-                    if (accept->id != header.id
-                        || accept->target != worker->pid)
-                    {
-                        continue;
-                    }
-
-                    ngx_queue_remove(q);
-
-                    if (header.status) {
-                        ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log,
-                                      header.status,
-                                      "worker %P rejected a routed "
-                                      "connection", worker->pid);
-                    }
-
-                    ngx_win32_router_finish_accept(accept);
-                    break;
-                }
-
-                continue;
-            }
-
-            if (header.type != NGX_WIN32_CHANNEL_UDP_SEND
-                || header.length < sizeof(ngx_win32_channel_udp_t)
-                || header.length > sizeof(ngx_win32_channel_udp_t)
-                                   + NGX_WIN32_CHANNEL_UDP_MAX)
-            {
-                ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
-                              "unsupported Win32 worker channel message");
-                break;
-            }
-
-            message = ngx_alloc(header.length, ngx_win32_router_log);
-            if (message == NULL) {
-                break;
-            }
-
-            if (ngx_win32_router_read(worker->pipe, message, header.length)
+        if (header->length == sizeof(ngx_win32_channel_header_t)) {
+            if (ngx_win32_router_handle_channel(worker, read->header,
+                                                 header->length)
                 != NGX_OK)
             {
-                ngx_free(message);
-                break;
+                worker->ready = 0;
+                worker->active = 0;
+                worker->removing = 1;
+                worker->failed = 1;
+                goto done;
             }
 
-            udp = (ngx_win32_channel_udp_t *) message;
+            read->offset = 0;
+            (void) ngx_win32_router_post_pipe_read(worker);
+            return;
+        }
 
-            if (udp->data_len > NGX_WIN32_CHANNEL_UDP_MAX
-                || udp->header.length != sizeof(ngx_win32_channel_udp_t)
-                                         + udp->data_len)
-            {
-                ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
-                              "invalid routed UDP send from worker %P",
-                              worker->pid);
-                ngx_free(message);
+        message = ngx_alloc(header->length, ngx_win32_router_log);
+        if (message == NULL) {
+            worker->ready = 0;
+            worker->active = 0;
+            worker->removing = 1;
+            worker->failed = 1;
+            goto done;
+        }
+
+        ngx_memcpy(message, read->header,
+                   sizeof(ngx_win32_channel_header_t));
+        read->data = message;
+        read->size = header->length;
+        read->offset = sizeof(ngx_win32_channel_header_t);
+        (void) ngx_win32_router_post_pipe_read(worker);
+        return;
+    }
+
+    message = read->data;
+    error = ngx_win32_router_handle_channel(worker, message, read->size);
+
+    if (error != NGX_OK) {
+        worker->ready = 0;
+        worker->active = 0;
+        worker->removing = 1;
+        worker->failed = 1;
+    }
+
+    ngx_free(message);
+    read->data = read->header;
+    read->size = sizeof(ngx_win32_channel_header_t);
+    read->offset = 0;
+
+    if (error != NGX_OK) {
+        goto done;
+    }
+
+    (void) ngx_win32_router_post_pipe_read(worker);
+    return;
+
+done:
+
+    if (worker->removing && worker->write_pending) {
+        (void) CancelIoEx(worker->pipe, NULL);
+    }
+
+    if (worker->removing && !worker->write_pending) {
+        if (read->data != read->header) {
+            ngx_free(read->data);
+        }
+
+        read->data = read->header;
+        read->size = sizeof(ngx_win32_channel_header_t);
+        read->offset = 0;
+        if (!worker->failed) {
+            worker->pipe = NULL;
+        }
+
+        worker->removing = 0;
+    }
+}
+
+
+static ngx_int_t
+ngx_win32_router_handle_channel(ngx_win32_router_worker_t *worker,
+    u_char *message, size_t size)
+{
+    ngx_queue_t                 *q;
+    ngx_win32_channel_header_t  *header;
+    ngx_win32_channel_udp_t     *udp;
+    ngx_win32_router_accept_t   *accept;
+
+    header = (ngx_win32_channel_header_t *) message;
+
+    if (header->length != size) {
+        return NGX_ERROR;
+    }
+
+    if (header->type == NGX_WIN32_CHANNEL_ACCEPT_ACK) {
+        if (size != sizeof(ngx_win32_channel_header_t)) {
+            return NGX_ERROR;
+        }
+
+        for (q = ngx_queue_head(
+                 &ngx_win32_router_accept_buckets[
+                               header->id % NGX_WIN32_ROUTER_ACCEPT_BUCKETS]);
+             q != ngx_queue_sentinel(
+                 &ngx_win32_router_accept_buckets[
+                               header->id % NGX_WIN32_ROUTER_ACCEPT_BUCKETS]);
+             q = ngx_queue_next(q))
+        {
+            accept = ngx_queue_data(q, ngx_win32_router_accept_t, id_queue);
+
+            if (accept->id != header->id || accept->target != worker->pid) {
                 continue;
             }
 
-            (void) ngx_win32_router_send_udp(worker, udp,
-                         message + sizeof(ngx_win32_channel_udp_t));
-            ngx_free(message);
+            ngx_queue_remove(&accept->queue);
+            ngx_queue_remove(&accept->id_queue);
+
+            if (header->status) {
+                ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log,
+                              header->status,
+                              "worker %P rejected a routed connection",
+                              worker->pid);
+            }
+
+            ngx_win32_router_finish_accept(accept);
+            break;
+        }
+
+        return NGX_OK;
+    }
+
+    if (header->type != NGX_WIN32_CHANNEL_UDP_SEND
+        || size < sizeof(ngx_win32_channel_udp_t)
+        || size > sizeof(ngx_win32_channel_udp_t)
+                  + NGX_WIN32_CHANNEL_UDP_MAX)
+    {
+        return NGX_ERROR;
+    }
+
+    udp = (ngx_win32_channel_udp_t *) message;
+
+    if (udp->data_len > NGX_WIN32_CHANNEL_UDP_MAX
+        || size != sizeof(ngx_win32_channel_udp_t) + udp->data_len)
+    {
+        return NGX_ERROR;
+    }
+
+    if (ngx_win32_router_udp_sends >= NGX_WIN32_ROUTER_UDP_SENDS
+        || udp->data_len > NGX_WIN32_ROUTER_UDP_SEND_LIMIT
+        || ngx_win32_router_udp_send_bytes
+           > NGX_WIN32_ROUTER_UDP_SEND_LIMIT - udp->data_len)
+    {
+        ngx_log_error(NGX_LOG_WARN, ngx_win32_router_log, 0,
+                      "routed UDP send queue is full");
+        return NGX_OK;
+    }
+
+    (void) ngx_win32_router_send_udp(worker, udp,
+                     message + sizeof(ngx_win32_channel_udp_t));
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_win32_router_queue_write(ngx_win32_router_worker_t *worker,
+    const void *data, size_t size, uint64_t accept_id)
+{
+    ngx_win32_router_pipe_write_t *write;
+
+    if (!ngx_win32_router_channels || !worker->ready || size == 0
+        || worker->queued_messages >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+        || size > NGX_WIN32_ROUTER_CHANNEL_LIMIT
+        || worker->queued_bytes > NGX_WIN32_ROUTER_CHANNEL_LIMIT - size)
+    {
+        return NGX_ERROR;
+    }
+
+    write = ngx_alloc(sizeof(ngx_win32_router_pipe_write_t) + size,
+                      ngx_win32_router_log);
+    if (write == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(write, sizeof(ngx_win32_router_pipe_write_t));
+    write->op.type = NGX_WIN32_ROUTER_OP_PIPE_WRITE;
+    write->worker = worker;
+    write->size = size;
+    write->accept_id = accept_id;
+    ngx_memcpy(write->data, data, size);
+    ngx_queue_insert_tail(&worker->writes, &write->queue);
+    worker->queued_messages++;
+    worker->queued_bytes += size;
+
+    (void) ngx_win32_router_post_pipe_write(worker);
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_win32_router_post_pipe_write(ngx_win32_router_worker_t *worker)
+{
+    BOOL                            rc;
+    DWORD                           bytes, error;
+    ngx_uint_t                      expected;
+    ngx_queue_t                    *q;
+    ngx_win32_router_pipe_write_t  *write;
+
+    if (!ngx_win32_router_channels || !worker->ready
+        || worker->write_pending || ngx_queue_empty(&worker->writes))
+    {
+        return NGX_OK;
+    }
+
+    q = ngx_queue_head(&worker->writes);
+    write = ngx_queue_data(q, ngx_win32_router_pipe_write_t, queue);
+    ngx_memzero(&write->op.overlapped, sizeof(OVERLAPPED));
+    worker->write_pending = 1;
+    ngx_win32_router_channel_pending++;
+    bytes = 0;
+
+    rc = WriteFile(worker->pipe, write->data + write->offset,
+                   (DWORD) (write->size - write->offset), &bytes,
+                   &write->op.overlapped);
+
+    if (rc == 0) {
+        error = ngx_errno;
+
+        if (error != ERROR_IO_PENDING) {
+            worker->write_pending = 0;
+            ngx_win32_router_channel_pending--;
+            expected = !worker->active
+                       && ngx_win32_router_pipe_ended(error);
+
+            if (!expected) {
+                ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, error,
+                              "WriteFile(worker %P channel) failed",
+                              worker->pid);
+            }
+
+            ngx_queue_remove(&write->queue);
+            worker->queued_messages--;
+            worker->queued_bytes -= write->size;
+            ngx_win32_router_fail_accept(write->accept_id, worker->pid);
+            ngx_free(write);
+            worker->ready = 0;
+            worker->active = 0;
+            worker->removing = 1;
+            worker->failed = 1;
+            ngx_win32_router_drop_writes(worker, 0);
+
+            if (worker->read_pending) {
+                (void) CancelIoEx(worker->pipe, NULL);
+            }
+
+            return expected ? NGX_OK : NGX_ERROR;
         }
     }
 
-    LeaveCriticalSection(&ngx_win32_router_worker_lock);
+    return NGX_OK;
+}
+
+
+static void
+ngx_win32_router_complete_pipe_write(ngx_win32_router_pipe_write_t *write,
+    DWORD bytes, ngx_err_t error)
+{
+    ngx_win32_router_worker_t *worker;
+
+    worker = write->worker;
+    worker->write_pending = 0;
+    ngx_win32_router_channel_pending--;
+
+    if (bytes > write->size - write->offset) {
+        error = ERROR_INVALID_DATA;
+        bytes = 0;
+    }
+
+    write->offset += bytes;
+
+    if (error == ERROR_OPERATION_ABORTED && !ngx_win32_router_channels
+        && !worker->removing)
+    {
+        return;
+    }
+
+    if (error || bytes == 0 || worker->removing) {
+        if (error && error != ERROR_OPERATION_ABORTED && worker->ready
+            && (worker->active || !ngx_win32_router_pipe_ended(error)))
+        {
+            ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, error,
+                          "worker %P channel write failed", worker->pid);
+        }
+
+        ngx_queue_remove(&write->queue);
+        worker->queued_messages--;
+        worker->queued_bytes -= write->size;
+        ngx_win32_router_fail_accept(write->accept_id, worker->pid);
+        ngx_free(write);
+
+        if (error != ERROR_OPERATION_ABORTED) {
+            worker->ready = 0;
+            worker->active = 0;
+            worker->removing = 1;
+            worker->failed = 1;
+        }
+
+        ngx_win32_router_drop_writes(worker, 0);
+
+        if (worker->read_pending) {
+            (void) CancelIoEx(worker->pipe, NULL);
+        }
+
+        if (worker->removing && !worker->read_pending) {
+            if (!worker->failed) {
+                worker->pipe = NULL;
+            }
+
+            worker->removing = 0;
+        }
+
+        return;
+    }
+
+    if (write->offset != write->size) {
+        (void) ngx_win32_router_post_pipe_write(worker);
+        return;
+    }
+
+    ngx_queue_remove(&write->queue);
+    worker->queued_messages--;
+    worker->queued_bytes -= write->size;
+    ngx_free(write);
+    (void) ngx_win32_router_post_pipe_write(worker);
+}
+
+
+static ngx_uint_t
+ngx_win32_router_pipe_ended(ngx_err_t error)
+{
+    return error == ERROR_BROKEN_PIPE
+           || error == ERROR_PIPE_NOT_CONNECTED
+           || error == ERROR_NO_DATA;
+}
+
+
+static void
+ngx_win32_router_drop_writes(ngx_win32_router_worker_t *worker,
+    ngx_uint_t pending)
+{
+    ngx_queue_t                    *q, *next;
+    ngx_win32_router_pipe_write_t  *write;
+
+    for (q = ngx_queue_head(&worker->writes);
+         q != ngx_queue_sentinel(&worker->writes);
+         q = next)
+    {
+        next = ngx_queue_next(q);
+        write = ngx_queue_data(q, ngx_win32_router_pipe_write_t, queue);
+
+        if (pending) {
+            pending = 0;
+            continue;
+        }
+
+        ngx_queue_remove(q);
+        worker->queued_messages--;
+        worker->queued_bytes -= write->size;
+        ngx_win32_router_fail_accept(write->accept_id, worker->pid);
+        ngx_free(write);
+    }
+}
+
+
+static void
+ngx_win32_router_fail_accept(uint64_t id, ngx_pid_t pid)
+{
+    ngx_queue_t                *q;
+    ngx_win32_router_accept_t  *accept;
+
+    if (id == 0) {
+        return;
+    }
+
+    for (q = ngx_queue_head(
+             &ngx_win32_router_accept_buckets[
+                                      id % NGX_WIN32_ROUTER_ACCEPT_BUCKETS]);
+         q != ngx_queue_sentinel(
+             &ngx_win32_router_accept_buckets[
+                                      id % NGX_WIN32_ROUTER_ACCEPT_BUCKETS]);
+         q = ngx_queue_next(q))
+    {
+        accept = ngx_queue_data(q, ngx_win32_router_accept_t, id_queue);
+
+        if (accept->id == id && accept->target == pid) {
+            ngx_queue_remove(&accept->queue);
+            ngx_queue_remove(&accept->id_queue);
+            ngx_win32_router_finish_accept(accept);
+            return;
+        }
+    }
 }
 
 
@@ -1549,6 +2546,7 @@ ngx_win32_router_send_udp(ngx_win32_router_worker_t *worker,
     op->op.type = NGX_WIN32_ROUTER_OP_UDP_SEND;
     op->op.listener = listener;
     op->expected = udp->data_len;
+    op->size = udp->data_len;
     op->wsabuf.buf = (char *) op->data;
     op->wsabuf.len = udp->data_len;
     ngx_memcpy(op->data, data, udp->data_len);
@@ -1586,6 +2584,8 @@ ngx_win32_router_send_udp(ngx_win32_router_worker_t *worker,
 
     listener->pending++;
     ngx_win32_router_pending++;
+    ngx_win32_router_udp_sends++;
+    ngx_win32_router_udp_send_bytes += udp->data_len;
     bytes = 0;
 
     if (listener->wildcard) {
@@ -1608,6 +2608,8 @@ ngx_win32_router_send_udp(ngx_win32_router_worker_t *worker,
 
         listener->pending--;
         ngx_win32_router_pending--;
+        ngx_win32_router_udp_sends--;
+        ngx_win32_router_udp_send_bytes -= udp->data_len;
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, error,
                       "could not send routed UDP datagram for worker %P",
                       worker->pid);
@@ -1828,8 +2830,9 @@ ngx_win32_router_find_worker(ngx_pid_t pid, ngx_uint_t slot,
 {
     ngx_uint_t  i;
 
-    for (i = 0; i < ngx_win32_router_worker_n; i++) {
-        if (ngx_win32_router_workers[i].pid == pid
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        if (ngx_win32_router_workers[i].ready
+            && ngx_win32_router_workers[i].pid == pid
             && ngx_win32_router_workers[i].slot == slot
             && ngx_win32_router_workers[i].generation == generation)
         {
@@ -1846,8 +2849,9 @@ ngx_win32_router_find_quic_worker(ngx_uint_t slot, ngx_uint_t generation)
 {
     ngx_uint_t  i;
 
-    for (i = 0; i < ngx_win32_router_worker_n; i++) {
-        if (ngx_win32_router_workers[i].slot == slot
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        if (ngx_win32_router_workers[i].ready
+            && ngx_win32_router_workers[i].slot == slot
             && (ngx_win32_router_workers[i].generation & 0xffff)
                == generation)
         {
@@ -1862,13 +2866,45 @@ ngx_win32_router_find_quic_worker(ngx_uint_t slot, ngx_uint_t generation)
 static ngx_win32_router_worker_t *
 ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
 {
-    ngx_uint_t  i, n, target;
+    ngx_uint_t                  i, n, start, target;
+    ngx_win32_router_worker_t  *best, *worker;
+
+    if (round_robin) {
+        best = NULL;
+        start = ngx_win32_router_next_worker++ % NGX_MAX_PROCESSES;
+
+        for (n = 0; n < NGX_MAX_PROCESSES; n++) {
+            i = (start + n) % NGX_MAX_PROCESSES;
+            worker = &ngx_win32_router_workers[i];
+
+            if (!worker->ready || !worker->active
+                || worker->queued_messages
+                   >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+                || worker->queued_bytes >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
+            {
+                continue;
+            }
+
+            if (best == NULL || worker->queued_bytes < best->queued_bytes
+                || (worker->queued_bytes == best->queued_bytes
+                    && worker->queued_messages < best->queued_messages))
+            {
+                best = worker;
+            }
+        }
+
+        return best;
+    }
 
     n = 0;
 
-    for (i = 0; i < ngx_win32_router_worker_n; i++) {
-        if (ngx_win32_router_workers[i].generation
-            == ngx_win32_router_generation)
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        if (ngx_win32_router_workers[i].ready
+            && ngx_win32_router_workers[i].active
+            && ngx_win32_router_workers[i].queued_messages
+               < NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+            && ngx_win32_router_workers[i].queued_bytes
+               < NGX_WIN32_ROUTER_CHANNEL_LIMIT)
         {
             n++;
         }
@@ -1878,11 +2914,15 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
         return NULL;
     }
 
-    target = round_robin ? ngx_win32_router_next_worker++ % n : hash % n;
+    target = hash % n;
 
-    for (i = 0; i < ngx_win32_router_worker_n; i++) {
-        if (ngx_win32_router_workers[i].generation
-            != ngx_win32_router_generation)
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        if (!ngx_win32_router_workers[i].ready
+            || !ngx_win32_router_workers[i].active
+            || ngx_win32_router_workers[i].queued_messages
+               >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+            || ngx_win32_router_workers[i].queued_bytes
+               >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
         {
             continue;
         }
@@ -1913,13 +2953,17 @@ ngx_win32_router_expire_accepts(void)
         accept = ngx_queue_data(q, ngx_win32_router_accept_t, queue);
 
         if (accept->deadline > now) {
-            continue;
+            break;
         }
 
-        ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
-                      "worker %P did not acknowledge a routed connection",
-                      accept->target);
+        if (ngx_win32_router_log) {
+            ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
+                          "worker %P did not acknowledge a routed connection",
+                          accept->target);
+        }
+
         ngx_queue_remove(q);
+        ngx_queue_remove(&accept->id_queue);
         ngx_win32_router_finish_accept(accept);
     }
 }
@@ -1959,56 +3003,6 @@ ngx_win32_router_finish_accept(ngx_win32_router_accept_t *accept)
     }
 
     ngx_free(accept);
-}
-
-
-static ngx_int_t
-ngx_win32_router_read(HANDLE pipe, void *data, size_t size)
-{
-    DWORD   n;
-    u_char *p;
-
-    p = data;
-
-    while (size) {
-        if (ReadFile(pipe, p, (DWORD) ngx_min(size, 0xffffffff), &n, NULL)
-            == 0
-            || n == 0)
-        {
-            return NGX_ERROR;
-        }
-
-        p += n;
-        size -= n;
-    }
-
-    return NGX_OK;
-}
-
-
-static ngx_int_t
-ngx_win32_router_write(HANDLE pipe, const void *data, size_t size)
-{
-    DWORD         n;
-    const u_char *p;
-
-    p = data;
-
-    while (size) {
-        if (WriteFile(pipe, p, (DWORD) ngx_min(size, 0xffffffff), &n, NULL)
-            == 0
-            || n == 0)
-        {
-            ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, ngx_errno,
-                          "WriteFile(Win32 worker channel) failed");
-            return NGX_ERROR;
-        }
-
-        p += n;
-        size -= n;
-    }
-
-    return NGX_OK;
 }
 
 
