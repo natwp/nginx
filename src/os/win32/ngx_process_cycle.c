@@ -1057,6 +1057,25 @@ ngx_worker_process_exit(ngx_cycle_t *cycle)
         }
     }
 
+    if (ngx_process == NGX_PROCESS_SINGLE) {
+        ngx_delete_pidfile(cycle);
+
+        ngx_close_handle(ngx_stop_event);
+        ngx_stop_event = NULL;
+        ngx_close_handle(ngx_quit_event);
+        ngx_quit_event = NULL;
+        ngx_close_handle(ngx_reopen_event);
+        ngx_reopen_event = NULL;
+        ngx_close_handle(ngx_reload_event);
+        ngx_reload_event = NULL;
+
+        for (i = 0; cycle->modules[i]; i++) {
+            if (cycle->modules[i]->exit_master) {
+                cycle->modules[i]->exit_master(cycle);
+            }
+        }
+    }
+
     ngx_destroy_pool(cycle->pool);
 
     exit(0);
@@ -1192,7 +1211,10 @@ ngx_cache_loader_thread(void *data)
 void
 ngx_single_process_cycle(ngx_cycle_t *cycle)
 {
+    u_long     ev;
+    ngx_err_t  err;
     ngx_tid_t  tid;
+    HANDLE     events[5];
 
     ngx_console_init(cycle);
 
@@ -1205,8 +1227,91 @@ ngx_single_process_cycle(ngx_cycle_t *cycle)
         exit(2);
     }
 
-    /* STUB */
-    WaitForSingleObject(ngx_stop_event, INFINITE);
+    events[0] = ngx_stop_event;
+    events[1] = ngx_quit_event;
+    events[2] = ngx_reopen_event;
+    events[3] = ngx_reload_event;
+    events[4] = tid;
+
+    for ( ;; ) {
+        ev = WaitForMultipleObjects(5, events, 0, INFINITE);
+
+        err = ngx_errno;
+        ngx_time_update();
+
+        if (ev == WAIT_OBJECT_0) {
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "exiting");
+
+            if (ResetEvent(ngx_stop_event) == 0) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                              "ResetEvent(\"%s\") failed",
+                              ngx_stop_event_name);
+            }
+
+            ngx_terminate = 1;
+            break;
+        }
+
+        if (ev == WAIT_OBJECT_0 + 1) {
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "shutting down");
+
+            if (ResetEvent(ngx_quit_event) == 0) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                              "ResetEvent(\"%s\") failed",
+                              ngx_quit_event_name);
+            }
+
+            ngx_quit = 1;
+            break;
+        }
+
+        if (ev == WAIT_OBJECT_0 + 2) {
+            if (ResetEvent(ngx_reopen_event) == 0) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                              "ResetEvent(\"%s\") failed",
+                              ngx_reopen_event_name);
+            }
+
+            ngx_reopen = 1;
+            continue;
+        }
+
+        if (ev == WAIT_OBJECT_0 + 3) {
+            if (ResetEvent(ngx_reload_event) == 0) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                              "ResetEvent(\"%s\") failed",
+                              ngx_reload_event_name);
+            }
+
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "reload is not supported with "
+                          "master_process off");
+            continue;
+        }
+
+        if (ev == WAIT_OBJECT_0 + 4) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                          "worker thread exited unexpectedly");
+            ngx_terminate = 1;
+            break;
+        }
+
+        if (ev == WAIT_FAILED) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, err,
+                          "WaitForMultipleObjects() failed");
+            ngx_terminate = 1;
+            break;
+        }
+    }
+
+    if (WaitForSingleObject(tid, INFINITE) == WAIT_FAILED) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "WaitForSingleObject() failed");
+    }
+
+    ngx_close_handle(tid);
+
+    ngx_worker_process_exit((ngx_cycle_t *) ngx_cycle);
 }
 
 
