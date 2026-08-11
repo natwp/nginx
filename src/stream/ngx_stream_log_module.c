@@ -378,6 +378,10 @@ ngx_stream_log_write(ngx_stream_session_t *s, ngx_stream_log_t *log,
     if (log->script == NULL) {
         name = log->file->name.data;
 
+        if (name == NULL) {
+            name = (u_char *) "stderr";
+        }
+
 #if (NGX_ZLIB)
         buffer = log->file->data;
 
@@ -623,11 +627,17 @@ ngx_stream_log_gzip_free(void *opaque, void *address)
 static void
 ngx_stream_log_flush(ngx_open_file_t *file, ngx_log_t *log)
 {
+    u_char                *name;
     size_t                 len;
     ssize_t                n;
     ngx_stream_log_buf_t  *buffer;
 
     buffer = file->data;
+    name = file->name.data;
+
+    if (name == NULL) {
+        name = (u_char *) "stderr";
+    }
 
     len = buffer->pos - buffer->start;
 
@@ -649,12 +659,12 @@ ngx_stream_log_flush(ngx_open_file_t *file, ngx_log_t *log)
     if (n == -1) {
         ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
                       ngx_write_fd_n " to \"%s\" failed",
-                      file->name.data);
+                      name);
 
     } else if ((size_t) n != len) {
         ngx_log_error(NGX_LOG_ALERT, log, 0,
                       ngx_write_fd_n " to \"%s\" was incomplete: %z of %uz",
-                      file->name.data, n, len);
+                      name, n, len);
     }
 
     buffer->pos = buffer->start;
@@ -1099,36 +1109,47 @@ ngx_stream_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         goto process_formats;
     }
 
-    n = ngx_stream_script_variables_count(&value[1]);
+    if (ngx_strcmp(value[1].data, "stderr") == 0) {
+        ngx_str_null(&name);
 
-    if (n == 0) {
-        log->file = ngx_conf_open_file(cf->cycle, &value[1]);
+        log->file = ngx_conf_open_file(cf->cycle, &name);
         if (log->file == NULL) {
             return NGX_CONF_ERROR;
         }
 
     } else {
-        if (ngx_conf_full_name(cf->cycle, &value[1], 0) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
+        n = ngx_stream_script_variables_count(&value[1]);
 
-        log->script = ngx_pcalloc(cf->pool, sizeof(ngx_stream_log_script_t));
-        if (log->script == NULL) {
-            return NGX_CONF_ERROR;
-        }
+        if (n == 0) {
+            log->file = ngx_conf_open_file(cf->cycle, &value[1]);
+            if (log->file == NULL) {
+                return NGX_CONF_ERROR;
+            }
 
-        ngx_memzero(&sc, sizeof(ngx_stream_script_compile_t));
+        } else {
+            if (ngx_conf_full_name(cf->cycle, &value[1], 0) != NGX_OK) {
+                return NGX_CONF_ERROR;
+            }
 
-        sc.cf = cf;
-        sc.source = &value[1];
-        sc.lengths = &log->script->lengths;
-        sc.values = &log->script->values;
-        sc.variables = n;
-        sc.complete_lengths = 1;
-        sc.complete_values = 1;
+            log->script = ngx_pcalloc(cf->pool,
+                                      sizeof(ngx_stream_log_script_t));
+            if (log->script == NULL) {
+                return NGX_CONF_ERROR;
+            }
 
-        if (ngx_stream_script_compile(&sc) != NGX_OK) {
-            return NGX_CONF_ERROR;
+            ngx_memzero(&sc, sizeof(ngx_stream_script_compile_t));
+
+            sc.cf = cf;
+            sc.source = &value[1];
+            sc.lengths = &log->script->lengths;
+            sc.values = &log->script->values;
+            sc.variables = n;
+            sc.complete_lengths = 1;
+            sc.complete_values = 1;
+
+            if (ngx_stream_script_compile(&sc) != NGX_OK) {
+                return NGX_CONF_ERROR;
+            }
         }
     }
 
