@@ -518,6 +518,10 @@ ngx_event_module_init(ngx_cycle_t *cycle)
     ngx_time_t          *tp;
     ngx_core_conf_t     *ccf;
     ngx_event_conf_t    *ecf;
+#if (NGX_WIN32)
+    ngx_uint_t           i;
+    ngx_listening_t     *ls;
+#endif
 
     cf = ngx_get_conf(cycle->conf_ctx, ngx_events_module);
     ecf = (*cf)[ngx_event_core_module.ctx_index];
@@ -528,6 +532,34 @@ ngx_event_module_init(ngx_cycle_t *cycle)
     }
 
     ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+
+#if (NGX_WIN32)
+
+    if (ecf->use != ngx_iocp_module.ctx_index) {
+        ls = cycle->listening.elts;
+
+        for (i = 0; i < cycle->listening.nelts; i++) {
+            if (!ls[i].ignore && ls[i].type != SOCK_STREAM) {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                              "the \"%s\" event method does not support "
+                              "datagram listener %V on Windows; use \"iocp\"",
+                              ecf->name, &ls[i].addr_text);
+                return NGX_ERROR;
+            }
+        }
+
+        if (ccf->master && ccf->worker_processes > 1
+            && !ecf->accept_mutex)
+        {
+            ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                          "accept_mutex off is not supported by the \"%s\" "
+                          "event method with multiple Windows workers; "
+                          "using accept_mutex on",
+                          ecf->name);
+        }
+    }
+
+#endif
 
     ngx_timer_resolution = ccf->timer_resolution;
 
@@ -940,6 +972,14 @@ ngx_event_process_init(ngx_cycle_t *cycle)
             }
 
         } else {
+            if (c->type != SOCK_STREAM) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                              "the \"%s\" event method cannot initialize "
+                              "datagram listener %V on Windows",
+                              ecf->name, &ls[i].addr_text);
+                return NGX_ERROR;
+            }
+
             rev->handler = ngx_event_accept;
 
             if (ngx_use_accept_mutex) {

@@ -11,6 +11,7 @@
 
 #define NGX_UTF16_BUFLEN  256
 #define NGX_UTF8_BUFLEN   512
+#define NGX_WIN32_LONG_PATH  32768
 
 static ngx_int_t ngx_win32_check_filename(u_short *u, size_t len,
     ngx_uint_t dirname);
@@ -676,39 +677,84 @@ ngx_getcwd(u_char *buf, size_t size)
 }
 
 
-size_t
-ngx_get_executable_dir(u_char *buf, size_t size)
+u_char *
+ngx_get_executable_dir(size_t *len)
 {
-    DWORD    n;
-    u_char  *p;
+    DWORD     n, size;
+    size_t    utf8_len;
+    u_char   *p, *utf8;
+    u_short  *utf16;
 
-    if (size == 0) {
-        ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
-        return 0;
-    }
+    *len = 0;
+    size = MAX_PATH;
+    utf16 = NULL;
 
-    n = GetModuleFileName(NULL, (char *) buf, (DWORD) size);
+    for ( ;; ) {
+        utf16 = malloc(size * sizeof(u_short));
+        if (utf16 == NULL) {
+            ngx_set_errno(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
 
-    if (n == 0) {
-        return 0;
-    }
+        utf16[size - 1] = 0;
+        n = GetModuleFileNameW(NULL, (WCHAR *) utf16, size);
 
-    if (n >= size) {
-        ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
-        return 0;
-    }
+        if (n == 0) {
+            ngx_free(utf16);
+            return NULL;
+        }
 
-    for (p = buf + n; p > buf; p--) {
-        if (ngx_path_separator(p[-1])) {
-            n = (DWORD) (p - buf);
-            buf[n - 1] = '/';
-            buf[n] = '\0';
-            return n;
+        if (n < size && utf16[n] == 0) {
+            break;
+        }
+
+        ngx_free(utf16);
+
+        if (size >= NGX_WIN32_LONG_PATH) {
+            ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
+            return NULL;
+        }
+
+        size *= 2;
+
+        if (size > NGX_WIN32_LONG_PATH) {
+            size = NGX_WIN32_LONG_PATH;
         }
     }
 
+    utf8_len = ((size_t) n + 1) * 4;
+    utf8 = malloc(utf8_len);
+    if (utf8 == NULL) {
+        ngx_free(utf16);
+        ngx_set_errno(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+
+    p = ngx_utf16_to_utf8(utf8, utf16, &utf8_len, NULL);
+    ngx_free(utf16);
+
+    if (p == NULL) {
+        ngx_free(utf8);
+        return NULL;
+    }
+
+    if (p != utf8) {
+        ngx_free(utf8);
+        utf8 = p;
+    }
+
+    for (p = utf8 + utf8_len - 1; p > utf8; p--) {
+        if (ngx_path_separator(p[-1])) {
+            p[-1] = '/';
+            *p = '\0';
+            *len = p - utf8;
+            return utf8;
+        }
+    }
+
+    ngx_free(utf8);
     ngx_set_errno(ERROR_PATH_NOT_FOUND);
-    return 0;
+    return NULL;
 }
 
 

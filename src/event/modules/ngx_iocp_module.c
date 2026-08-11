@@ -174,10 +174,6 @@ static GUID  iocp_wsasendmsg_guid = WSAID_WSASENDMSG;
 static ngx_int_t
 ngx_iocp_init(ngx_cycle_t *cycle, ngx_msec_t timer)
 {
-    ngx_iocp_conf_t  *cf;
-
-    cf = ngx_event_get_conf(cycle->conf_ctx, ngx_iocp_module);
-
     if (iocp == NULL) {
         iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
         if (iocp == NULL) {
@@ -190,11 +186,6 @@ ngx_iocp_init(ngx_cycle_t *cycle, ngx_msec_t timer)
         ngx_iocp_generation = 0;
         ngx_iocp_pending = 0;
         ngx_iocp_notifications = 0;
-    }
-
-    if (cf->threads > 1) {
-        ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
-                      "iocp_threads is limited to one completion dispatcher");
     }
 
     ngx_memzero(&ngx_iocp_notify_event, sizeof(ngx_event_t));
@@ -1429,6 +1420,13 @@ ngx_iocp_init_conf(ngx_cycle_t *cycle, void *conf)
     if (cf->threads < 0) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
                       "iocp_threads must not be negative");
+        return NGX_CONF_ERROR;
+    }
+
+    if (cf->threads > 1) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "iocp_threads must be 0 or 1; IOCP uses one completion "
+                      "dispatcher per worker process");
         return NGX_CONF_ERROR;
     }
 

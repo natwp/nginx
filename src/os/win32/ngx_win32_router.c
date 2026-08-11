@@ -16,6 +16,7 @@
 
 
 #define NGX_WIN32_ROUTER_PAUSE_TIMEOUT 30000
+#define NGX_WIN32_ROUTER_GRACE_TIMEOUT 5000
 #define NGX_WIN32_ROUTER_ACK_TIMEOUT   10000
 #define NGX_WIN32_ROUTER_ACCEPTS       32
 #define NGX_WIN32_ROUTER_BATCH         64
@@ -170,6 +171,7 @@ typedef struct {
 struct ngx_win32_router_control_s {
     ngx_win32_router_op_t              op;
     volatile LONG                      refs;
+    volatile LONG                      abandoned;
     HANDLE                             event;
     ngx_uint_t                         command;
     ngx_uint_t                         generation;
@@ -325,6 +327,7 @@ static size_t           ngx_win32_router_udp_send_bytes;
 static ngx_uint_t       ngx_win32_router_next_worker;
 static uint64_t         ngx_win32_router_next_id;
 static ngx_uint_t       ngx_win32_router_initialized;
+static ngx_uint_t       ngx_win32_router_broken;
 static ngx_uint_t       ngx_win32_router_generation;
 static ngx_win32_router_worker_t ngx_win32_router_workers[NGX_MAX_PROCESSES];
 static ngx_win32_router_control_t *ngx_win32_router_pending_control;
@@ -360,6 +363,13 @@ ngx_win32_router_required(ngx_cycle_t *cycle)
 
     return ccf && ecf && ccf->master && ccf->worker_processes > 0
            && ecf->use == ngx_iocp_module.ctx_index;
+}
+
+
+ngx_uint_t
+ngx_win32_router_failed(void)
+{
+    return ngx_win32_router_broken;
 }
 
 
@@ -417,6 +427,7 @@ ngx_win32_router_start(ngx_cycle_t *cycle, ngx_uint_t generation)
     ngx_win32_router_new_flows = 0;
     ngx_win32_router_channels = 0;
     ngx_win32_router_stopping = 0;
+    ngx_win32_router_broken = 0;
     ngx_win32_router_pending = 0;
     ngx_win32_router_channel_pending = 0;
     ngx_win32_router_udp_sends = 0;
@@ -690,6 +701,10 @@ ngx_win32_router_command(ngx_cycle_t *cycle, ngx_uint_t command,
     ngx_win32_router_control_t    *control;
     ngx_win32_router_worker_snapshot_t *snapshot;
 
+    if (ngx_win32_router_broken) {
+        return NGX_ERROR;
+    }
+
     control = ngx_calloc(sizeof(ngx_win32_router_control_t), cycle->log);
     if (control == NULL) {
         return NGX_ERROR;
@@ -737,6 +752,7 @@ ngx_win32_router_command(ngx_cycle_t *cycle, ngx_uint_t command,
         ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
                       "PostQueuedCompletionStatus(network router control) "
                       "failed");
+        ngx_win32_router_broken = 1;
         ngx_win32_router_release_control(control);
         ngx_win32_router_release_control(control);
         return NGX_ERROR;
@@ -749,7 +765,21 @@ ngx_win32_router_command(ngx_cycle_t *cycle, ngx_uint_t command,
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                       "Win32 network router control %ui exceeded %dms",
                       command, NGX_WIN32_ROUTER_PAUSE_TIMEOUT);
-        wait = WaitForSingleObject(control->event, INFINITE);
+
+        wait = WaitForSingleObject(control->event,
+                                   NGX_WIN32_ROUTER_GRACE_TIMEOUT);
+
+        if (wait == WAIT_TIMEOUT) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                          "Win32 network router control %ui did not complete "
+                          "within an additional %dms; router is unusable",
+                          command, NGX_WIN32_ROUTER_GRACE_TIMEOUT);
+
+            InterlockedExchange(&control->abandoned, 1);
+            ngx_win32_router_broken = 1;
+            ngx_win32_router_release_control(control);
+            return NGX_ERROR;
+        }
     }
 
     if (wait == WAIT_OBJECT_0) {
@@ -759,6 +789,9 @@ ngx_win32_router_command(ngx_cycle_t *cycle, ngx_uint_t command,
         ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
                       "WaitForSingleObject(network router control %ui) "
                       "failed", command);
+
+        InterlockedExchange(&control->abandoned, 1);
+        ngx_win32_router_broken = 1;
         rc = NGX_ERROR;
     }
 
@@ -800,6 +833,11 @@ ngx_win32_router_process_control(ngx_win32_router_control_t *control)
     ngx_iocp_conf_t             *iocpcf;
     ngx_win32_router_listener_t *listener;
     ngx_win32_router_worker_t   *worker;
+
+    if (InterlockedCompareExchange(&control->abandoned, 0, 0)) {
+        ngx_win32_router_complete_control(control);
+        return;
+    }
 
     ngx_win32_router_log = control->cycle->log;
 

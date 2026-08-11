@@ -192,8 +192,8 @@ size_t ngx_getcwd(u_char *buf, size_t size);
 #define ngx_getcwd_n                "GetCurrentDirectory()"
 
 
-size_t ngx_get_executable_dir(u_char *buf, size_t size);
-#define ngx_get_executable_dir_n    "GetModuleFileName()"
+u_char *ngx_get_executable_dir(size_t *len);
+#define ngx_get_executable_dir_n    "GetModuleFileNameW()"
 
 
 #define ngx_path_separator(c)       ((c) == '/' || (c) == '\\')

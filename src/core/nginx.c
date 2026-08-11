@@ -1162,19 +1162,23 @@ static ngx_int_t
 ngx_set_executable_prefix(ngx_cycle_t *cycle)
 {
     size_t   len;
-    u_char  *p;
+    u_char  *name, *p;
 
-    p = ngx_pnalloc(cycle->pool, NGX_MAX_PATH + 1);
-    if (p == NULL) {
-        return NGX_ERROR;
-    }
-
-    len = ngx_get_executable_dir(p, NGX_MAX_PATH + 1);
-    if (len == 0) {
+    name = ngx_get_executable_dir(&len);
+    if (name == NULL) {
         ngx_log_stderr(ngx_errno,
                        "[emerg]: " ngx_get_executable_dir_n " failed");
         return NGX_ERROR;
     }
+
+    p = ngx_pnalloc(cycle->pool, len + 1);
+    if (p == NULL) {
+        ngx_free(name);
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(p, name, len + 1);
+    ngx_free(name);
 
     cycle->conf_prefix.len = len;
     cycle->conf_prefix.data = p;
@@ -1244,6 +1248,17 @@ ngx_core_module_init_conf(ngx_cycle_t *cycle, void *conf)
 
     ngx_conf_init_value(ccf->worker_processes, 1);
     ngx_conf_init_value(ccf->debug_points, 0);
+
+#if (NGX_WIN32)
+
+    if (ccf->worker_processes > NGX_MAX_PROCESSES) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "\"worker_processes\" must not exceed %d on Windows",
+                      NGX_MAX_PROCESSES);
+        return NGX_CONF_ERROR;
+    }
+
+#endif
 
 #if (NGX_HAVE_CPU_AFFINITY)
 

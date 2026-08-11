@@ -156,6 +156,15 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
 
     for ( ;; ) {
 
+        if (ngx_win32_router_failed()) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                          "Win32 network router failed; terminating");
+
+            ngx_terminate = 1;
+            ngx_terminate_worker_processes(cycle);
+            ngx_master_process_exit(cycle);
+        }
+
         nev = 5;
 
         if (timer) {
@@ -742,7 +751,7 @@ ngx_master_process_exit(ngx_cycle_t *cycle)
 
     ngx_destroy_pool(cycle->pool);
 
-    exit(0);
+    exit(ngx_win32_router_failed() ? 2 : 0);
 }
 
 

@@ -320,11 +320,15 @@ ngx_log_init(u_char *prefix, u_char *error_log)
     u_char  *p, *name;
     size_t   nlen, plen;
 #if (NGX_WIN32)
-    u_char   executable_dir[NGX_MAX_PATH + 1];
+    u_char  *executable_dir;
 #endif
 
     ngx_log.file = &ngx_log_file;
     ngx_log.log_level = NGX_LOG_NOTICE;
+
+#if (NGX_WIN32)
+    executable_dir = NULL;
+#endif
 
     if (error_log == NULL) {
         error_log = (u_char *) NGX_ERROR_LOG_PATH;
@@ -352,25 +356,16 @@ ngx_log_init(u_char *prefix, u_char *error_log)
         } else {
 #if (NGX_WIN32)
             if (prefix) {
+                executable_dir = ngx_get_executable_dir(&plen);
                 prefix = executable_dir;
-                plen = ngx_get_executable_dir(prefix, sizeof(executable_dir));
-
-                if (plen == 0) {
-                    prefix = NULL;
-                }
 
             } else {
 #ifdef NGX_PREFIX
                 prefix = (u_char *) NGX_PREFIX;
                 plen = ngx_strlen(prefix);
 #else
+                executable_dir = ngx_get_executable_dir(&plen);
                 prefix = executable_dir;
-                plen = ngx_get_executable_dir(prefix,
-                                              sizeof(executable_dir));
-
-                if (plen == 0) {
-                    prefix = NULL;
-                }
 #endif
             }
 #else
@@ -386,6 +381,11 @@ ngx_log_init(u_char *prefix, u_char *error_log)
         if (plen) {
             name = malloc(plen + nlen + 2);
             if (name == NULL) {
+#if (NGX_WIN32)
+                if (executable_dir) {
+                    ngx_free(executable_dir);
+                }
+#endif
                 return NULL;
             }
 
@@ -421,6 +421,12 @@ ngx_log_init(u_char *prefix, u_char *error_log)
     if (p) {
         ngx_free(p);
     }
+
+#if (NGX_WIN32)
+    if (executable_dir) {
+        ngx_free(executable_dir);
+    }
+#endif
 
     return &ngx_log;
 }
