@@ -21,6 +21,9 @@ static void ngx_cleanup_environment_variable(void *data);
 static ngx_int_t ngx_get_options(int argc, char *const *argv);
 static ngx_int_t ngx_process_options(ngx_cycle_t *cycle);
 static ngx_int_t ngx_save_argv(ngx_cycle_t *cycle, int argc, char *const *argv);
+#if (NGX_WIN32)
+static ngx_int_t ngx_set_executable_prefix(ngx_cycle_t *cycle);
+#endif
 static void *ngx_core_module_create_conf(ngx_cycle_t *cycle);
 static char *ngx_core_module_init_conf(ngx_cycle_t *cycle, void *conf);
 static char *ngx_set_user(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -436,6 +439,9 @@ ngx_show_version_info(void)
                                "stop, quit, reopen, reload" NGX_LINEFEED
 #ifdef NGX_PREFIX
             "  -p prefix     : set prefix path (default: " NGX_PREFIX ")"
+                               NGX_LINEFEED
+#elif (NGX_WIN32)
+            "  -p prefix     : set prefix path (default: executable directory)"
                                NGX_LINEFEED
 #else
             "  -p prefix     : set prefix path (default: NONE)" NGX_LINEFEED
@@ -1024,7 +1030,7 @@ ngx_process_options(ngx_cycle_t *cycle)
     u_char  *p;
     size_t   len;
 
-    if (ngx_prefix) {
+    if (ngx_prefix && *ngx_prefix) {
         len = ngx_strlen(ngx_prefix);
         p = ngx_prefix;
 
@@ -1044,6 +1050,32 @@ ngx_process_options(ngx_cycle_t *cycle)
         cycle->prefix.data = p;
 
     } else {
+
+#if (NGX_WIN32)
+
+#ifndef NGX_PREFIX
+        if (ngx_set_executable_prefix(cycle) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+#else
+        if (ngx_prefix) {
+            if (ngx_set_executable_prefix(cycle) != NGX_OK) {
+                return NGX_ERROR;
+            }
+
+        } else {
+#ifdef NGX_CONF_PREFIX
+            ngx_str_set(&cycle->conf_prefix, NGX_CONF_PREFIX);
+#else
+            ngx_str_set(&cycle->conf_prefix, NGX_PREFIX);
+#endif
+            ngx_str_set(&cycle->prefix, NGX_PREFIX);
+        }
+
+#endif
+
+#else
 
 #ifndef NGX_PREFIX
 
@@ -1074,6 +1106,8 @@ ngx_process_options(ngx_cycle_t *cycle)
         ngx_str_set(&cycle->conf_prefix, NGX_PREFIX);
 #endif
         ngx_str_set(&cycle->prefix, NGX_PREFIX);
+
+#endif
 
 #endif
     }
@@ -1120,6 +1154,37 @@ ngx_process_options(ngx_cycle_t *cycle)
 
     return NGX_OK;
 }
+
+
+#if (NGX_WIN32)
+
+static ngx_int_t
+ngx_set_executable_prefix(ngx_cycle_t *cycle)
+{
+    size_t   len;
+    u_char  *p;
+
+    p = ngx_pnalloc(cycle->pool, NGX_MAX_PATH + 1);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    len = ngx_get_executable_dir(p, NGX_MAX_PATH + 1);
+    if (len == 0) {
+        ngx_log_stderr(ngx_errno,
+                       "[emerg]: " ngx_get_executable_dir_n " failed");
+        return NGX_ERROR;
+    }
+
+    cycle->conf_prefix.len = len;
+    cycle->conf_prefix.data = p;
+    cycle->prefix.len = len;
+    cycle->prefix.data = p;
+
+    return NGX_OK;
+}
+
+#endif
 
 
 static void *

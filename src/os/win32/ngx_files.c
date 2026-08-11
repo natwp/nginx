@@ -676,6 +676,42 @@ ngx_getcwd(u_char *buf, size_t size)
 }
 
 
+size_t
+ngx_get_executable_dir(u_char *buf, size_t size)
+{
+    DWORD    n;
+    u_char  *p;
+
+    if (size == 0) {
+        ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+
+    n = GetModuleFileName(NULL, (char *) buf, (DWORD) size);
+
+    if (n == 0) {
+        return 0;
+    }
+
+    if (n >= size) {
+        ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+
+    for (p = buf + n; p > buf; p--) {
+        if (ngx_path_separator(p[-1])) {
+            n = (DWORD) (p - buf);
+            buf[n - 1] = '/';
+            buf[n] = '\0';
+            return n;
+        }
+    }
+
+    ngx_set_errno(ERROR_PATH_NOT_FOUND);
+    return 0;
+}
+
+
 ngx_int_t
 ngx_open_dir(ngx_str_t *name, ngx_dir_t *dir)
 {
