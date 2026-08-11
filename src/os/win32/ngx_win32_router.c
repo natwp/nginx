@@ -135,7 +135,7 @@ typedef struct {
     size_t                 size;
     size_t                 offset;
     uint64_t               accept_id;
-    u_char                 data[1];
+    u_char                *data;
 } ngx_win32_router_pipe_write_t;
 
 
@@ -259,6 +259,13 @@ static ngx_int_t ngx_win32_router_handle_channel(
 static ngx_int_t ngx_win32_router_queue_write(
     ngx_win32_router_worker_t *worker, const void *data, size_t size,
     uint64_t accept_id);
+static ngx_win32_router_pipe_write_t *ngx_win32_router_alloc_write(
+    ngx_win32_router_worker_t *worker, size_t size, uint64_t accept_id);
+static void ngx_win32_router_queue_write_node(
+    ngx_win32_router_worker_t *worker,
+    ngx_win32_router_pipe_write_t *write);
+static void ngx_win32_router_free_pipe_write(
+    ngx_win32_router_pipe_write_t *write);
 static ngx_int_t ngx_win32_router_post_pipe_write(
     ngx_win32_router_worker_t *worker);
 static void ngx_win32_router_complete_pipe_write(
@@ -1668,6 +1675,7 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
     ngx_win32_channel_udp_t       *message;
     ngx_win32_router_flow_t       *flow;
     ngx_win32_router_flow_key_t    key;
+    ngx_win32_router_pipe_write_t *write;
     ngx_win32_router_worker_t     *worker;
     u_char                        *data;
     socklen_t                      remote_socklen;
@@ -1684,14 +1692,6 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
     {
         return NGX_ERROR;
     }
-
-    message = ngx_alloc(sizeof(ngx_win32_channel_udp_t) + bytes,
-                        ngx_win32_router_log);
-    if (message == NULL) {
-        return NGX_ERROR;
-    }
-
-    ngx_memzero(message, sizeof(ngx_win32_channel_udp_t));
 
     worker = NULL;
 
@@ -1721,9 +1721,17 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
     }
 
     if (worker == NULL) {
-        ngx_free(message);
         return NGX_ERROR;
     }
+
+    write = ngx_win32_router_alloc_write(worker,
+                              sizeof(ngx_win32_channel_udp_t) + bytes, 0);
+    if (write == NULL) {
+        return NGX_ERROR;
+    }
+
+    message = (ngx_win32_channel_udp_t *) write->data;
+    ngx_memzero(message, sizeof(ngx_win32_channel_udp_t));
 
     message->header.magic = NGX_WIN32_CHANNEL_MAGIC;
     message->header.version = NGX_WIN32_CHANNEL_VERSION;
@@ -1743,15 +1751,7 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
     data = (u_char *) message + sizeof(ngx_win32_channel_udp_t);
     ngx_memcpy(data, op->data, bytes);
 
-    if (ngx_win32_router_queue_write(worker, message,
-                                     message->header.length, 0)
-        != NGX_OK)
-    {
-        ngx_free(message);
-        return NGX_ERROR;
-    }
-
-    ngx_free(message);
+    ngx_win32_router_queue_write_node(worker, write);
 
     return NGX_OK;
 }
@@ -2271,18 +2271,36 @@ ngx_win32_router_queue_write(ngx_win32_router_worker_t *worker,
 {
     ngx_win32_router_pipe_write_t *write;
 
+    write = ngx_win32_router_alloc_write(worker, size, accept_id);
+    if (write == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(write->data, data, size);
+    ngx_win32_router_queue_write_node(worker, write);
+
+    return NGX_OK;
+}
+
+
+static ngx_win32_router_pipe_write_t *
+ngx_win32_router_alloc_write(ngx_win32_router_worker_t *worker, size_t size,
+    uint64_t accept_id)
+{
+    ngx_win32_router_pipe_write_t *write;
+
     if (!ngx_win32_router_channels || !worker->ready || size == 0
         || worker->queued_messages >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
         || size > NGX_WIN32_ROUTER_CHANNEL_LIMIT
         || worker->queued_bytes > NGX_WIN32_ROUTER_CHANNEL_LIMIT - size)
     {
-        return NGX_ERROR;
+        return NULL;
     }
 
     write = ngx_alloc(sizeof(ngx_win32_router_pipe_write_t) + size,
                       ngx_win32_router_log);
     if (write == NULL) {
-        return NGX_ERROR;
+        return NULL;
     }
 
     ngx_memzero(write, sizeof(ngx_win32_router_pipe_write_t));
@@ -2290,14 +2308,28 @@ ngx_win32_router_queue_write(ngx_win32_router_worker_t *worker,
     write->worker = worker;
     write->size = size;
     write->accept_id = accept_id;
-    ngx_memcpy(write->data, data, size);
+    write->data = (u_char *) (write + 1);
+
+    return write;
+}
+
+
+static void
+ngx_win32_router_queue_write_node(ngx_win32_router_worker_t *worker,
+    ngx_win32_router_pipe_write_t *write)
+{
     ngx_queue_insert_tail(&worker->writes, &write->queue);
     worker->queued_messages++;
-    worker->queued_bytes += size;
+    worker->queued_bytes += write->size;
 
     (void) ngx_win32_router_post_pipe_write(worker);
+}
 
-    return NGX_OK;
+
+static void
+ngx_win32_router_free_pipe_write(ngx_win32_router_pipe_write_t *write)
+{
+    ngx_free(write);
 }
 
 
@@ -2346,7 +2378,7 @@ ngx_win32_router_post_pipe_write(ngx_win32_router_worker_t *worker)
             worker->queued_messages--;
             worker->queued_bytes -= write->size;
             ngx_win32_router_fail_accept(write->accept_id, worker->pid);
-            ngx_free(write);
+            ngx_win32_router_free_pipe_write(write);
             worker->ready = 0;
             worker->active = 0;
             worker->removing = 1;
@@ -2400,7 +2432,7 @@ ngx_win32_router_complete_pipe_write(ngx_win32_router_pipe_write_t *write,
         worker->queued_messages--;
         worker->queued_bytes -= write->size;
         ngx_win32_router_fail_accept(write->accept_id, worker->pid);
-        ngx_free(write);
+        ngx_win32_router_free_pipe_write(write);
 
         if (error != ERROR_OPERATION_ABORTED) {
             worker->ready = 0;
@@ -2434,7 +2466,7 @@ ngx_win32_router_complete_pipe_write(ngx_win32_router_pipe_write_t *write,
     ngx_queue_remove(&write->queue);
     worker->queued_messages--;
     worker->queued_bytes -= write->size;
-    ngx_free(write);
+    ngx_win32_router_free_pipe_write(write);
     (void) ngx_win32_router_post_pipe_write(worker);
 }
 
@@ -2471,7 +2503,7 @@ ngx_win32_router_drop_writes(ngx_win32_router_worker_t *worker,
         worker->queued_messages--;
         worker->queued_bytes -= write->size;
         ngx_win32_router_fail_accept(write->accept_id, worker->pid);
-        ngx_free(write);
+        ngx_win32_router_free_pipe_write(write);
     }
 }
 

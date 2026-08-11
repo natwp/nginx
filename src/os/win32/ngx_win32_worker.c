@@ -85,7 +85,7 @@ typedef struct {
 typedef struct {
     ngx_queue_t  queue;
     size_t       size;
-    u_char       data[1];
+    u_char      *data;
 } ngx_win32_channel_write_node_t;
 
 
@@ -111,6 +111,11 @@ static ngx_thread_value_t __stdcall ngx_win32_worker_channel_write_thread(
     void *data);
 static ngx_int_t ngx_win32_worker_channel_write(const void *data, size_t size,
     ngx_uint_t priority, ngx_log_t *log);
+static ngx_win32_channel_write_node_t *ngx_win32_worker_channel_alloc_write(
+    size_t size, ngx_log_t *log);
+static ngx_int_t ngx_win32_worker_channel_queue_write(
+    ngx_win32_channel_write_node_t *node, ngx_uint_t priority,
+    ngx_log_t *log);
 static ngx_int_t ngx_win32_worker_channel_ack(uint64_t id,
     ngx_uint_t status);
 static ngx_listening_t *ngx_win32_worker_find_listener(ngx_cycle_t *cycle,
@@ -727,20 +732,46 @@ static ngx_int_t
 ngx_win32_worker_channel_write(const void *data, size_t size,
     ngx_uint_t priority, ngx_log_t *log)
 {
-    ngx_uint_t                    full;
-    ngx_win32_channel_write_node_t  *node;
+    ngx_win32_channel_write_node_t *node;
 
     if (!ngx_win32_channel_initialized || data == NULL || size == 0) {
         return NGX_ERROR;
     }
 
-    node = ngx_alloc(sizeof(ngx_win32_channel_write_node_t) + size, log);
+    node = ngx_win32_worker_channel_alloc_write(size, log);
     if (node == NULL) {
         return NGX_ERROR;
     }
 
-    node->size = size;
     ngx_memcpy(node->data, data, size);
+
+    return ngx_win32_worker_channel_queue_write(node, priority, log);
+}
+
+
+static ngx_win32_channel_write_node_t *
+ngx_win32_worker_channel_alloc_write(size_t size, ngx_log_t *log)
+{
+    ngx_win32_channel_write_node_t *node;
+
+    node = ngx_alloc(sizeof(ngx_win32_channel_write_node_t) + size, log);
+    if (node == NULL) {
+        return NULL;
+    }
+
+    ngx_memzero(node, sizeof(ngx_win32_channel_write_node_t));
+    node->size = size;
+    node->data = (u_char *) (node + 1);
+
+    return node;
+}
+
+
+static ngx_int_t
+ngx_win32_worker_channel_queue_write(ngx_win32_channel_write_node_t *node,
+    ngx_uint_t priority, ngx_log_t *log)
+{
+    ngx_uint_t  full;
 
     EnterCriticalSection(&ngx_win32_channel_write_lock);
 
@@ -751,9 +782,9 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
         return NGX_ERROR;
     }
 
-    if ((!priority && size > NGX_WIN32_CHANNEL_WRITE_LIMIT)
+    if ((!priority && node->size > NGX_WIN32_CHANNEL_WRITE_LIMIT)
         || (priority
-            && size > NGX_WIN32_CHANNEL_WRITE_LIMIT
+            && node->size > NGX_WIN32_CHANNEL_WRITE_LIMIT
                       + NGX_WIN32_CHANNEL_WRITE_RESERVE))
     {
         LeaveCriticalSection(&ngx_win32_channel_write_lock);
@@ -767,7 +798,8 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
                  ? NGX_WIN32_CHANNEL_WRITE_RESERVE_MESSAGES : 0)
            || ngx_win32_channel_write_queued
               > NGX_WIN32_CHANNEL_WRITE_LIMIT
-                + (priority ? NGX_WIN32_CHANNEL_WRITE_RESERVE : 0) - size;
+                + (priority ? NGX_WIN32_CHANNEL_WRITE_RESERVE : 0)
+                - node->size;
 
     if (full) {
         LeaveCriticalSection(&ngx_win32_channel_write_lock);
@@ -787,12 +819,12 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
         ngx_queue_insert_tail(&ngx_win32_channel_write_queue, &node->queue);
     }
 
-    ngx_win32_channel_write_queued += size;
+    ngx_win32_channel_write_queued += node->size;
     ngx_win32_channel_write_messages++;
 
     if (SetEvent(ngx_win32_channel_write_ready) == 0) {
         ngx_queue_remove(&node->queue);
-        ngx_win32_channel_write_queued -= size;
+        ngx_win32_channel_write_queued -= node->size;
         ngx_win32_channel_write_messages--;
         LeaveCriticalSection(&ngx_win32_channel_write_lock);
         ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
@@ -1227,6 +1259,7 @@ ngx_win32_worker_udp_sendmsg(ngx_connection_t *c, struct msghdr *msg,
     ngx_int_t                   rc;
     ngx_uint_t                  i, listener;
     ngx_listening_t            *ls;
+    ngx_win32_channel_write_node_t *node;
     ngx_win32_channel_udp_t    *udp;
     ngx_win32_channel_header_t *header;
     u_char                     *p;
@@ -1275,11 +1308,13 @@ ngx_win32_worker_udp_sendmsg(ngx_connection_t *c, struct msghdr *msg,
         return NGX_ERROR;
     }
 
-    udp = ngx_alloc(sizeof(ngx_win32_channel_udp_t) + size, c->log);
-    if (udp == NULL) {
+    node = ngx_win32_worker_channel_alloc_write(
+        sizeof(ngx_win32_channel_udp_t) + size, c->log);
+    if (node == NULL) {
         return NGX_ERROR;
     }
 
+    udp = (ngx_win32_channel_udp_t *) node->data;
     ngx_memzero(udp, sizeof(ngx_win32_channel_udp_t));
     header = &udp->header;
     header->magic = NGX_WIN32_CHANNEL_MAGIC;
@@ -1304,9 +1339,7 @@ ngx_win32_worker_udp_sendmsg(ngx_connection_t *c, struct msghdr *msg,
                        msg->msg_iov[i].iov_len);
     }
 
-    rc = ngx_win32_worker_channel_write(udp, header->length, 0, c->log);
-
-    ngx_free(udp);
+    rc = ngx_win32_worker_channel_queue_write(node, 0, c->log);
 
     return rc == NGX_OK ? (ssize_t) size
                         : rc == NGX_AGAIN ? NGX_AGAIN : NGX_ERROR;
