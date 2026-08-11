@@ -495,11 +495,11 @@ ngx_win32_router_resume(ngx_cycle_t *cycle, ngx_uint_t generation)
 }
 
 
-void
+ngx_int_t
 ngx_win32_router_update_workers(ngx_cycle_t *cycle, ngx_uint_t generation)
 {
     if (!ngx_win32_router_initialized) {
-        return;
+        return NGX_OK;
     }
 
     if (ngx_win32_router_command(cycle, NGX_WIN32_ROUTER_CONTROL_UPDATE,
@@ -508,7 +508,10 @@ ngx_win32_router_update_workers(ngx_cycle_t *cycle, ngx_uint_t generation)
     {
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                       "could not update Win32 network router workers");
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 

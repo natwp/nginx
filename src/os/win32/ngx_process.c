@@ -20,10 +20,13 @@ HANDLE           ngx_process_exit_event;
 static HANDLE    ngx_win32_worker_job;
 
 
-static char *ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
+static WCHAR *ngx_win32_get_module_filename(ngx_cycle_t *cycle);
+static WCHAR *ngx_win32_copy_command_line(ngx_cycle_t *cycle);
+static WCHAR *ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
     ngx_win32_worker_bootstrap_t *bootstrap);
-static ngx_uint_t ngx_win32_worker_environment_variable(u_char *entry,
+static ngx_uint_t ngx_win32_worker_environment_variable(WCHAR *entry,
     size_t len);
+static WCHAR *ngx_win32_copy_ascii(WCHAR *dst, u_char *src);
 static VOID CALLBACK ngx_win32_process_wait_handler(PVOID data,
     BOOLEAN timed_out);
 
@@ -51,12 +54,11 @@ ngx_pid_t
 ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
     ngx_uint_t slot, ngx_uint_t generation, ngx_uint_t role)
 {
-    u_long          rc, n, code;
+    u_long          rc, code;
     ngx_int_t       s;
     ngx_pid_t       pid;
     ngx_exec_ctx_t  ctx;
     HANDLE          events[2];
-    char            file[MAX_PATH + 1];
 
     if (respawn >= 0) {
         s = respawn;
@@ -78,25 +80,25 @@ ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
 
     ngx_memzero(&ngx_processes[s], sizeof(ngx_process_t));
 
-    n = GetModuleFileName(NULL, file, MAX_PATH);
+    ngx_memzero(&ctx, sizeof(ngx_exec_ctx_t));
 
-    if (n == 0) {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "GetModuleFileName() failed");
+    ctx.wpath = ngx_win32_get_module_filename(cycle);
+    if (ctx.wpath == NULL) {
         return NGX_INVALID_PID;
     }
 
-    file[n] = '\0';
-
-    ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                   "GetModuleFileName: \"%s\"", file);
-
-    ngx_memzero(&ctx, sizeof(ngx_exec_ctx_t));
+    ctx.wargs = ngx_win32_copy_command_line(cycle);
+    if (ctx.wargs == NULL) {
+        ngx_free(ctx.wpath);
+        return NGX_INVALID_PID;
+    }
 
     ngx_processes[s].bootstrap = ngx_alloc(
                                       sizeof(ngx_win32_worker_bootstrap_t),
                                       cycle->log);
     if (ngx_processes[s].bootstrap == NULL) {
+        ngx_free(ctx.wargs);
+        ngx_free(ctx.wpath);
         return NGX_INVALID_PID;
     }
 
@@ -107,28 +109,32 @@ ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
     {
         ngx_free(ngx_processes[s].bootstrap);
         ngx_processes[s].bootstrap = NULL;
+        ngx_free(ctx.wargs);
+        ngx_free(ctx.wpath);
         return NGX_INVALID_PID;
     }
 
-    ctx.path = file;
     ctx.name = name;
-    ctx.args = GetCommandLine();
     ctx.argv = NULL;
     ctx.envp = NULL;
-    ctx.environment = ngx_win32_create_worker_environment(
-                                          cycle,
-                                          ngx_processes[s].bootstrap);
+    ctx.wenvironment = ngx_win32_create_worker_environment(
+                                           cycle,
+                                           ngx_processes[s].bootstrap);
 
-    if (ctx.environment == NULL) {
+    if (ctx.wenvironment == NULL) {
         ngx_win32_master_close_bootstrap(ngx_processes[s].bootstrap);
         ngx_free(ngx_processes[s].bootstrap);
         ngx_processes[s].bootstrap = NULL;
+        ngx_free(ctx.wargs);
+        ngx_free(ctx.wpath);
         return NGX_INVALID_PID;
     }
 
     pid = ngx_execute(cycle, &ctx);
 
-    ngx_free(ctx.environment);
+    ngx_free(ctx.wenvironment);
+    ngx_free(ctx.wargs);
+    ngx_free(ctx.wpath);
 
     if (pid == NGX_INVALID_PID) {
         ngx_win32_master_close_bootstrap(ngx_processes[s].bootstrap);
@@ -325,26 +331,119 @@ failed:
 ngx_pid_t
 ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
 {
-    STARTUPINFO          si;
-    PROCESS_INFORMATION  pi;
-    u_long               flags;
+    BOOL                  inherit_handles, process_created;
+    SIZE_T                size;
+    STARTUPINFOEXW        si;
+    PROCESS_INFORMATION   pi;
+    LPPROC_THREAD_ATTRIBUTE_LIST  attributes;
+    HANDLE                child_stderr, stderr_handle;
+    u_long                flags;
+    ngx_uint_t            attributes_initialized;
 
-    ngx_memzero(&si, sizeof(STARTUPINFO));
-    si.cb = sizeof(STARTUPINFO);
+    ngx_memzero(&si, sizeof(STARTUPINFOEXW));
+    si.StartupInfo.cb = sizeof(STARTUPINFOW);
 
     ngx_memzero(&pi, sizeof(PROCESS_INFORMATION));
 
+    attributes = NULL;
+    attributes_initialized = 0;
+    child_stderr = NULL;
+    inherit_handles = 0;
+
+    stderr_handle = ngx_stderr;
+
+    if (stderr_handle != NULL && stderr_handle != INVALID_HANDLE_VALUE) {
+        if (DuplicateHandle(GetCurrentProcess(), stderr_handle,
+                            GetCurrentProcess(), &child_stderr, 0, 1,
+                            DUPLICATE_SAME_ACCESS)
+            == 0)
+        {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "DuplicateHandle(stderr) failed");
+            return NGX_INVALID_PID;
+        }
+
+        size = 0;
+        (void) InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+
+        if (size == 0) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "InitializeProcThreadAttributeList() failed");
+            ngx_close_handle(child_stderr);
+            return NGX_INVALID_PID;
+        }
+
+        attributes = ngx_alloc(size, cycle->log);
+        if (attributes == NULL) {
+            ngx_close_handle(child_stderr);
+            return NGX_INVALID_PID;
+        }
+
+        if (InitializeProcThreadAttributeList(attributes, 1, 0, &size) == 0) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "InitializeProcThreadAttributeList() failed");
+            goto failed;
+        }
+
+        attributes_initialized = 1;
+
+        if (UpdateProcThreadAttribute(attributes, 0,
+                                      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                      &child_stderr, sizeof(HANDLE), NULL, NULL)
+            == 0)
+        {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "UpdateProcThreadAttribute() failed");
+            goto failed;
+        }
+
+        si.lpAttributeList = attributes;
+        si.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+        si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+        si.StartupInfo.hStdError = child_stderr;
+        inherit_handles = 1;
+    }
+
     flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
 
-    if (CreateProcess(ctx->path, ctx->args,
-                      NULL, NULL, 0, flags, ctx->environment,
-                      NULL, &si, &pi)
-        == 0)
-    {
-        ngx_log_error(NGX_LOG_CRIT, cycle->log, ngx_errno,
-                      "CreateProcess(\"%s\") failed", ngx_argv[0]);
+    if (attributes) {
+        flags |= EXTENDED_STARTUPINFO_PRESENT;
+    }
 
-        return 0;
+    if (ctx->wpath) {
+        flags |= CREATE_UNICODE_ENVIRONMENT;
+
+        process_created = CreateProcessW(ctx->wpath, ctx->wargs,
+                                         NULL, NULL, inherit_handles, flags,
+                                         ctx->wenvironment, NULL,
+                                         &si.StartupInfo, &pi);
+
+    } else {
+        process_created = CreateProcessA(ctx->path, ctx->args,
+                                         NULL, NULL, inherit_handles, flags,
+                                         ctx->environment, NULL,
+                                         (LPSTARTUPINFOA) &si.StartupInfo, &pi);
+    }
+
+    if (process_created == 0) {
+        ngx_log_error(NGX_LOG_CRIT, cycle->log, ngx_errno,
+                      "CreateProcess() failed");
+
+        goto failed;
+    }
+
+    if (attributes_initialized) {
+        DeleteProcThreadAttributeList(attributes);
+    }
+
+    if (attributes) {
+        ngx_free(attributes);
+    }
+
+    if (child_stderr) {
+        ngx_close_handle(child_stderr);
     }
 
     if (ngx_win32_worker_job
@@ -378,6 +477,22 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
                   "start %s process %P", ctx->name, pi.dwProcessId);
 
     return pi.dwProcessId;
+
+failed:
+
+    if (attributes_initialized) {
+        DeleteProcThreadAttributeList(attributes);
+    }
+
+    if (attributes) {
+        ngx_free(attributes);
+    }
+
+    if (child_stderr) {
+        ngx_close_handle(child_stderr);
+    }
+
+    return NGX_INVALID_PID;
 }
 
 
@@ -443,29 +558,104 @@ ngx_win32_job_done(void)
 }
 
 
-static char *
+static WCHAR *
+ngx_win32_get_module_filename(ngx_cycle_t *cycle)
+{
+    DWORD   n, size;
+    WCHAR  *file;
+
+    size = MAX_PATH;
+
+    for ( ;; ) {
+        file = ngx_alloc(size * sizeof(WCHAR), cycle->log);
+        if (file == NULL) {
+            return NULL;
+        }
+
+        file[size - 1] = L'\0';
+        n = GetModuleFileNameW(NULL, file, size);
+
+        if (n == 0) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "GetModuleFileNameW() failed");
+            ngx_free(file);
+            return NULL;
+        }
+
+        if (n < size && file[n] == L'\0') {
+            ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                           "GetModuleFileNameW() returned %ul characters", n);
+            return file;
+        }
+
+        ngx_free(file);
+
+        if (size >= 32768) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log,
+                          ERROR_INSUFFICIENT_BUFFER,
+                          "GetModuleFileNameW() returned a path that is too "
+                          "long");
+            return NULL;
+        }
+
+        size *= 2;
+
+        if (size > 32768) {
+            size = 32768;
+        }
+    }
+}
+
+
+static WCHAR *
+ngx_win32_copy_command_line(ngx_cycle_t *cycle)
+{
+    size_t  len;
+    WCHAR  *args, *command;
+
+    command = GetCommandLineW();
+    if (command == NULL) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "GetCommandLineW() failed");
+        return NULL;
+    }
+
+    for (len = 0; command[len]; len++) { /* void */ }
+
+    args = ngx_alloc((len + 1) * sizeof(WCHAR), cycle->log);
+    if (args == NULL) {
+        return NULL;
+    }
+
+    ngx_memcpy(args, command, (len + 1) * sizeof(WCHAR));
+
+    return args;
+}
+
+
+static WCHAR *
 ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
     ngx_win32_worker_bootstrap_t *bootstrap)
 {
     size_t  size, extra, len;
-    char   *base, *env;
-    u_char *p;
-    char    slot[NGX_INT_T_LEN + 1];
-    char    generation[NGX_INT_T_LEN + 1];
-    char    role[NGX_INT_T_LEN + 1];
+    WCHAR  *base, *dst, *env, *p;
+    u_char  slot[NGX_INT_T_LEN + 1];
+    u_char  generation[NGX_INT_T_LEN + 1];
+    u_char  role[NGX_INT_T_LEN + 1];
 
-    base = GetEnvironmentStrings();
+    base = GetEnvironmentStringsW();
     if (base == NULL) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                      "GetEnvironmentStrings() failed");
+                      "GetEnvironmentStringsW() failed");
         return NULL;
     }
 
     size = 0;
-    p = (u_char *) base;
+    p = base;
 
     while (*p) {
-        len = ngx_strlen(p) + 1;
+        for (len = 0; p[len]; len++) { /* void */ }
+        len++;
 
         if (!ngx_win32_worker_environment_variable(p, len - 1)) {
             size += len;
@@ -474,10 +664,9 @@ ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
         p += len;
     }
 
-    (void) ngx_sprintf((u_char *) slot, "%ui%Z", bootstrap->slot);
-    (void) ngx_sprintf((u_char *) generation, "%ui%Z",
-                       bootstrap->generation);
-    (void) ngx_sprintf((u_char *) role, "%ui%Z", bootstrap->role);
+    (void) ngx_sprintf(slot, "%ui%Z", bootstrap->slot);
+    (void) ngx_sprintf(generation, "%ui%Z", bootstrap->generation);
+    (void) ngx_sprintf(role, "%ui%Z", bootstrap->role);
 
     extra = sizeof(NGX_WIN32_WORKER_SLOT_ENV) + 1 + ngx_strlen(slot)
             + sizeof(NGX_WIN32_WORKER_GENERATION_ENV) + 1
@@ -487,48 +676,56 @@ ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
             + sizeof(NGX_WIN32_WORKER_ROLE_ENV) + 1 + ngx_strlen(role)
             + 1;
 
-    env = ngx_alloc(size + extra, cycle->log);
+    env = ngx_alloc((size + extra) * sizeof(WCHAR), cycle->log);
     if (env == NULL) {
-        FreeEnvironmentStrings(base);
+        FreeEnvironmentStringsW(base);
         return NULL;
     }
 
-    p = (u_char *) base;
-    env[0] = '\0';
-    {
-        u_char *dst;
+    p = base;
+    dst = env;
 
-        dst = (u_char *) env;
+    while (*p) {
+        for (len = 0; p[len]; len++) { /* void */ }
+        len++;
 
-        while (*p) {
-            len = ngx_strlen(p) + 1;
-
-            if (!ngx_win32_worker_environment_variable(p, len - 1)) {
-                dst = ngx_cpymem(dst, p, len);
-            }
-
-            p += len;
+        if (!ngx_win32_worker_environment_variable(p, len - 1)) {
+            ngx_memcpy(dst, p, len * sizeof(WCHAR));
+            dst += len;
         }
 
-        p = dst;
+        p += len;
     }
 
-    p = ngx_sprintf((u_char *) p, NGX_WIN32_WORKER_SLOT_ENV "=%s%Z", slot);
-    p = ngx_sprintf((u_char *) p,
-                    NGX_WIN32_WORKER_GENERATION_ENV "=%s%Z", generation);
-    p = ngx_sprintf((u_char *) p, NGX_WIN32_WORKER_PIPE_ENV "=%s%Z",
-                    bootstrap->name);
-    p = ngx_sprintf((u_char *) p, NGX_WIN32_WORKER_ROLE_ENV "=%s%Z", role);
-    *p = '\0';
+    dst = ngx_win32_copy_ascii(dst,
+                               (u_char *) NGX_WIN32_WORKER_SLOT_ENV "=");
+    dst = ngx_win32_copy_ascii(dst, slot);
+    *dst++ = L'\0';
 
-    FreeEnvironmentStrings(base);
+    dst = ngx_win32_copy_ascii(dst,
+                         (u_char *) NGX_WIN32_WORKER_GENERATION_ENV "=");
+    dst = ngx_win32_copy_ascii(dst, generation);
+    *dst++ = L'\0';
+
+    dst = ngx_win32_copy_ascii(dst,
+                               (u_char *) NGX_WIN32_WORKER_PIPE_ENV "=");
+    dst = ngx_win32_copy_ascii(dst, bootstrap->name);
+    *dst++ = L'\0';
+
+    dst = ngx_win32_copy_ascii(dst,
+                               (u_char *) NGX_WIN32_WORKER_ROLE_ENV "=");
+    dst = ngx_win32_copy_ascii(dst, role);
+    *dst++ = L'\0';
+    *dst = L'\0';
+
+    FreeEnvironmentStringsW(base);
 
     return env;
 }
 
 
 static ngx_uint_t
-ngx_win32_worker_environment_variable(u_char *entry, size_t len)
+ngx_win32_worker_environment_variable(WCHAR *entry, size_t len)
 {
     static ngx_str_t  names[] = {
         ngx_string(NGX_WIN32_WORKER_SLOT_ENV),
@@ -537,17 +734,49 @@ ngx_win32_worker_environment_variable(u_char *entry, size_t len)
         ngx_string(NGX_WIN32_WORKER_ROLE_ENV)
     };
 
+    u_char      c;
+    size_t      n;
     ngx_uint_t  i;
 
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (len > names[i].len && entry[names[i].len] == '='
-            && ngx_strncasecmp(entry, names[i].data, names[i].len) == 0)
-        {
+        if (len <= names[i].len || entry[names[i].len] != L'=') {
+            continue;
+        }
+
+        for (n = 0; n < names[i].len; n++) {
+            c = names[i].data[n];
+
+            if (c >= 'a' && c <= 'z') {
+                c &= ~0x20;
+            }
+
+            if (entry[n] >= L'a' && entry[n] <= L'z') {
+                if ((WCHAR) (entry[n] & ~0x20) != c) {
+                    break;
+                }
+
+            } else if (entry[n] != c) {
+                break;
+            }
+        }
+
+        if (n == names[i].len) {
             return 1;
         }
     }
 
     return 0;
+}
+
+
+static WCHAR *
+ngx_win32_copy_ascii(WCHAR *dst, u_char *src)
+{
+    while (*src) {
+        *dst++ = *src++;
+    }
+
+    return dst;
 }
 
 

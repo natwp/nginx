@@ -61,6 +61,9 @@ typedef struct {
     char *const            *argv;
     char *const            *envp;
     char                   *environment;
+    WCHAR                  *wpath;
+    WCHAR                  *wargs;
+    WCHAR                  *wenvironment;
     HANDLE                  child;
 } ngx_exec_ctx_t;
 
