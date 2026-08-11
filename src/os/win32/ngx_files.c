@@ -558,8 +558,87 @@ ngx_close_file_mapping(ngx_file_mapping_t *fm)
 u_char *
 ngx_realpath(u_char *path, u_char *resolved)
 {
-    /* STUB */
-    return path;
+    u_char     *p;
+    size_t      len;
+    u_long      n;
+    ngx_err_t   err;
+    ngx_fd_t    fd;
+    u_short    *name, *u;
+    u_short     utf16[NGX_UTF16_BUFLEN];
+    u_short     final[NGX_MAX_PATH];
+
+    if (resolved == NULL) {
+        ngx_set_errno(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, path, &len, 0);
+
+    if (u == NULL) {
+        return NULL;
+    }
+
+    fd = CreateFileW(u, FILE_READ_ATTRIBUTES,
+                     FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                     NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
+    }
+
+    if (fd == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+
+    n = GetFinalPathNameByHandleW(fd, final, NGX_MAX_PATH,
+                                  FILE_NAME_NORMALIZED|VOLUME_NAME_DOS);
+    err = ngx_errno;
+
+    if (CloseHandle(fd) == 0 && n != 0) {
+        n = 0;
+        err = ngx_errno;
+    }
+
+    if (n == 0 || n >= NGX_MAX_PATH) {
+        ngx_set_errno(n == 0 ? err : ERROR_INSUFFICIENT_BUFFER);
+        return NULL;
+    }
+
+    name = final;
+
+    if (n >= 8
+        && final[0] == '\\' && final[1] == '\\'
+        && final[2] == '?' && final[3] == '\\'
+        && final[4] == 'U' && final[5] == 'N'
+        && final[6] == 'C' && final[7] == '\\')
+    {
+        final[6] = '\\';
+        name = &final[6];
+
+    } else if (n >= 4
+               && final[0] == '\\' && final[1] == '\\'
+               && final[2] == '?' && final[3] == '\\')
+    {
+        name = &final[4];
+    }
+
+    len = NGX_MAX_PATH;
+    p = ngx_utf16_to_utf8(resolved, name, &len, NULL);
+
+    if (p == NULL) {
+        return NULL;
+    }
+
+    if (p != resolved) {
+        ngx_free(p);
+        ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
+        return NULL;
+    }
+
+    return resolved;
 }
 
 

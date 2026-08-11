@@ -1054,7 +1054,7 @@ static ngx_listening_t *
 ngx_win32_worker_find_listener(ngx_cycle_t *cycle, ngx_uint_t index, int type,
     struct sockaddr *local, socklen_t local_socklen)
 {
-    ngx_uint_t        i;
+    ngx_uint_t        i, n;
     ngx_listening_t  *ls;
 
     if (local == NULL
@@ -1065,15 +1065,17 @@ ngx_win32_worker_find_listener(ngx_cycle_t *cycle, ngx_uint_t index, int type,
     }
 
     ls = cycle->listening.elts;
+    n = ngx_win32_worker_routed ? ngx_win32_worker_expected_listeners
+                                : cycle->listening.nelts;
 
-    if (index < cycle->listening.nelts
+    if (index < n
         && ngx_win32_worker_listener_matches(&ls[index], type, local,
                                               local_socklen))
     {
         return &ls[index];
     }
 
-    for (i = 0; i < cycle->listening.nelts; i++) {
+    for (i = 0; i < n; i++) {
         if (i != index
             && ngx_win32_worker_listener_matches(&ls[i], type, local,
                                                   local_socklen))
@@ -1112,6 +1114,10 @@ ngx_win32_worker_channel_handler(ngx_event_t *ev)
     ngx_win32_channel_accept_node_t *node;
 
     (void) ev;
+
+    if (!ngx_win32_channel_initialized) {
+        return;
+    }
 
     cycle = (ngx_cycle_t *) ngx_cycle;
     dispatched = 0;
@@ -1253,7 +1259,7 @@ ngx_win32_worker_udp_sendmsg(ngx_connection_t *c, struct msghdr *msg,
     ls = ((ngx_cycle_t *) ngx_cycle)->listening.elts;
     listener = (ngx_uint_t) (c->listening - ls);
 
-    if (listener >= ((ngx_cycle_t *) ngx_cycle)->listening.nelts) {
+    if (listener >= ngx_win32_worker_expected_listeners) {
         return NGX_ERROR;
     }
 

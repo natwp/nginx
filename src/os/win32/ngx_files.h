@@ -185,7 +185,7 @@ extern ngx_uint_t  ngx_file_aio;
 
 
 u_char *ngx_realpath(u_char *path, u_char *resolved);
-#define ngx_realpath_n              ""
+#define ngx_realpath_n              "GetFinalPathNameByHandleW()"
 
 
 size_t ngx_getcwd(u_char *buf, size_t size);
