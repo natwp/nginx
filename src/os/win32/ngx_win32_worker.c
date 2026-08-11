@@ -727,6 +727,7 @@ static ngx_int_t
 ngx_win32_worker_channel_write(const void *data, size_t size,
     ngx_uint_t priority, ngx_log_t *log)
 {
+    ngx_uint_t                    full;
     ngx_win32_channel_write_node_t  *node;
 
     if (!ngx_win32_channel_initialized || data == NULL || size == 0) {
@@ -743,28 +744,39 @@ ngx_win32_worker_channel_write(const void *data, size_t size,
 
     EnterCriticalSection(&ngx_win32_channel_write_lock);
 
-    if (ngx_win32_channel_stopping
-        || ngx_win32_channel_write_messages
-           >= NGX_WIN32_CHANNEL_WRITE_MESSAGES
-              + (priority
-                 ? NGX_WIN32_CHANNEL_WRITE_RESERVE_MESSAGES : 0)
-        || (!priority && size > NGX_WIN32_CHANNEL_WRITE_LIMIT)
-        || (priority
-            && size > NGX_WIN32_CHANNEL_WRITE_LIMIT
-                      + NGX_WIN32_CHANNEL_WRITE_RESERVE)
-        || ngx_win32_channel_write_queued
-           > NGX_WIN32_CHANNEL_WRITE_LIMIT
-             + (priority ? NGX_WIN32_CHANNEL_WRITE_RESERVE : 0) - size)
-    {
+    if (ngx_win32_channel_stopping) {
         LeaveCriticalSection(&ngx_win32_channel_write_lock);
         ngx_free(node);
 
-        if (!ngx_win32_channel_stopping) {
-            ngx_log_error(NGX_LOG_WARN, log, 0,
-                          "Win32 worker channel write queue is full");
-        }
-
         return NGX_ERROR;
+    }
+
+    if ((!priority && size > NGX_WIN32_CHANNEL_WRITE_LIMIT)
+        || (priority
+            && size > NGX_WIN32_CHANNEL_WRITE_LIMIT
+                      + NGX_WIN32_CHANNEL_WRITE_RESERVE))
+    {
+        LeaveCriticalSection(&ngx_win32_channel_write_lock);
+        ngx_free(node);
+        return NGX_ERROR;
+    }
+
+    full = ngx_win32_channel_write_messages
+           >= NGX_WIN32_CHANNEL_WRITE_MESSAGES
+              + (priority
+                 ? NGX_WIN32_CHANNEL_WRITE_RESERVE_MESSAGES : 0)
+           || ngx_win32_channel_write_queued
+              > NGX_WIN32_CHANNEL_WRITE_LIMIT
+                + (priority ? NGX_WIN32_CHANNEL_WRITE_RESERVE : 0) - size;
+
+    if (full) {
+        LeaveCriticalSection(&ngx_win32_channel_write_lock);
+        ngx_free(node);
+
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "Win32 worker channel write queue is full");
+
+        return priority ? NGX_ERROR : NGX_AGAIN;
     }
 
     if (priority) {
@@ -1296,7 +1308,8 @@ ngx_win32_worker_udp_sendmsg(ngx_connection_t *c, struct msghdr *msg,
 
     ngx_free(udp);
 
-    return rc == NGX_OK ? (ssize_t) size : NGX_ERROR;
+    return rc == NGX_OK ? (ssize_t) size
+                        : rc == NGX_AGAIN ? NGX_AGAIN : NGX_ERROR;
 }
 
 
