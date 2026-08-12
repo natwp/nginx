@@ -18,7 +18,8 @@ static int __stdcall ngx_console_handler(u_long type);
 static ngx_int_t ngx_create_signal_events(ngx_cycle_t *cycle);
 static ngx_int_t ngx_start_worker_processes(ngx_cycle_t *cycle, ngx_int_t type);
 static void ngx_reopen_worker_processes(ngx_cycle_t *cycle);
-static void ngx_quit_worker_processes(ngx_cycle_t *cycle, ngx_uint_t old);
+static ngx_int_t ngx_quit_worker_processes(ngx_cycle_t *cycle,
+    ngx_uint_t old);
 static void ngx_terminate_worker_processes(ngx_cycle_t *cycle);
 static ngx_uint_t ngx_reap_worker(ngx_cycle_t *cycle, HANDLE h);
 static void ngx_master_process_exit(ngx_cycle_t *cycle, ngx_uint_t status);
@@ -41,11 +42,11 @@ ngx_pid_t      ngx_parent;
 ngx_uint_t     ngx_inherited;
 ngx_pid_t      ngx_new_binary;
 
-sig_atomic_t   ngx_terminate;
-sig_atomic_t   ngx_quit;
-sig_atomic_t   ngx_reopen;
+volatile LONG  ngx_terminate;
+volatile LONG  ngx_quit;
+volatile LONG  ngx_reopen;
 sig_atomic_t   ngx_reconfigure;
-ngx_uint_t     ngx_exiting;
+volatile ngx_uint_t  ngx_exiting;
 
 
 HANDLE         ngx_master_process_event;
@@ -154,7 +155,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                       "could not start the configured worker processes");
 
-        ngx_terminate = 1;
+        ngx_win32_set_terminate(1);
         ngx_terminate_worker_processes(cycle);
         ngx_master_process_exit(cycle, 2);
     }
@@ -163,7 +164,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                       "could not start the Win32 network router");
 
-        ngx_terminate = 1;
+        ngx_win32_set_terminate(1);
         ngx_terminate_worker_processes(cycle);
         ngx_master_process_exit(cycle, 2);
     }
@@ -177,7 +178,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
             ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                           "Win32 network router failed; terminating");
 
-            ngx_terminate = 1;
+            ngx_win32_set_terminate(1);
             ngx_terminate_worker_processes(cycle);
             ngx_master_process_exit(cycle, 2);
         }
@@ -208,14 +209,19 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
                 timer = ngx_current_msec + 5000;
             }
 
-            ngx_terminate = 1;
+            ngx_win32_set_terminate(1);
 
             if (ngx_win32_router_pause(cycle) != NGX_OK) {
                 ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                               "could not pause the Win32 network router");
+                ngx_terminate_worker_processes(cycle);
+                ngx_master_process_exit(cycle, 2);
             }
 
-            ngx_quit_worker_processes(cycle, 0);
+            if (ngx_quit_worker_processes(cycle, 0) != NGX_OK) {
+                ngx_terminate_worker_processes(cycle);
+                ngx_master_process_exit(cycle, 2);
+            }
 
             continue;
         }
@@ -228,14 +234,20 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
                               "ResetEvent(\"%s\") failed", ngx_quit_event_name);
             }
 
-            ngx_quit = 1;
+            ngx_win32_set_quit(1);
 
             if (ngx_win32_router_drain(cycle) != NGX_OK) {
                 ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                               "could not drain the Win32 network router");
+                ngx_win32_set_terminate(1);
+                ngx_terminate_worker_processes(cycle);
+                ngx_master_process_exit(cycle, 2);
             }
 
-            ngx_quit_worker_processes(cycle, 0);
+            if (ngx_quit_worker_processes(cycle, 0) != NGX_OK) {
+                ngx_terminate_worker_processes(cycle);
+                ngx_master_process_exit(cycle, 2);
+            }
 
             continue;
         }
@@ -278,7 +290,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
                               "could not restore the Win32 network router "
                               "after a failed reload pause");
 
-                ngx_terminate = 1;
+                ngx_win32_set_terminate(1);
                 ngx_terminate_worker_processes(cycle);
                 ngx_master_process_exit(cycle, 2);
 
@@ -298,7 +310,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
                                   "could not restore the Win32 network "
                                   "router after a failed reload");
 
-                    ngx_terminate = 1;
+                    ngx_win32_set_terminate(1);
                     ngx_terminate_worker_processes(cycle);
                     ngx_master_process_exit(cycle, 2);
                 }
@@ -332,7 +344,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
                     }
 
                 } else if (routed) {
-                    ngx_win32_router_stop(cycle);
+                    resumed = ngx_win32_router_stop(cycle);
                 }
 
             } else {
@@ -340,9 +352,12 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
             }
 
             if (started == ccf->worker_processes && resumed == NGX_OK) {
-                ngx_quit_worker_processes(cycle, 1);
+                if (ngx_quit_worker_processes(cycle, 1) != NGX_OK) {
+                    resumed = NGX_ERROR;
+                }
+            }
 
-            } else {
+            if (started != ccf->worker_processes || resumed != NGX_OK) {
                 ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                               "could not activate the new worker generation "
                               "(started %i of %i, router activation %i)",
@@ -354,7 +369,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
                  * generation: fail closed and let the service manager
                  * restart nginx.
                  */
-                ngx_terminate = 1;
+                ngx_win32_set_terminate(1);
                 ngx_terminate_worker_processes(cycle);
                 ngx_master_process_exit(cycle, 2);
             }
@@ -395,7 +410,9 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
                 }
             }
 
-            if (!live && (ngx_terminate || ngx_quit)) {
+            if (!live && (ngx_win32_terminate_requested()
+                          || ngx_win32_quit_requested()))
+            {
                 ngx_master_process_exit(cycle, 0);
             }
 
@@ -556,7 +573,12 @@ ngx_start_worker_processes(ngx_cycle_t *cycle, ngx_int_t type)
         }
     }
 
-    ngx_win32_router_update_workers(cycle, ngx_master_generation);
+    if (n == ccf->worker_processes
+        && ngx_win32_router_update_workers(cycle, ngx_master_generation)
+           != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
     return n;
 }
@@ -582,10 +604,12 @@ ngx_reopen_worker_processes(ngx_cycle_t *cycle)
 }
 
 
-static void
+static ngx_int_t
 ngx_quit_worker_processes(ngx_cycle_t *cycle, ngx_uint_t old)
 {
-    ngx_int_t  n;
+    ngx_int_t  n, rc;
+
+    rc = NGX_OK;
 
     for (n = 0; n < ngx_last_process; n++) {
 
@@ -610,12 +634,19 @@ ngx_quit_worker_processes(ngx_cycle_t *cycle, ngx_uint_t old)
             ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
                           "SetEvent(\"%s\") failed",
                           ngx_processes[n].quit_event);
+            rc = NGX_ERROR;
         }
 
         ngx_processes[n].exiting = 1;
     }
 
-    ngx_win32_router_update_workers(cycle, ngx_master_generation);
+    if (ngx_win32_router_update_workers(cycle, ngx_master_generation)
+        != NGX_OK)
+    {
+        rc = NGX_ERROR;
+    }
+
+    return rc;
 }
 
 
@@ -644,10 +675,25 @@ ngx_terminate_worker_processes(ngx_cycle_t *cycle)
             ngx_processes[n].wait = NULL;
         }
 
-        ngx_close_handle(ngx_processes[n].reopen);
-        ngx_close_handle(ngx_processes[n].quit);
-        ngx_close_handle(ngx_processes[n].term);
-        ngx_close_handle(ngx_processes[n].handle);
+        if (ngx_processes[n].reopen) {
+            ngx_close_handle(ngx_processes[n].reopen);
+            ngx_processes[n].reopen = NULL;
+        }
+
+        if (ngx_processes[n].quit) {
+            ngx_close_handle(ngx_processes[n].quit);
+            ngx_processes[n].quit = NULL;
+        }
+
+        if (ngx_processes[n].term) {
+            ngx_close_handle(ngx_processes[n].term);
+            ngx_processes[n].term = NULL;
+        }
+
+        if (ngx_processes[n].handle) {
+            ngx_close_handle(ngx_processes[n].handle);
+            ngx_processes[n].handle = NULL;
+        }
     }
 }
 
@@ -676,7 +722,13 @@ ngx_reap_worker(ngx_cycle_t *cycle, HANDLE h)
                       ngx_processes[n].name, ngx_processes[n].pid, code);
 
         ngx_processes[n].ready_state = 0;
-        ngx_win32_router_update_workers(cycle, ngx_master_generation);
+        if (ngx_win32_router_update_workers(cycle, ngx_master_generation)
+            != NGX_OK)
+        {
+            ngx_win32_set_terminate(1);
+            ngx_terminate_worker_processes(cycle);
+            ngx_master_process_exit(cycle, 2);
+        }
 
         if (ngx_processes[n].wait) {
             (void) UnregisterWaitEx(ngx_processes[n].wait,
@@ -700,7 +752,10 @@ ngx_reap_worker(ngx_cycle_t *cycle, HANDLE h)
         ngx_processes[n].quit = NULL;
         ngx_processes[n].reopen = NULL;
 
-        if (!ngx_processes[n].exiting && !ngx_terminate && !ngx_quit) {
+        if (!ngx_processes[n].exiting
+            && !ngx_win32_terminate_requested()
+            && !ngx_win32_quit_requested())
+        {
 
             name = ngx_processes[n].name;
 
@@ -714,7 +769,7 @@ ngx_reap_worker(ngx_cycle_t *cycle, HANDLE h)
                     ngx_last_process--;
                 }
 
-                ngx_terminate = 1;
+                ngx_win32_set_terminate(1);
                 ngx_terminate_worker_processes(cycle);
                 ngx_master_process_exit(cycle, 2);
 
@@ -723,7 +778,7 @@ ngx_reap_worker(ngx_cycle_t *cycle, HANDLE h)
                                                     ngx_master_generation)
                     != NGX_OK)
                 {
-                    ngx_terminate = 1;
+                    ngx_win32_set_terminate(1);
                     ngx_terminate_worker_processes(cycle);
                     ngx_master_process_exit(cycle, 2);
                 }
@@ -763,7 +818,9 @@ ngx_master_process_exit(ngx_cycle_t *cycle, ngx_uint_t status)
 
     ngx_delete_pidfile(cycle);
 
-    ngx_win32_router_stop(cycle);
+    if (ngx_win32_router_stop(cycle) != NGX_OK) {
+        status = 2;
+    }
     ngx_win32_job_done();
 
     ngx_close_handle(ngx_cache_manager_mutex);
@@ -923,7 +980,7 @@ ngx_worker_process_cycle(ngx_cycle_t *cycle, char *mevn)
                        "worker WaitForMultipleObjects: %ul", ev);
 
         if (ev == WAIT_OBJECT_0) {
-            ngx_terminate = 1;
+            ngx_win32_set_terminate(1);
             ngx_log_error(NGX_LOG_NOTICE, log, 0, "exiting");
 
             if (ResetEvent(events[0]) == 0) {
@@ -935,13 +992,13 @@ ngx_worker_process_cycle(ngx_cycle_t *cycle, char *mevn)
         }
 
         if (ev == WAIT_OBJECT_0 + 1) {
-            ngx_quit = 1;
+            ngx_win32_set_quit(1);
             ngx_log_error(NGX_LOG_NOTICE, log, 0, "gracefully shutting down");
             break;
         }
 
         if (ev == WAIT_OBJECT_0 + 2) {
-            ngx_reopen = 1;
+            ngx_win32_set_reopen(1);
             ngx_log_error(NGX_LOG_NOTICE, log, 0, "reopening logs");
 
             if (ResetEvent(events[2]) == 0) {
@@ -1029,9 +1086,9 @@ ngx_worker_thread(void *data)
         exit(2);
     }
 
-    while (!ngx_quit) {
+    while (!ngx_win32_quit_requested()) {
 
-        if (ngx_exiting) {
+        if (ngx_win32_exiting_requested()) {
             if (ngx_event_no_timers_left() == NGX_OK) {
                 break;
             }
@@ -1041,15 +1098,15 @@ ngx_worker_thread(void *data)
 
         ngx_process_events_and_timers(cycle);
 
-        if (ngx_terminate) {
+        if (ngx_win32_terminate_requested()) {
             return 0;
         }
 
-        if (ngx_quit) {
-            ngx_quit = 0;
+        if (ngx_win32_quit_requested()) {
+            ngx_win32_set_quit(0);
 
-            if (!ngx_exiting) {
-                ngx_exiting = 1;
+            if (!ngx_win32_exiting_requested()) {
+                ngx_win32_set_exiting(1);
                 ngx_set_shutdown_timer(cycle);
                 ngx_close_listening_sockets(cycle);
                 ngx_close_idle_connections(cycle);
@@ -1057,8 +1114,8 @@ ngx_worker_thread(void *data)
             }
         }
 
-        if (ngx_reopen) {
-            ngx_reopen = 0;
+        if (ngx_win32_reopen_requested()) {
+            ngx_win32_set_reopen(0);
             ngx_reopen_files(cycle, -1);
         }
     }
@@ -1124,7 +1181,9 @@ ngx_worker_process_exit(ngx_cycle_t *cycle)
 
     ngx_win32_accept_mutex_done();
 
-    if (ngx_exiting && !ngx_terminate) {
+    if (ngx_win32_exiting_requested()
+        && !ngx_win32_terminate_requested())
+    {
         c = cycle->connections;
         for (i = 0; i < cycle->connection_n; i++) {
             if (c[i].fd != (ngx_socket_t) -1
@@ -1199,7 +1258,10 @@ ngx_cache_manager_thread(void *data)
          * ev == WAIT_ABANDONED_0 + 1
          */
 
-        if (ngx_terminate || ngx_quit || ngx_exiting) {
+        if (ngx_win32_terminate_requested()
+            || ngx_win32_quit_requested()
+            || ngx_win32_exiting_requested())
+        {
             ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "exiting");
             return 0;
         }
@@ -1216,7 +1278,10 @@ ngx_cache_manager_thread(void *data)
 
     for ( ;; ) {
 
-        if (ngx_terminate || ngx_quit || ngx_exiting) {
+        if (ngx_win32_terminate_requested()
+            || ngx_win32_quit_requested()
+            || ngx_win32_exiting_requested())
+        {
             ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "exiting");
             break;
         }
@@ -1324,7 +1389,10 @@ ngx_cache_loader_thread(void *data)
     path = cycle->paths.elts;
     for (i = 0; i < cycle->paths.nelts; i++) {
 
-        if (ngx_terminate || ngx_quit || ngx_exiting) {
+        if (ngx_win32_terminate_requested()
+            || ngx_win32_quit_requested()
+            || ngx_win32_exiting_requested())
+        {
             break;
         }
 
@@ -1401,7 +1469,7 @@ ngx_single_process_cycle(ngx_cycle_t *cycle)
                               ngx_stop_event_name);
             }
 
-            ngx_terminate = 1;
+            ngx_win32_set_terminate(1);
             break;
         }
 
@@ -1414,7 +1482,7 @@ ngx_single_process_cycle(ngx_cycle_t *cycle)
                               ngx_quit_event_name);
             }
 
-            ngx_quit = 1;
+            ngx_win32_set_quit(1);
             break;
         }
 
@@ -1425,7 +1493,7 @@ ngx_single_process_cycle(ngx_cycle_t *cycle)
                               ngx_reopen_event_name);
             }
 
-            ngx_reopen = 1;
+            ngx_win32_set_reopen(1);
             continue;
         }
 
@@ -1445,14 +1513,14 @@ ngx_single_process_cycle(ngx_cycle_t *cycle)
         if (ev == WAIT_OBJECT_0 + 4) {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                           "worker thread exited unexpectedly");
-            ngx_terminate = 1;
+            ngx_win32_set_terminate(1);
             break;
         }
 
         if (ev == WAIT_FAILED) {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, err,
                           "WaitForMultipleObjects() failed");
-            ngx_terminate = 1;
+            ngx_win32_set_terminate(1);
             break;
         }
     }

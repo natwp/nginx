@@ -52,7 +52,7 @@ static HANDLE  ngx_win32_accept_mutex;
 static HANDLE  ngx_win32_channel_thread;
 static HANDLE  ngx_win32_channel_write_thread;
 static HANDLE  ngx_win32_channel_write_ready;
-static ngx_uint_t ngx_win32_channel_stopping;
+static volatile LONG ngx_win32_channel_stopping;
 static ngx_queue_t ngx_win32_channel_queue;
 static ngx_queue_t ngx_win32_channel_write_queue;
 static ngx_queue_t ngx_win32_channel_write_priority_queue;
@@ -66,6 +66,20 @@ static ngx_uint_t ngx_win32_channel_initialized;
 static ngx_uint_t ngx_win32_channel_posted;
 static uint64_t ngx_win32_quic_route_key[2];
 static ngx_uint_t ngx_win32_quic_route_key_initialized;
+
+
+static ngx_inline ngx_uint_t
+ngx_win32_channel_is_stopping(void)
+{
+    return ngx_win32_channel_stopping != 0;
+}
+
+
+static ngx_inline void
+ngx_win32_channel_set_stopping(LONG value)
+{
+    (void) InterlockedExchange(&ngx_win32_channel_stopping, value);
+}
 
 
 typedef struct {
@@ -470,7 +484,7 @@ ngx_win32_worker_channel_init(ngx_cycle_t *cycle)
     InitializeCriticalSection(&ngx_win32_channel_lock);
     InitializeCriticalSection(&ngx_win32_channel_write_lock);
     ngx_win32_channel_initialized = 1;
-    ngx_win32_channel_stopping = 0;
+    ngx_win32_channel_set_stopping(0);
     ngx_win32_channel_posted = 0;
     ngx_win32_channel_queued = 0;
     ngx_win32_channel_read_queued = 0;
@@ -506,7 +520,7 @@ ngx_win32_worker_channel_init(ngx_cycle_t *cycle)
 
 failed:
 
-    ngx_win32_channel_stopping = 1;
+    ngx_win32_channel_set_stopping(1);
 
     if (ngx_win32_worker_pipe) {
         (void) CancelIoEx(ngx_win32_worker_pipe, NULL);
@@ -546,7 +560,9 @@ failed:
 void
 ngx_win32_worker_channel_done(void)
 {
+    size_t                           read_bytes, write_bytes;
     u_long                           wait;
+    ngx_uint_t                       read_messages, write_messages;
     ngx_queue_t                     *q;
     ngx_win32_channel_accept_node_t *node;
     ngx_win32_channel_write_node_t  *write;
@@ -555,7 +571,7 @@ ngx_win32_worker_channel_done(void)
         return;
     }
 
-    ngx_win32_channel_stopping = 1;
+    ngx_win32_channel_set_stopping(1);
 
     if (ngx_win32_channel_write_ready) {
         (void) SetEvent(ngx_win32_channel_write_ready);
@@ -593,10 +609,10 @@ ngx_win32_worker_channel_done(void)
         ngx_win32_channel_write_thread = NULL;
     }
 
-    ngx_win32_channel_queued = 0;
-    ngx_win32_channel_read_queued = 0;
-
     EnterCriticalSection(&ngx_win32_channel_lock);
+
+    read_bytes = 0;
+    read_messages = 0;
 
     while (!ngx_queue_empty(&ngx_win32_channel_queue)) {
         q = ngx_queue_head(&ngx_win32_channel_queue);
@@ -607,12 +623,31 @@ ngx_win32_worker_channel_done(void)
             (void) ngx_close_socket(node->socket);
         }
 
+        read_messages++;
+        read_bytes += sizeof(ngx_win32_channel_accept_node_t) + node->size;
         ngx_free(node);
     }
+
+    if (read_messages != ngx_win32_channel_queued
+        || read_bytes != ngx_win32_channel_read_queued)
+    {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                      "Win32 worker channel read queue counters differ "
+                      "at shutdown (tracked:%ui/%uz, actual:%ui/%uz)",
+                      ngx_win32_channel_queued,
+                      ngx_win32_channel_read_queued,
+                      read_messages, read_bytes);
+    }
+
+    ngx_win32_channel_queued = 0;
+    ngx_win32_channel_read_queued = 0;
 
     LeaveCriticalSection(&ngx_win32_channel_lock);
 
     EnterCriticalSection(&ngx_win32_channel_write_lock);
+
+    write_bytes = 0;
+    write_messages = 0;
 
     while (!ngx_queue_empty(&ngx_win32_channel_write_priority_queue)
            || !ngx_queue_empty(&ngx_win32_channel_write_queue))
@@ -622,7 +657,20 @@ ngx_win32_worker_channel_done(void)
             : ngx_queue_head(&ngx_win32_channel_write_queue);
         ngx_queue_remove(q);
         write = ngx_queue_data(q, ngx_win32_channel_write_node_t, queue);
+        write_messages++;
+        write_bytes += write->size;
         ngx_free(write);
+    }
+
+    if (write_messages != ngx_win32_channel_write_messages
+        || write_bytes != ngx_win32_channel_write_queued)
+    {
+        ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                      "Win32 worker channel write queue counters differ "
+                      "at shutdown (tracked:%ui/%uz, actual:%ui/%uz)",
+                      ngx_win32_channel_write_messages,
+                      ngx_win32_channel_write_queued,
+                      write_messages, write_bytes);
     }
 
     ngx_win32_channel_write_queued = 0;
@@ -673,7 +721,7 @@ ngx_win32_worker_channel_write_thread(void *data)
             ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
                           "WaitForSingleObject(worker channel write) failed");
 
-            if (!ngx_win32_channel_stopping) {
+            if (!ngx_win32_channel_is_stopping()) {
                 exit(2);
             }
 
@@ -683,7 +731,7 @@ ngx_win32_worker_channel_write_thread(void *data)
         for ( ;; ) {
             EnterCriticalSection(&ngx_win32_channel_write_lock);
 
-            if (ngx_win32_channel_stopping) {
+            if (ngx_win32_channel_is_stopping()) {
                 LeaveCriticalSection(&ngx_win32_channel_write_lock);
                 return 0;
             }
@@ -712,10 +760,12 @@ ngx_win32_worker_channel_write_thread(void *data)
             {
                 ngx_free(node);
 
-                if (!ngx_win32_channel_stopping) {
+                if (!ngx_win32_channel_is_stopping()) {
                     ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                                   "Win32 worker channel writer stopped "
-                                  "unexpectedly");
+                                  "unexpectedly for slot %ui generation %ui",
+                                  ngx_win32_worker_slot,
+                                  ngx_win32_worker_generation);
                     exit(2);
                 }
 
@@ -775,7 +825,7 @@ ngx_win32_worker_channel_queue_write(ngx_win32_channel_write_node_t *node,
 
     EnterCriticalSection(&ngx_win32_channel_write_lock);
 
-    if (ngx_win32_channel_stopping) {
+    if (ngx_win32_channel_is_stopping()) {
         LeaveCriticalSection(&ngx_win32_channel_write_lock);
         ngx_free(node);
 
@@ -859,9 +909,12 @@ ngx_win32_worker_channel_thread(void *data)
                                      cycle->log)
             != NGX_OK)
         {
-            if (!ngx_win32_channel_stopping) {
+            if (!ngx_win32_channel_is_stopping()) {
                 ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                              "Win32 worker channel stopped unexpectedly");
+                              "Win32 worker channel stopped unexpectedly for "
+                              "slot %ui generation %ui",
+                              ngx_win32_worker_slot,
+                              ngx_win32_worker_generation);
                 exit(2);
             }
 
@@ -967,10 +1020,14 @@ ngx_win32_worker_channel_thread(void *data)
 
         if (accept.local_socklen > sizeof(ngx_sockaddr_t)
             || accept.remote_socklen > sizeof(ngx_sockaddr_t)
-            || ngx_exiting || ngx_quit || ngx_terminate)
+            || ngx_win32_exiting_requested()
+            || ngx_win32_quit_requested()
+            || ngx_win32_terminate_requested())
         {
             (void) ngx_win32_worker_channel_ack(header.id,
-                         ngx_exiting || ngx_quit || ngx_terminate
+                         ngx_win32_exiting_requested()
+                         || ngx_win32_quit_requested()
+                         || ngx_win32_terminate_requested()
                          ? ERROR_OPERATION_ABORTED : ERROR_INVALID_DATA);
             continue;
         }
@@ -1009,7 +1066,7 @@ ngx_win32_worker_channel_thread(void *data)
 
         EnterCriticalSection(&ngx_win32_channel_lock);
 
-        if (ngx_win32_channel_stopping
+        if (ngx_win32_channel_is_stopping()
             || ngx_win32_channel_queued >= NGX_WIN32_CHANNEL_QUEUE_LIMIT
             || queued_size > NGX_WIN32_CHANNEL_READ_LIMIT
             || ngx_win32_channel_read_queued
@@ -1025,7 +1082,7 @@ ngx_win32_worker_channel_thread(void *data)
 
             ngx_free(node);
 
-            if (!ngx_win32_channel_stopping) {
+            if (!ngx_win32_channel_is_stopping()) {
                 ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
                               "Win32 worker channel read queue is full");
             }
@@ -1062,7 +1119,7 @@ ngx_win32_worker_channel_thread(void *data)
 
 failed:
 
-    if (!ngx_win32_channel_stopping) {
+    if (!ngx_win32_channel_is_stopping()) {
         exit(2);
     }
 
@@ -1266,7 +1323,7 @@ ngx_win32_worker_udp_sendmsg(ngx_connection_t *c, struct msghdr *msg,
     struct sockaddr            *local, *remote;
     socklen_t                   local_socklen, remote_socklen;
 
-    if (!ngx_win32_channel_initialized || ngx_win32_channel_stopping
+    if (!ngx_win32_channel_initialized || ngx_win32_channel_is_stopping()
         || ngx_win32_worker_pipe == NULL || c == NULL || msg == NULL
         || c->listening == NULL
         || msg->msg_iovlen > NGX_WIN32_CHANNEL_UDP_BUFS)
@@ -1906,7 +1963,7 @@ ngx_win32_worker_pipe_io(HANDLE pipe, void *data, size_t size,
 
             if (error != ERROR_IO_PENDING) {
                 if (error != ERROR_OPERATION_ABORTED
-                    || !ngx_win32_channel_stopping)
+                    || !ngx_win32_channel_is_stopping())
                 {
                     ngx_log_error(NGX_LOG_EMERG, log, error,
                                   "%s(worker pipe) failed",
@@ -1927,7 +1984,7 @@ ngx_win32_worker_pipe_io(HANDLE pipe, void *data, size_t size,
                 error = ngx_errno;
 
                 if (error != ERROR_OPERATION_ABORTED
-                    || !ngx_win32_channel_stopping)
+                    || !ngx_win32_channel_is_stopping())
                 {
                     ngx_log_error(NGX_LOG_EMERG, log, error,
                                   "GetOverlappedResult(worker pipe) failed");

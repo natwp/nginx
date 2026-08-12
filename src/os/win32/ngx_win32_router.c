@@ -515,17 +515,23 @@ ngx_win32_router_update_workers(ngx_cycle_t *cycle, ngx_uint_t generation)
 }
 
 
-void
+ngx_int_t
 ngx_win32_router_stop(ngx_cycle_t *cycle)
 {
-    u_long                      wait;
-    ngx_uint_t                  i;
-    ngx_queue_t                *q;
-    ngx_win32_router_accept_t  *accept;
+    u_long                           wait;
+    size_t                           queued_bytes;
+    ngx_int_t                        rc;
+    ngx_uint_t                       i, queued_messages;
+    ngx_queue_t                     *q;
+    ngx_win32_router_accept_t       *accept;
+    ngx_win32_router_pipe_write_t   *write;
+    ngx_win32_router_worker_t       *worker;
 
     if (!ngx_win32_router_initialized) {
-        return;
+        return NGX_OK;
     }
+
+    rc = NGX_OK;
 
     if (ngx_win32_router_thread_handle
         && ngx_win32_router_command(cycle, NGX_WIN32_ROUTER_CONTROL_STOP,
@@ -534,7 +540,7 @@ ngx_win32_router_stop(ngx_cycle_t *cycle)
     {
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
                       "could not stop the Win32 network router safely");
-        return;
+        return NGX_ERROR;
     }
 
     if (ngx_win32_router_thread_handle) {
@@ -544,7 +550,7 @@ ngx_win32_router_stop(ngx_cycle_t *cycle)
             ngx_log_error(NGX_LOG_ALERT, cycle->log,
                           wait == WAIT_FAILED ? ngx_errno : 0,
                           "could not join the Win32 network router thread");
-            return;
+            return NGX_ERROR;
         }
 
         ngx_close_handle(ngx_win32_router_thread_handle);
@@ -560,13 +566,52 @@ ngx_win32_router_stop(ngx_cycle_t *cycle)
     }
 
     for (i = 0; i < NGX_MAX_PROCESSES; i++) {
-        ngx_win32_router_drop_writes(&ngx_win32_router_workers[i], 0);
+        worker = &ngx_win32_router_workers[i];
+        queued_bytes = 0;
+        queued_messages = 0;
 
-        if (ngx_win32_router_workers[i].read.data
-            != ngx_win32_router_workers[i].read.header)
+        for (q = ngx_queue_head(&worker->writes);
+             q != ngx_queue_sentinel(&worker->writes);
+             q = ngx_queue_next(q))
         {
-            ngx_free(ngx_win32_router_workers[i].read.data);
+            write = ngx_queue_data(q, ngx_win32_router_pipe_write_t, queue);
+            queued_messages++;
+            queued_bytes += write->size;
         }
+
+        if (worker->read_pending || worker->write_pending
+            || queued_messages != worker->queued_messages
+            || queued_bytes != worker->queued_bytes)
+        {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                          "Win32 network router worker %P shutdown state "
+                          "differs (pending:%ui/%ui, tracked:%ui/%uz, "
+                          "actual:%ui/%uz)",
+                          worker->pid, worker->read_pending,
+                          worker->write_pending, worker->queued_messages,
+                          worker->queued_bytes, queued_messages, queued_bytes);
+            rc = NGX_ERROR;
+        }
+
+        ngx_win32_router_drop_writes(worker, 0);
+
+        if (worker->read.data != worker->read.header)
+        {
+            ngx_free(worker->read.data);
+        }
+    }
+
+    if (ngx_win32_router_pending || ngx_win32_router_channel_pending
+        || ngx_win32_router_udp_sends || ngx_win32_router_udp_send_bytes)
+    {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "Win32 network router shutdown left pending work "
+                      "(io:%ui, channel:%ui, udp:%ui, bytes:%uz)",
+                      ngx_win32_router_pending,
+                      ngx_win32_router_channel_pending,
+                      ngx_win32_router_udp_sends,
+                      ngx_win32_router_udp_send_bytes);
+        rc = NGX_ERROR;
     }
 
     ngx_win32_router_free_listeners();
@@ -580,6 +625,8 @@ ngx_win32_router_stop(ngx_cycle_t *cycle)
     ngx_win32_router_initialized = 0;
     ngx_win32_router_stopping = 0;
     ngx_win32_router_log = NULL;
+
+    return rc;
 }
 
 
@@ -766,17 +813,19 @@ ngx_win32_router_command(ngx_cycle_t *cycle, ngx_uint_t command,
 
     if (wait == WAIT_TIMEOUT) {
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                      "Win32 network router control %ui exceeded %dms",
-                      command, NGX_WIN32_ROUTER_PAUSE_TIMEOUT);
+                      "Win32 network router control %ui for generation %ui "
+                      "exceeded %dms", command, generation,
+                      NGX_WIN32_ROUTER_PAUSE_TIMEOUT);
 
         wait = WaitForSingleObject(control->event,
                                    NGX_WIN32_ROUTER_GRACE_TIMEOUT);
 
         if (wait == WAIT_TIMEOUT) {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                          "Win32 network router control %ui did not complete "
-                          "within an additional %dms; router is unusable",
-                          command, NGX_WIN32_ROUTER_GRACE_TIMEOUT);
+                          "Win32 network router control %ui for generation "
+                          "%ui did not complete within an additional %dms; "
+                          "router is unusable", command, generation,
+                          NGX_WIN32_ROUTER_GRACE_TIMEOUT);
 
             InterlockedExchange(&control->abandoned, 1);
             ngx_win32_router_broken = 1;
@@ -790,8 +839,8 @@ ngx_win32_router_command(ngx_cycle_t *cycle, ngx_uint_t command,
 
     } else {
         ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "WaitForSingleObject(network router control %ui) "
-                      "failed", command);
+                      "WaitForSingleObject(network router control %ui for "
+                      "generation %ui) failed", command, generation);
 
         InterlockedExchange(&control->abandoned, 1);
         ngx_win32_router_broken = 1;

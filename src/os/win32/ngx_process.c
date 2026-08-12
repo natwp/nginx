@@ -137,6 +137,9 @@ ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
     ngx_free(ctx.wpath);
 
     if (pid == NGX_INVALID_PID) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "could not start %s process in slot %ui "
+                      "generation %ui", name, slot, generation);
         ngx_win32_master_close_bootstrap(ngx_processes[s].bootstrap);
         ngx_free(ngx_processes[s].bootstrap);
         ngx_processes[s].bootstrap = NULL;
@@ -227,14 +230,24 @@ ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
 
     case WAIT_TIMEOUT:
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                      "the event \"%s\" was not signaled for 5s",
-                      ngx_master_process_event_name);
+                      "the event \"%s\" was not signaled for 5s while "
+                      "starting %s process %P in slot %ui generation %ui",
+                      ngx_master_process_event_name, name, pid, slot,
+                      generation);
         goto failed;
 
     case WAIT_FAILED:
         ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
                       "WaitForSingleObject(\"%s\") failed",
                       ngx_master_process_event_name);
+
+        goto failed;
+
+    default:
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "WaitForMultipleObjects() returned unexpected "
+                      "value %ul while starting %s process %P",
+                      rc, name, pid);
 
         goto failed;
     }
@@ -307,22 +320,31 @@ failed:
 
     if (ngx_processes[s].reopen) {
         ngx_close_handle(ngx_processes[s].reopen);
+        ngx_processes[s].reopen = NULL;
     }
 
     if (ngx_processes[s].quit) {
         ngx_close_handle(ngx_processes[s].quit);
+        ngx_processes[s].quit = NULL;
     }
 
     if (ngx_processes[s].term) {
         ngx_close_handle(ngx_processes[s].term);
+        ngx_processes[s].term = NULL;
     }
 
-    TerminateProcess(ngx_processes[s].handle, 2);
-
     if (ngx_processes[s].handle) {
+        if (TerminateProcess(ngx_processes[s].handle, 2) == 0) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "TerminateProcess(%P) failed",
+                          ngx_processes[s].pid);
+        }
+
         ngx_close_handle(ngx_processes[s].handle);
         ngx_processes[s].handle = NULL;
     }
+
+    ngx_processes[s].ready_state = 0;
 
     return NGX_INVALID_PID;
 }
@@ -429,7 +451,8 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
 
     if (process_created == 0) {
         ngx_log_error(NGX_LOG_CRIT, cycle->log, ngx_errno,
-                      "CreateProcess() failed");
+                      "CreateProcess() failed while starting %s process",
+                      ctx->name);
 
         goto failed;
     }
