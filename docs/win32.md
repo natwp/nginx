@@ -32,6 +32,10 @@ worker. Increase `worker_processes` to use more CPU cores. `post_acceptex`
 controls outstanding TCP accepts, and `iocp_udp_receives` controls outstanding
 UDP receives.
 
+On systems with multiple Windows processor groups, workers are assigned to
+groups before their primary thread resumes. This preserves the single-threaded
+nginx worker model while allowing `worker_processes auto` to use all groups.
+
 ## File IO and Logging
 
 IOCP workers use overlapped file IO when `aio on` is configured. With
@@ -56,8 +60,22 @@ signature intentionally rejects modules built against the upstream Windows
 ABI, including `--with-compat` modules, because IOCP adds fields to core
 structures.
 
-Before packaging, run `nginx.exe -t`, HTTP and UDP loopback requests for each
-enabled event backend, worker crash/respawn, graceful reload and quit, cache
-loader startup, Unicode executable-path, stderr logging, TLS, file AIO, and
-sendfile tests. Confirm the release binary is built without `--with-debug` and
-with the intended PCRE, zlib, and OpenSSL dependencies.
+Before packaging, run `nginx.exe -t`, HTTP loopback requests for each enabled
+event backend, an IOCP UDP loopback request, worker crash/respawn, graceful
+reload and quit, cache loader startup, Unicode executable-path, stderr logging,
+TLS, file AIO, and sendfile tests. Confirm the release binary is built without
+`--with-debug` and with the intended PCRE, zlib, and OpenSSL dependencies.
+
+The repeatable smoke/lifecycle matrix is in `misc/win32-rc-test.ps1`. Run it
+from Windows PowerShell against a build with PCRE2 and zlib. Pass the OpenSSL
+executable used for the build to add a live TLS handshake:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe `
+    -OpenSSLBinary C:\path\to\openssl.exe
+```
+
+The fork does not currently register nginx directly with the Windows Service
+Control Manager. Use a service wrapper that starts the master as a console
+process, or treat SCM integration as a separate feature.

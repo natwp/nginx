@@ -103,6 +103,9 @@ This source tree includes an expanded native Windows implementation. See the
 [Windows port notes](docs/win32.md) for its process model, IOCP behavior,
 build requirements, and release validation checklist.
 
+The native Windows port is currently distributed as a console-process build;
+direct Windows Service Control Manager registration is not included.
+
 ## Dynamic modules
 NGINX version 1.9.11 added support for [Dynamic Modules](https://nginx.org/en/docs/ngx_core_module.html#load_module). Unlike Static modules, dynamically built modules can be downloaded, installed, and configured after the core NGINX binaries have been built. [Official dynamic module binaries](https://nginx.org/en/linux_packages.html#dynmodules) are available from the same package repository as the core NGINX binaries described in previous steps.
 

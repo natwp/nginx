@@ -17,13 +17,17 @@ char           **ngx_os_argv;
 ngx_int_t        ngx_last_process;
 ngx_process_t    ngx_processes[NGX_MAX_PROCESSES];
 HANDLE           ngx_process_exit_event;
-static HANDLE    ngx_win32_worker_job;
+static HANDLE     ngx_win32_worker_job;
+static ngx_uint_t ngx_win32_worker_job_nested;
+static ngx_uint_t ngx_win32_worker_job_assigned;
 
 
 static WCHAR *ngx_win32_get_module_filename(ngx_cycle_t *cycle);
 static WCHAR *ngx_win32_copy_command_line(ngx_cycle_t *cycle);
 static WCHAR *ngx_win32_create_worker_environment(ngx_cycle_t *cycle,
     ngx_win32_worker_bootstrap_t *bootstrap);
+static void ngx_win32_set_worker_group(ngx_cycle_t *cycle,
+    ngx_exec_ctx_t *ctx, ngx_uint_t slot);
 static ngx_uint_t ngx_win32_worker_environment_variable(WCHAR *entry,
     size_t len);
 static WCHAR *ngx_win32_copy_ascii(WCHAR *dst, u_char *src);
@@ -81,6 +85,7 @@ ngx_spawn_worker(ngx_cycle_t *cycle, char *name, ngx_int_t respawn,
     ngx_memzero(&ngx_processes[s], sizeof(ngx_process_t));
 
     ngx_memzero(&ctx, sizeof(ngx_exec_ctx_t));
+    ngx_win32_set_worker_group(cycle, &ctx, slot);
 
     ctx.wpath = ngx_win32_get_module_filename(cycle);
     if (ctx.wpath == NULL) {
@@ -360,7 +365,7 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
     LPPROC_THREAD_ATTRIBUTE_LIST  attributes;
     HANDLE                child_stderr, stderr_handle;
     u_long                flags;
-    ngx_uint_t            attributes_initialized;
+    ngx_uint_t            attributes_initialized, attributes_n;
 
     ngx_memzero(&si, sizeof(STARTUPINFOEXW));
     si.StartupInfo.cb = sizeof(STARTUPINFOW);
@@ -369,6 +374,7 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
 
     attributes = NULL;
     attributes_initialized = 0;
+    attributes_n = 0;
     child_stderr = NULL;
     inherit_handles = 0;
 
@@ -385,23 +391,33 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
             return NGX_INVALID_PID;
         }
 
+        attributes_n++;
+    }
+
+    if (ctx->group_affinity_set) {
+        attributes_n++;
+    }
+
+    if (attributes_n) {
         size = 0;
-        (void) InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+        (void) InitializeProcThreadAttributeList(NULL, attributes_n, 0,
+                                                &size);
 
         if (size == 0) {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
                           "InitializeProcThreadAttributeList() failed");
-            ngx_close_handle(child_stderr);
-            return NGX_INVALID_PID;
+            goto failed;
         }
 
         attributes = ngx_alloc(size, cycle->log);
         if (attributes == NULL) {
-            ngx_close_handle(child_stderr);
-            return NGX_INVALID_PID;
+            goto failed;
         }
 
-        if (InitializeProcThreadAttributeList(attributes, 1, 0, &size) == 0) {
+        if (InitializeProcThreadAttributeList(attributes, attributes_n, 0,
+                                              &size)
+            == 0)
+        {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
                           "InitializeProcThreadAttributeList() failed");
             goto failed;
@@ -409,18 +425,37 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
 
         attributes_initialized = 1;
 
-        if (UpdateProcThreadAttribute(attributes, 0,
-                                      PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                      &child_stderr, sizeof(HANDLE), NULL, NULL)
-            == 0)
-        {
-            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                          "UpdateProcThreadAttribute() failed");
-            goto failed;
+        if (child_stderr) {
+            if (UpdateProcThreadAttribute(attributes, 0,
+                                          PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                          &child_stderr, sizeof(HANDLE),
+                                          NULL, NULL)
+                == 0)
+            {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                              "UpdateProcThreadAttribute(handle list) failed");
+                goto failed;
+            }
         }
 
         si.lpAttributeList = attributes;
         si.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+    }
+
+    if (ctx->group_affinity_set) {
+        if (UpdateProcThreadAttribute(attributes, 0,
+                                      PROC_THREAD_ATTRIBUTE_GROUP_AFFINITY,
+                                      &ctx->group_affinity,
+                                      sizeof(GROUP_AFFINITY), NULL, NULL)
+            == 0)
+        {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "UpdateProcThreadAttribute(group affinity) failed");
+            goto failed;
+        }
+    }
+
+    if (child_stderr) {
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
         si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
@@ -469,15 +504,31 @@ ngx_execute(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx)
         ngx_close_handle(child_stderr);
     }
 
-    if (ngx_win32_worker_job
-        && AssignProcessToJobObject(ngx_win32_worker_job, pi.hProcess) == 0)
-    {
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "AssignProcessToJobObject() failed");
-        (void) TerminateProcess(pi.hProcess, 2);
-        ngx_close_handle(pi.hThread);
-        ngx_close_handle(pi.hProcess);
-        return NGX_INVALID_PID;
+    if (ngx_win32_worker_job) {
+        if (AssignProcessToJobObject(ngx_win32_worker_job, pi.hProcess) == 0) {
+            if (ngx_win32_worker_job_nested
+                && ngx_win32_worker_job_assigned == 0)
+            {
+                ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
+                              "AssignProcessToJobObject() failed for a "
+                              "nested job; worker crash cleanup is "
+                              "unavailable");
+                ngx_close_handle(ngx_win32_worker_job);
+                ngx_win32_worker_job = NULL;
+                ngx_win32_worker_job_nested = 0;
+
+            } else {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                              "AssignProcessToJobObject() failed");
+                (void) TerminateProcess(pi.hProcess, 2);
+                ngx_close_handle(pi.hThread);
+                ngx_close_handle(pi.hProcess);
+                return NGX_INVALID_PID;
+            }
+
+        } else {
+            ngx_win32_worker_job_assigned++;
+        }
     }
 
     if (ResumeThread(pi.hThread) == (DWORD) -1) {
@@ -538,10 +589,13 @@ ngx_win32_job_init(ngx_cycle_t *cycle)
         return NGX_DECLINED;
     }
 
+    ngx_win32_worker_job_nested = in_job;
+    ngx_win32_worker_job_assigned = 0;
+
     if (in_job) {
         ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                      "master process is already contained in a Job Object");
-        return NGX_DECLINED;
+                      "master process is contained in a Job Object; "
+                      "using a nested worker Job Object");
     }
 
     ngx_win32_worker_job = CreateJobObject(NULL, NULL);
@@ -549,6 +603,7 @@ ngx_win32_job_init(ngx_cycle_t *cycle)
         ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
                       "CreateJobObject() failed, worker crash cleanup "
                       "is unavailable");
+        ngx_win32_worker_job_nested = 0;
         return NGX_DECLINED;
     }
 
@@ -564,6 +619,7 @@ ngx_win32_job_init(ngx_cycle_t *cycle)
                       "cleanup is unavailable");
         ngx_close_handle(ngx_win32_worker_job);
         ngx_win32_worker_job = NULL;
+        ngx_win32_worker_job_nested = 0;
         return NGX_DECLINED;
     }
 
@@ -578,6 +634,80 @@ ngx_win32_job_done(void)
         ngx_close_handle(ngx_win32_worker_job);
         ngx_win32_worker_job = NULL;
     }
+
+    ngx_win32_worker_job_nested = 0;
+    ngx_win32_worker_job_assigned = 0;
+}
+
+
+static void
+ngx_win32_set_worker_group(ngx_cycle_t *cycle, ngx_exec_ctx_t *ctx,
+    ngx_uint_t slot)
+{
+    WORD             group, groups;
+    DWORD            count, total;
+    uint64_t         target;
+    ngx_core_conf_t *ccf;
+
+    groups = GetActiveProcessorGroupCount();
+
+    if (groups <= 1) {
+        return;
+    }
+
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+    if (ccf == NULL || ccf->worker_processes <= 0) {
+        return;
+    }
+
+    total = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (total == 0) {
+        ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
+                      "GetActiveProcessorCount() failed; worker processor "
+                      "group placement is unavailable");
+        return;
+    }
+
+    if (ccf->worker_processes == 1) {
+        target = 0;
+
+    } else {
+        target = ((uint64_t) slot * 2 + 1) * total
+                 / ((uint64_t) ccf->worker_processes * 2);
+    }
+
+    if (target >= total) {
+        target = total - 1;
+    }
+
+    for (group = 0; group < groups; group++) {
+        count = GetActiveProcessorCount(group);
+
+        if (target < count) {
+            ngx_memzero(&ctx->group_affinity, sizeof(GROUP_AFFINITY));
+            ctx->group_affinity.Group = group;
+
+            if (count >= sizeof(KAFFINITY) * 8) {
+                ctx->group_affinity.Mask = (KAFFINITY) -1;
+
+            } else {
+                ctx->group_affinity.Mask = ((KAFFINITY) 1 << count) - 1;
+            }
+
+            ctx->group_affinity_set = 1;
+
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                           "worker slot %ui uses processor group %ui",
+                           slot, (ngx_uint_t) group);
+            return;
+        }
+
+        target -= count;
+    }
+
+    ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                  "could not select a processor group for worker slot %ui",
+                  slot);
 }
 
 

@@ -298,6 +298,7 @@ static ngx_win32_router_worker_t *ngx_win32_router_find_worker(
     ngx_pid_t pid, ngx_uint_t slot, ngx_uint_t generation);
 static ngx_win32_router_worker_t *ngx_win32_router_find_quic_worker(
     ngx_uint_t slot, ngx_uint_t generation);
+static void ngx_win32_router_rebuild_ready_workers(void);
 static ngx_win32_router_worker_t *ngx_win32_router_select_worker(
     uint32_t hash, ngx_uint_t round_robin);
 static void ngx_win32_router_expire_accepts(void);
@@ -330,6 +331,9 @@ static ngx_uint_t       ngx_win32_router_initialized;
 static ngx_uint_t       ngx_win32_router_broken;
 static ngx_uint_t       ngx_win32_router_generation;
 static ngx_win32_router_worker_t ngx_win32_router_workers[NGX_MAX_PROCESSES];
+static ngx_win32_router_worker_t *ngx_win32_router_ready_workers[
+                                                          NGX_MAX_PROCESSES];
+static ngx_uint_t       ngx_win32_router_ready_worker_n;
 static ngx_win32_router_control_t *ngx_win32_router_pending_control;
 static ngx_queue_t      ngx_win32_router_flow_buckets[
                                                  NGX_WIN32_ROUTER_FLOW_BUCKETS];
@@ -404,6 +408,7 @@ ngx_win32_router_start(ngx_cycle_t *cycle, ngx_uint_t generation)
 
     ngx_memzero(ngx_win32_router_workers,
                 sizeof(ngx_win32_router_workers));
+    ngx_win32_router_ready_worker_n = 0;
 
     for (i = 0; i < NGX_MAX_PROCESSES; i++) {
         ngx_queue_init(&ngx_win32_router_workers[i].writes);
@@ -2036,6 +2041,7 @@ ngx_win32_router_apply_workers(ngx_win32_router_control_t *control)
         }
     }
 
+    ngx_win32_router_rebuild_ready_workers();
     ngx_win32_router_generation = control->generation;
 
     return NGX_OK;
@@ -2956,15 +2962,16 @@ static ngx_win32_router_worker_t *
 ngx_win32_router_find_worker(ngx_pid_t pid, ngx_uint_t slot,
     ngx_uint_t generation)
 {
-    ngx_uint_t  i;
+    ngx_uint_t                  i;
+    ngx_win32_router_worker_t  *worker;
 
-    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
-        if (ngx_win32_router_workers[i].ready
-            && ngx_win32_router_workers[i].pid == pid
-            && ngx_win32_router_workers[i].slot == slot
-            && ngx_win32_router_workers[i].generation == generation)
+    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
+        worker = ngx_win32_router_ready_workers[i];
+
+        if (worker->ready && worker->pid == pid && worker->slot == slot
+            && worker->generation == generation)
         {
-            return &ngx_win32_router_workers[i];
+            return worker;
         }
     }
 
@@ -2975,19 +2982,37 @@ ngx_win32_router_find_worker(ngx_pid_t pid, ngx_uint_t slot,
 static ngx_win32_router_worker_t *
 ngx_win32_router_find_quic_worker(ngx_uint_t slot, ngx_uint_t generation)
 {
-    ngx_uint_t  i;
+    ngx_uint_t                  i;
+    ngx_win32_router_worker_t  *worker;
 
-    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
-        if (ngx_win32_router_workers[i].ready
-            && ngx_win32_router_workers[i].slot == slot
-            && (ngx_win32_router_workers[i].generation & 0xffff)
-               == generation)
+    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
+        worker = ngx_win32_router_ready_workers[i];
+
+        if (worker->ready && worker->slot == slot
+            && (worker->generation & 0xffff) == generation)
         {
-            return &ngx_win32_router_workers[i];
+            return worker;
         }
     }
 
     return NULL;
+}
+
+
+static void
+ngx_win32_router_rebuild_ready_workers(void)
+{
+    ngx_uint_t  i;
+
+    ngx_win32_router_ready_worker_n = 0;
+
+    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
+        if (ngx_win32_router_workers[i].ready) {
+            ngx_win32_router_ready_workers[
+                ngx_win32_router_ready_worker_n++] =
+                    &ngx_win32_router_workers[i];
+        }
+    }
 }
 
 
@@ -2999,11 +3024,17 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
 
     if (round_robin) {
         best = NULL;
-        start = ngx_win32_router_next_worker++ % NGX_MAX_PROCESSES;
 
-        for (n = 0; n < NGX_MAX_PROCESSES; n++) {
-            i = (start + n) % NGX_MAX_PROCESSES;
-            worker = &ngx_win32_router_workers[i];
+        if (ngx_win32_router_ready_worker_n == 0) {
+            return NULL;
+        }
+
+        start = ngx_win32_router_next_worker++
+                % ngx_win32_router_ready_worker_n;
+
+        for (n = 0; n < ngx_win32_router_ready_worker_n; n++) {
+            i = (start + n) % ngx_win32_router_ready_worker_n;
+            worker = ngx_win32_router_ready_workers[i];
 
             if (!worker->ready || !worker->active
                 || worker->queued_messages
@@ -3026,13 +3057,12 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
 
     n = 0;
 
-    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
-        if (ngx_win32_router_workers[i].ready
-            && ngx_win32_router_workers[i].active
-            && ngx_win32_router_workers[i].queued_messages
-               < NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-            && ngx_win32_router_workers[i].queued_bytes
-               < NGX_WIN32_ROUTER_CHANNEL_LIMIT)
+    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
+        worker = ngx_win32_router_ready_workers[i];
+
+        if (worker->ready && worker->active
+            && worker->queued_messages < NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+            && worker->queued_bytes < NGX_WIN32_ROUTER_CHANNEL_LIMIT)
         {
             n++;
         }
@@ -3044,19 +3074,18 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
 
     target = hash % n;
 
-    for (i = 0; i < NGX_MAX_PROCESSES; i++) {
-        if (!ngx_win32_router_workers[i].ready
-            || !ngx_win32_router_workers[i].active
-            || ngx_win32_router_workers[i].queued_messages
-               >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-            || ngx_win32_router_workers[i].queued_bytes
-               >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
+    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
+        worker = ngx_win32_router_ready_workers[i];
+
+        if (!worker->ready || !worker->active
+            || worker->queued_messages >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+            || worker->queued_bytes >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
         {
             continue;
         }
 
         if (target-- == 0) {
-            return &ngx_win32_router_workers[i];
+            return worker;
         }
     }
 

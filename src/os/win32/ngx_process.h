@@ -65,6 +65,8 @@ typedef struct {
     WCHAR                  *wargs;
     WCHAR                  *wenvironment;
     HANDLE                  child;
+    GROUP_AFFINITY          group_affinity;
+    unsigned                group_affinity_set:1;
 } ngx_exec_ctx_t;
 
 
