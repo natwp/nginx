@@ -14,6 +14,7 @@ typedef struct {
     ngx_iocp_op_t  op;
     WSABUF         wsabuf;
     u_char        *buffer;
+    unsigned       allocated:1;
 } ngx_iocp_wsarecv_op_t;
 
 
@@ -245,11 +246,22 @@ ngx_overlapped_wsarecv(ngx_connection_t *c, u_char *buf, size_t size)
     }
 
     op->wsabuf.len = (ULONG) size;
-    op->buffer = ngx_alloc(op->wsabuf.len, c->log);
-    if (op->buffer == NULL) {
-        ngx_iocp_op_abort(&op->op);
-        rev->error = 1;
-        return NGX_ERROR;
+
+    if (rev->iocp_pool && rev->iocp_pool != c->pool) {
+        op->buffer = buf;
+        op->allocated = 0;
+        rev->iocp_direct_recv = 1;
+
+    } else {
+        rev->iocp_direct_recv = 0;
+        op->buffer = ngx_alloc(op->wsabuf.len, c->log);
+        if (op->buffer == NULL) {
+            ngx_iocp_op_abort(&op->op);
+            rev->error = 1;
+            return NGX_ERROR;
+        }
+
+        op->allocated = 1;
     }
 
     op->wsabuf.buf = (char *) op->buffer;
@@ -277,6 +289,7 @@ ngx_overlapped_wsarecv(ngx_connection_t *c, u_char *buf, size_t size)
 
         rev->active = 0;
         rev->ready = 1;
+        rev->iocp_direct_recv = 0;
         ngx_iocp_op_abort(&op->op);
 
         n = ngx_connection_error(c, err, "WSARecv() failed");
@@ -304,6 +317,7 @@ ngx_iocp_wsarecv_complete(ngx_iocp_op_t *base)
     if (base->error == 0 && base->bytes) {
         if (rev->iocp_buffer) {
             base->error = WSAEINVAL;
+            rev->iocp_direct_recv = 0;
 
         } else {
             rev->iocp_buffer = op->buffer;
@@ -311,6 +325,9 @@ ngx_iocp_wsarecv_complete(ngx_iocp_op_t *base)
             rev->iocp_buffer_pos = 0;
             op->buffer = NULL;
         }
+
+    } else {
+        rev->iocp_direct_recv = 0;
     }
 
     ngx_iocp_event_complete(base);
@@ -324,7 +341,7 @@ ngx_iocp_wsarecv_cleanup(ngx_iocp_op_t *base)
 
     op = (ngx_iocp_wsarecv_op_t *) base;
 
-    if (op->buffer) {
+    if (op->allocated && op->buffer) {
         ngx_free(op->buffer);
         op->buffer = NULL;
     }
@@ -350,15 +367,20 @@ ngx_iocp_wsarecv_copy(ngx_event_t *rev, u_char *buf, size_t size)
             return NGX_ERROR;
         }
 
-        ngx_memcpy(buf, rev->iocp_buffer + rev->iocp_buffer_pos, n);
+        if (buf != rev->iocp_buffer + rev->iocp_buffer_pos) {
+            ngx_memcpy(buf, rev->iocp_buffer + rev->iocp_buffer_pos, n);
+        }
         rev->iocp_buffer_pos += n;
     }
 
     if (rev->iocp_buffer_pos == rev->iocp_buffer_size) {
-        ngx_free(rev->iocp_buffer);
+        if (!rev->iocp_direct_recv) {
+            ngx_free(rev->iocp_buffer);
+        }
         rev->iocp_buffer = NULL;
         rev->iocp_buffer_size = 0;
         rev->iocp_buffer_pos = 0;
+        rev->iocp_direct_recv = 0;
         rev->ready = 0;
     }
 

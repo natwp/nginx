@@ -1091,19 +1091,20 @@ ngx_iocp_close_connection(ngx_connection_t *c)
         ngx_delete_udp_connection(c);
     }
 
-    if (c->read->iocp_buffer) {
+    if (c->read->iocp_buffer && !c->read->iocp_direct_recv) {
         ngx_free(c->read->iocp_buffer);
-        c->read->iocp_buffer = NULL;
-        c->read->iocp_buffer_size = 0;
-        c->read->iocp_buffer_pos = 0;
     }
+    c->read->iocp_buffer = NULL;
+    c->read->iocp_buffer_size = 0;
+    c->read->iocp_buffer_pos = 0;
+    c->read->iocp_direct_recv = 0;
 
     if (c->write->iocp_buffer) {
         ngx_free(c->write->iocp_buffer);
-        c->write->iocp_buffer = NULL;
-        c->write->iocp_buffer_size = 0;
-        c->write->iocp_buffer_pos = 0;
     }
+    c->write->iocp_buffer = NULL;
+    c->write->iocp_buffer_size = 0;
+    c->write->iocp_buffer_pos = 0;
 
     ngx_iocp_cancel(owner);
 

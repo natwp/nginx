@@ -101,6 +101,7 @@ struct ngx_event_s {
     size_t           iocp_bytes;
     ngx_err_t        iocp_error;
     size_t           iocp_expected;
+    unsigned         iocp_direct_recv:1;
 #endif
 
     ngx_uint_t       index;
