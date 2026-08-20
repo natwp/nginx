@@ -11,6 +11,7 @@
 
 
 ngx_uint_t  ngx_win32_version;
+ngx_uint_t  ngx_win32_workstation;
 ngx_uint_t  ngx_ncpu;
 ngx_uint_t  ngx_max_wsabufs;
 ngx_int_t   ngx_max_sockets;
@@ -77,6 +78,8 @@ ngx_os_init(ngx_log_t *log)
 
     /* get Windows version */
 
+    ngx_win32_workstation = 1;
+
     ngx_memzero(&osvi, sizeof(OSVERSIONINFOEX));
     osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
 
@@ -123,6 +126,9 @@ ngx_os_init(ngx_log_t *log)
     if (osviex) {
         ngx_win32_version += osvi.wServicePackMajor * 10
                              + osvi.wServicePackMinor;
+
+        ngx_win32_workstation =
+            (osvi.wProductType == VER_NT_WORKSTATION);
     }
 
     GetSystemInfo(&si);

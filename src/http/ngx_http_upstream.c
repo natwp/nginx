@@ -3991,6 +3991,9 @@ ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
     ngx_buf_t                 *b;
     ngx_int_t                  rc;
     ngx_uint_t                 flags;
+#if (NGX_HAVE_IOCP)
+    ngx_uint_t                 iocp_direct;
+#endif
     ngx_connection_t          *downstream, *upstream;
     ngx_http_upstream_t       *u;
     ngx_http_core_loc_conf_t  *clcf;
@@ -4050,9 +4053,42 @@ ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
 
         size = b->end - b->last;
 
+#if (NGX_HAVE_IOCP)
+        iocp_direct = size
+                      && (ngx_event_flags & NGX_USE_IOCP_EVENT)
+                      && upstream->recv == ngx_overlapped_wsarecv
+                      && upstream->read->iocp_pool == r->pool
+                      && !upstream->read->eof
+                      && !upstream->read->error;
+
+        /*
+         * A zero-byte WSARecv() followed by a data WSARecv() doubles the
+         * completion traffic while a non-buffered upstream response is
+         * flowing.  The request pool pins this buffer, so post the real
+         * receive directly and let its completion drive the handler.
+         */
+        if (iocp_direct
+            && upstream->read->iocp_op == NULL
+            && !upstream->read->complete
+            && upstream->read->iocp_buffer == NULL)
+        {
+            upstream->read->ready = 1;
+        }
+#endif
+
         if (size && upstream->read->ready) {
 
+#if (NGX_HAVE_IOCP)
+            if (iocp_direct) {
+                upstream->read->iocp_direct_recv = 1;
+            }
+#endif
+
             n = upstream->recv(upstream, b->last, size);
+
+#if (NGX_HAVE_IOCP)
+            upstream->read->iocp_direct_recv = 0;
+#endif
 
             if (n == NGX_AGAIN) {
                 break;

@@ -13,6 +13,7 @@ param(
     [string] $Binary = (Join-Path $PSScriptRoot '..\objs\nginx.exe'),
     [string] $Root = (Join-Path $PSScriptRoot '..'),
     [string] $OpenSSLBinary = '',
+    [switch] $SkipStream,
     [switch] $KeepArtifacts
 )
 
@@ -117,6 +118,91 @@ function Wait-Http([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
         }
     } while ((Get-Date) -lt $deadline)
     throw "HTTP backend on port $Port did not return '$Expected'"
+}
+
+function Test-ConnectionChurn([int] $Port, [string] $Expected,
+    [int] $Concurrency = 32, [int] $Rounds = 100) {
+    if (-not ('NginxWin32Rc.ConnectionChurn' -as [type])) {
+        Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace NginxWin32Rc
+{
+    public static class ConnectionChurn
+    {
+        private static readonly byte[] Request = Encoding.ASCII.GetBytes(
+            "GET /churn HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+            "Connection: close\r\n\r\n");
+
+        public static void Run(int port, string expected, int concurrency,
+            int rounds)
+        {
+            for (int round = 0; round < rounds; round++) {
+                Task[] tasks = new Task[concurrency];
+
+                for (int i = 0; i < concurrency; i++) {
+                    tasks[i] = SendRequest(port, expected);
+                }
+
+                if (!Task.WaitAll(tasks, 20000)) {
+                    throw new TimeoutException(
+                        "HTTP connection-churn batch timed out");
+                }
+            }
+        }
+
+        private static async Task SendRequest(int port, string expected)
+        {
+            using (TcpClient client = new TcpClient()) {
+                client.NoDelay = true;
+                await client.ConnectAsync("127.0.0.1", port)
+                    .ConfigureAwait(false);
+
+                using (NetworkStream stream = client.GetStream())
+                using (MemoryStream response = new MemoryStream()) {
+                    await stream.WriteAsync(Request, 0, Request.Length)
+                        .ConfigureAwait(false);
+
+                    byte[] buffer = new byte[1024];
+                    int size;
+
+                    while ((size = await stream.ReadAsync(buffer, 0,
+                                                          buffer.Length)
+                                              .ConfigureAwait(false)) != 0)
+                    {
+                        response.Write(buffer, 0, size);
+
+                        if (response.Length > 65536) {
+                            throw new InvalidDataException(
+                                "HTTP churn response was too large");
+                        }
+                    }
+
+                    string text = Encoding.ASCII.GetString(
+                        response.ToArray());
+
+                    if (!text.StartsWith("HTTP/1.1 200 ",
+                                         StringComparison.Ordinal)
+                        || text.IndexOf("\r\n\r\n" + expected,
+                                        StringComparison.Ordinal) < 0)
+                    {
+                        throw new InvalidDataException(
+                            "HTTP churn response mismatch");
+                    }
+                }
+            }
+        }
+    }
+}
+'@
+    }
+
+    [NginxWin32Rc.ConnectionChurn]::Run($Port, $Expected, $Concurrency,
+        $Rounds)
 }
 
 function Wait-TestProcesses([string] $Prefix, [int] $Minimum, [int] $TimeoutSec = 20) {
@@ -237,7 +323,9 @@ function Test-Backend([string] $Backend, [string] $BaseDir) {
     $dir = Join-Path $BaseDir $Backend
     $logs = Join-Path $dir 'logs'
     $html = Join-Path $dir 'html'
-    New-Item -ItemType Directory -Force -Path $logs, $html | Out-Null
+    $temp = Join-Path $dir 'temp'
+    New-Item -ItemType Directory -Force -Path $logs, $html, $temp |
+        Out-Null
 
     $httpPort = Get-FreeTcpPort
     $httpsPort = Get-FreeTcpPort
@@ -257,7 +345,7 @@ function Test-Backend([string] $Backend, [string] $BaseDir) {
         }
 "@
     } else { '' }
-    $streamConfig = if ($Backend -eq 'iocp') {
+    $streamConfig = if ($Backend -eq 'iocp' -and $script:Stream) {
 @"
 stream {
     log_format rc_stream '`$remote_addr [`$time_local] `$protocol `$status';
@@ -306,6 +394,10 @@ $tlsConfig
         location = / {
             return 200 "$body";
         }
+        location = /churn {
+            access_log off;
+            return 200 "$body";
+        }
         location = /sendfile.txt {
             root "$($html.Replace('\','/'))";
             sendfile on;
@@ -330,6 +422,9 @@ $streamConfig
     try {
         Wait-Http $httpPort $body
         if ($Backend -eq 'iocp') {
+            Test-ConnectionChurn $httpPort $body
+        }
+        if ($Backend -eq 'iocp' -and $script:Stream) {
             Invoke-Udp $udpPort $udpBody
         }
 
@@ -364,8 +459,10 @@ $streamConfig
 
     $logText = if (Test-Path $stderr) { Get-Content -Raw -LiteralPath $stderr } else { '' }
     Assert-True ($logText -notmatch '\[(?:emerg|alert|crit)\]|could not start|router failed|shutdown left pending') "$Backend emitted a fatal lifecycle error"
-    $network = if ($Backend -eq 'iocp') {
+    $network = if ($Backend -eq 'iocp' -and $script:Stream) {
         'HTTP/UDP, file AIO/sendfile'
+    } elseif ($Backend -eq 'iocp') {
+        'HTTP, file AIO/sendfile'
     } else {
         'HTTP, static file'
     }
@@ -378,6 +475,7 @@ $script:Binary = [IO.Path]::GetFullPath($Binary)
 $script:Root = [IO.Path]::GetFullPath($Root)
 $script:OpenSSL = ''
 $script:Tls = $null
+$script:Stream = -not $SkipStream
 $base = Join-Path ([IO.Path]::GetTempPath()) ('nginx-win32-rc-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $base | Out-Null
 
@@ -411,6 +509,9 @@ distinguished_name = dn
     $emptyConfig = Join-Path $emptyDir $emptyConfigName
     $emptyPidName = "$emptyName.pid"
     $emptyPort = Get-FreeTcpPort
+    $emptyTemp = Join-Path $base 'empty-temp'
+    New-Item -ItemType Directory -Force -Path $emptyTemp | Out-Null
+    $emptyTempPath = $emptyTemp.Replace('\','/')
     Set-Content -LiteralPath $emptyConfig -Value @"
 worker_processes 1;
 error_log stderr notice;
@@ -418,6 +519,11 @@ pid $emptyPidName;
 events { use select; worker_connections 64; }
 http {
     access_log stderr;
+    client_body_temp_path "$emptyTempPath/client_body_temp";
+    proxy_temp_path "$emptyTempPath/proxy_temp";
+    fastcgi_temp_path "$emptyTempPath/fastcgi_temp";
+    uwsgi_temp_path "$emptyTempPath/uwsgi_temp";
+    scgi_temp_path "$emptyTempPath/scgi_temp";
     server { listen 127.0.0.1:$emptyPort; return 200 "empty-prefix"; }
 }
 "@ -Encoding ASCII

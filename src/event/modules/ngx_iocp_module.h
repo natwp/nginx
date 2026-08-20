@@ -22,7 +22,8 @@ typedef enum {
     NGX_IOCP_OP_UDP_SEND,
     NGX_IOCP_OP_FILE_READ,
     NGX_IOCP_OP_FILE_WRITE,
-    NGX_IOCP_OP_TRANSMIT
+    NGX_IOCP_OP_TRANSMIT,
+    NGX_IOCP_OP_MAX
 } ngx_iocp_op_type_e;
 
 
@@ -44,11 +45,13 @@ struct ngx_iocp_owner_s {
     ngx_log_t               safe_log;
     ngx_uint_t              generation;
     ngx_uint_t              pending;
+    ngx_uint_t              arming;
     ngx_uint_t              children;
     unsigned                socket:1;
     unsigned                associated:1;
     unsigned                closing:1;
     unsigned                shared:1;
+    unsigned                skip_completion:1;
     unsigned                udp_pktinfo:1;
     unsigned                udp_connreset:1;
     LPFN_ACCEPTEX           acceptex;
@@ -75,11 +78,16 @@ struct ngx_iocp_op_s {
     DWORD                   expected;
     DWORD                   flags;
     ngx_err_t               error;
+    size_t                  allocation_size;
     ngx_uint_t              generation;
     ngx_uint_t              type;
     unsigned                linked:1;
     unsigned                completing:1;
     unsigned                cancel_requested:1;
+    unsigned                prepared:1;
+    unsigned                owner_held:1;
+    unsigned                data_held:1;
+    volatile LONG           state;
 };
 
 
@@ -99,14 +107,20 @@ ngx_iocp_owner_t *ngx_iocp_create_shared_owner(ngx_connection_t *c,
 ngx_int_t ngx_iocp_associate(ngx_iocp_owner_t *owner);
 void ngx_iocp_load_extensions(ngx_iocp_owner_t *owner);
 ngx_int_t ngx_iocp_add_connection(ngx_connection_t *c);
+ngx_int_t ngx_iocp_enable_skip_completion(ngx_connection_t *c);
 ngx_int_t ngx_iocp_post_read(ngx_event_t *rev);
 ngx_int_t ngx_iocp_post_write(ngx_event_t *wev);
 void ngx_iocp_close_connection(ngx_connection_t *c);
 void ngx_iocp_close_owner(ngx_iocp_owner_t *owner);
+void ngx_iocp_free_event_buffer(ngx_event_t *ev);
 
 ngx_iocp_op_t *ngx_iocp_op_create(size_t size, ngx_iocp_owner_t *owner,
     ngx_event_t *event, ngx_pool_t *data_pool, ngx_uint_t type,
     ngx_iocp_completion_pt handler, ngx_iocp_cleanup_pt cleanup);
+ngx_iocp_op_t *ngx_iocp_op_prepare(size_t size, ngx_iocp_owner_t *owner,
+    ngx_event_t *event, ngx_pool_t *data_pool, ngx_uint_t type,
+    ngx_iocp_completion_pt handler, ngx_iocp_cleanup_pt cleanup);
+ngx_int_t ngx_iocp_op_arm(ngx_iocp_op_t *op, ngx_uint_t pending);
 void ngx_iocp_op_abort(ngx_iocp_op_t *op);
 void ngx_iocp_event_complete(ngx_iocp_op_t *op);
 

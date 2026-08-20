@@ -3601,6 +3601,7 @@ ngx_http_keepalive_handler(ngx_event_t *rev)
     ngx_set_socket_errno(0);
 
     n = c->recv(c, b->last, size);
+
     c->log_error = NGX_ERROR_INFO;
 
     if (n == NGX_AGAIN) {
