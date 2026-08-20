@@ -16,18 +16,6 @@
 #define NGX_IOCP_SHUTDOWN_WAIT  5000
 #define NGX_IOCP_MAX_ACCEPTS    1024
 #define NGX_IOCP_MAX_UDP_RECV   256
-#define NGX_IOCP_OP_CACHE_MAX   128
-
-#define NGX_IOCP_OP_ARMING      0
-#define NGX_IOCP_OP_ARMED       1
-#define NGX_IOCP_OP_COMPLETED   2
-#define NGX_IOCP_OP_PROCESSING  3
-
-typedef struct {
-    ngx_queue_t  queue;
-    size_t       size;
-    ngx_uint_t   count;
-} ngx_iocp_op_cache_t;
 
 
 typedef struct {
@@ -74,19 +62,6 @@ static void ngx_iocp_cancel(ngx_iocp_owner_t *owner);
 static void ngx_iocp_close_children(ngx_iocp_owner_t *owner);
 static void ngx_iocp_finalize_owner(ngx_iocp_owner_t *owner);
 static void ngx_iocp_finish_op(ngx_iocp_op_t *op, ngx_uint_t cleanup);
-static ngx_iocp_op_t *ngx_iocp_op_init(size_t size,
-    ngx_iocp_owner_t *owner, ngx_event_t *event, ngx_pool_t *data_pool,
-    ngx_uint_t type, ngx_iocp_completion_pt handler,
-    ngx_iocp_cleanup_pt cleanup, ngx_uint_t arming);
-static ngx_int_t ngx_iocp_op_link(ngx_iocp_op_t *op);
-static void ngx_iocp_process_op(ngx_iocp_op_t *op);
-static ngx_uint_t ngx_iocp_op_cacheable(ngx_uint_t type);
-static ngx_iocp_op_t *ngx_iocp_op_alloc(size_t size, ngx_uint_t type,
-    ngx_log_t *log);
-static void ngx_iocp_op_free(ngx_iocp_op_t *op);
-static void ngx_iocp_free_op_caches(void);
-static ngx_err_t ngx_iocp_completion_error(ngx_iocp_owner_t *owner,
-    ngx_iocp_op_t *op, OVERLAPPED_ENTRY *entry);
 static void ngx_iocp_set_log(ngx_iocp_owner_t *owner, ngx_log_t *log);
 static void ngx_iocp_query_extension(ngx_iocp_owner_t *owner, GUID *guid,
     void *target, DWORD size);
@@ -186,15 +161,6 @@ static ngx_atomic_t ngx_iocp_notifications;
 static ngx_msec_t   ngx_iocp_timer_resolution;
 static ngx_event_t  ngx_iocp_notify_event;
 static u_char        ngx_iocp_zero_byte;
-static ngx_iocp_op_cache_t  ngx_iocp_op_caches[NGX_IOCP_OP_MAX];
-#if (NGX_DEBUG)
-static ngx_uint_t   ngx_iocp_op_cache_hits;
-static ngx_uint_t   ngx_iocp_op_cache_misses;
-static ngx_atomic_t ngx_iocp_fast_prepared;
-static ngx_atomic_t ngx_iocp_fast_sync;
-static ngx_atomic_t ngx_iocp_fast_pending;
-static ngx_atomic_t ngx_iocp_fast_races;
-#endif
 
 static GUID  iocp_acceptex_guid = WSAID_ACCEPTEX;
 static GUID  iocp_getacceptexsockaddrs_guid = WSAID_GETACCEPTEXSOCKADDRS;
@@ -208,8 +174,6 @@ static GUID  iocp_wsasendmsg_guid = WSAID_WSASENDMSG;
 static ngx_int_t
 ngx_iocp_init(ngx_cycle_t *cycle, ngx_msec_t timer)
 {
-    ngx_uint_t  i;
-
     if (iocp == NULL) {
         iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
         if (iocp == NULL) {
@@ -222,22 +186,6 @@ ngx_iocp_init(ngx_cycle_t *cycle, ngx_msec_t timer)
         ngx_iocp_generation = 0;
         ngx_iocp_pending = 0;
         ngx_iocp_notifications = 0;
-
-        for (i = 0; i < NGX_IOCP_OP_MAX; i++) {
-            ngx_queue_init(&ngx_iocp_op_caches[i].queue);
-            ngx_iocp_op_caches[i].size = 0;
-            ngx_iocp_op_caches[i].count = 0;
-        }
-
-#if (NGX_DEBUG)
-        ngx_iocp_op_cache_hits = 0;
-        ngx_iocp_op_cache_misses = 0;
-        ngx_iocp_fast_prepared = 0;
-        ngx_iocp_fast_sync = 0;
-        ngx_iocp_fast_pending = 0;
-        ngx_iocp_fast_races = 0;
-#endif
-
     }
 
     ngx_memzero(&ngx_iocp_notify_event, sizeof(ngx_event_t));
@@ -245,15 +193,6 @@ ngx_iocp_init(ngx_cycle_t *cycle, ngx_msec_t timer)
     ngx_iocp_notify_event.active = 1;
 
     ngx_io = ngx_iocp_io;
-
-    if (ngx_win32_workstation) {
-        ngx_io.flags &= ~NGX_IO_SENDFILE;
-
-        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                      "IOCP native file transmit disabled on "
-                      "Windows workstation");
-    }
-
     ngx_event_actions = ngx_iocp_module_ctx.actions;
     ngx_event_flags = NGX_USE_IOCP_EVENT;
 
@@ -347,19 +286,6 @@ ngx_iocp_done(ngx_cycle_t *cycle)
                       "%uA IOCP notifications did not drain during shutdown",
                       ngx_iocp_notifications);
     }
-
-#if (NGX_DEBUG)
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                  "IOCP operation cache: %ui hits, %ui misses",
-                  ngx_iocp_op_cache_hits, ngx_iocp_op_cache_misses);
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                  "IOCP fast operations: %uA prepared, %uA synchronous, "
-                  "%uA pending, %uA completion races",
-                  ngx_iocp_fast_prepared, ngx_iocp_fast_sync,
-                  ngx_iocp_fast_pending, ngx_iocp_fast_races);
-#endif
-
-    ngx_iocp_free_op_caches();
 
     if (iocp && CloseHandle(iocp) == 0) {
         ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
@@ -541,9 +467,7 @@ ngx_iocp_add_connection(ngx_connection_t *c)
     }
 
     if (c->type == SOCK_STREAM && c->sendfile
-        && (ngx_win32_workstation
-            || (owner->transmitfile == NULL
-                && owner->transmitpackets == NULL)))
+        && owner->transmitfile == NULL && owner->transmitpackets == NULL)
     {
         c->sendfile = 0;
     }
@@ -553,66 +477,6 @@ ngx_iocp_add_connection(ngx_connection_t *c)
 
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "iocp add connection: fd:%d owner:%p", c->fd, owner);
-
-    return NGX_OK;
-}
-
-
-ngx_int_t
-ngx_iocp_enable_skip_completion(ngx_connection_t *c)
-{
-    int                 len;
-    WSAPROTOCOL_INFO    protocol;
-    ngx_iocp_owner_t   *owner;
-
-    owner = c->iocp;
-
-    if (owner == NULL || !owner->associated || !owner->socket
-        || owner->shared || owner->closing
-        || owner->handle == INVALID_HANDLE_VALUE)
-    {
-        return NGX_DECLINED;
-    }
-
-    if (owner->skip_completion) {
-        return NGX_OK;
-    }
-
-    len = sizeof(WSAPROTOCOL_INFO);
-
-    if (getsockopt(c->fd, SOL_SOCKET, SO_PROTOCOL_INFO,
-                   (char *) &protocol, &len)
-        == SOCKET_ERROR)
-    {
-        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, ngx_socket_errno,
-                       "getsockopt(SO_PROTOCOL_INFO) failed for fd:%d",
-                       c->fd);
-        return NGX_DECLINED;
-    }
-
-    if (!(protocol.dwServiceFlags1 & XP1_IFS_HANDLES)) {
-        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
-                       "IOCP synchronous completion fast path unavailable "
-                       "for non-IFS socket fd:%d", c->fd);
-        return NGX_DECLINED;
-    }
-
-    if (SetFileCompletionNotificationModes(owner->handle,
-          FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
-          | FILE_SKIP_SET_EVENT_ON_HANDLE)
-        == 0)
-    {
-        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, ngx_errno,
-                       "SetFileCompletionNotificationModes() failed "
-                       "for fd:%d", c->fd);
-        return NGX_DECLINED;
-    }
-
-    owner->skip_completion = 1;
-
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
-                   "IOCP synchronous completion fast path enabled for fd:%d",
-                   c->fd);
 
     return NGX_OK;
 }
@@ -665,15 +529,9 @@ ngx_iocp_post_read(ngx_event_t *rev)
     pool = rev->iocp_pool ? rev->iocp_pool : c->pool;
 
     op = (ngx_iocp_read_notify_op_t *)
-         ngx_iocp_op_prepare(sizeof(ngx_iocp_read_notify_op_t), c->iocp, rev,
-                             pool, NGX_IOCP_OP_READ_NOTIFY,
-                             ngx_iocp_read_notify_complete, NULL);
-    if (op == NULL) {
-        op = (ngx_iocp_read_notify_op_t *)
-             ngx_iocp_op_create(sizeof(ngx_iocp_read_notify_op_t), c->iocp,
-                                rev, pool, NGX_IOCP_OP_READ_NOTIFY,
-                                ngx_iocp_read_notify_complete, NULL);
-    }
+         ngx_iocp_op_create(sizeof(ngx_iocp_read_notify_op_t), c->iocp, rev,
+                            pool, NGX_IOCP_OP_READ_NOTIFY,
+                            ngx_iocp_read_notify_complete, NULL);
     if (op == NULL) {
         rev->error = 1;
         return NGX_ERROR;
@@ -692,36 +550,18 @@ ngx_iocp_post_read(ngx_event_t *rev)
     rev->ready = 0;
     rev->complete = 0;
 
-    if (rc == 0 && c->iocp->skip_completion) {
-        rev->active = 0;
-        rev->ready = 1;
-        if (op->op.prepared) {
-            (void) ngx_iocp_op_arm(&op->op, 0);
-        }
-        ngx_iocp_op_abort(&op->op);
-        ngx_post_event(rev, &ngx_posted_events);
-
-        return NGX_OK;
-    }
-
     if (rc == 0) {
         return NGX_OK;
     }
 
     err = ngx_socket_errno;
     if (err == WSA_IO_PENDING) {
-        if (op->op.prepared) {
-            (void) ngx_iocp_op_arm(&op->op, 1);
-        }
         return NGX_OK;
     }
 
     rev->active = 0;
     rev->ready = 1;
     rev->error = 1;
-    if (op->op.prepared) {
-        (void) ngx_iocp_op_arm(&op->op, 0);
-    }
     ngx_iocp_op_abort(&op->op);
     (void) ngx_connection_error(c, err, "zero-byte WSARecv() failed");
 
@@ -1031,42 +871,6 @@ ngx_iocp_op_create(size_t size, ngx_iocp_owner_t *owner, ngx_event_t *event,
 {
     ngx_iocp_op_t  *op;
 
-    op = ngx_iocp_op_init(size, owner, event, data_pool, type, handler,
-                          cleanup, 0);
-    if (op == NULL) {
-        return NULL;
-    }
-
-    if (ngx_iocp_op_link(op) != NGX_OK) {
-        ngx_iocp_op_abort(op);
-        return NULL;
-    }
-
-    return op;
-}
-
-
-ngx_iocp_op_t *
-ngx_iocp_op_prepare(size_t size, ngx_iocp_owner_t *owner,
-    ngx_event_t *event, ngx_pool_t *data_pool, ngx_uint_t type,
-    ngx_iocp_completion_pt handler, ngx_iocp_cleanup_pt cleanup)
-{
-    if (owner == NULL || owner->shared || !owner->skip_completion) {
-        return NULL;
-    }
-
-    return ngx_iocp_op_init(size, owner, event, data_pool, type, handler,
-                            cleanup, 1);
-}
-
-
-static ngx_iocp_op_t *
-ngx_iocp_op_init(size_t size, ngx_iocp_owner_t *owner, ngx_event_t *event,
-    ngx_pool_t *data_pool, ngx_uint_t type, ngx_iocp_completion_pt handler,
-    ngx_iocp_cleanup_pt cleanup, ngx_uint_t arming)
-{
-    ngx_iocp_op_t  *op;
-
     if (owner == NULL || owner->closing || !owner->associated
         || size < sizeof(ngx_iocp_op_t))
     {
@@ -1078,7 +882,7 @@ ngx_iocp_op_init(size_t size, ngx_iocp_owner_t *owner, ngx_event_t *event,
         ngx_iocp_set_log(owner, owner->connection->log);
     }
 
-    op = ngx_iocp_op_alloc(size, type, owner->log);
+    op = ngx_calloc(size, owner->log);
     if (op == NULL) {
         return NULL;
     }
@@ -1090,54 +894,22 @@ ngx_iocp_op_init(size_t size, ngx_iocp_owner_t *owner, ngx_event_t *event,
     op->cleanup = cleanup;
     op->generation = owner->generation;
     op->type = type;
-    op->allocation_size = size;
 
     op->owner_pool = owner->pool;
-    op->data_pool = data_pool != op->owner_pool ? data_pool : NULL;
-    op->prepared = arming;
-    op->state = arming ? NGX_IOCP_OP_ARMING : NGX_IOCP_OP_ARMED;
-
-    if (event) {
-        event->iocp_op = op;
-    }
-
-    if (arming) {
-        owner->arming++;
-#if (NGX_DEBUG)
-        (void) ngx_atomic_fetch_add(&ngx_iocp_fast_prepared, 1);
-#endif
-    }
-
-    return op;
-}
-
-
-static ngx_int_t
-ngx_iocp_op_link(ngx_iocp_op_t *op)
-{
-    ngx_iocp_owner_t  *owner;
-
-    owner = op->owner;
 
     if (op->owner_pool && ngx_pool_hold(op->owner_pool) != NGX_OK) {
-        return NGX_ERROR;
+        ngx_free(op);
+        return NULL;
     }
 
-    if (op->owner_pool) {
-        op->owner_held = 1;
-    }
-
-    if (op->data_pool && ngx_pool_hold(op->data_pool) != NGX_OK) {
-        if (op->owner_held) {
+    if (data_pool && data_pool != op->owner_pool) {
+        if (ngx_pool_hold(data_pool) != NGX_OK) {
             ngx_pool_release(op->owner_pool);
-            op->owner_held = 0;
+            ngx_free(op);
+            return NULL;
         }
 
-        return NGX_ERROR;
-    }
-
-    if (op->data_pool) {
-        op->data_held = 1;
+        op->data_pool = data_pool;
     }
 
     ngx_queue_insert_tail(&owner->operations, &op->queue);
@@ -1145,79 +917,11 @@ ngx_iocp_op_link(ngx_iocp_op_t *op)
     owner->pending++;
     ngx_iocp_pending++;
 
-    return NGX_OK;
-}
-
-
-ngx_int_t
-ngx_iocp_op_arm(ngx_iocp_op_t *op, ngx_uint_t pending)
-{
-    ngx_iocp_owner_t  *owner;
-    LONG               state;
-
-    if (op == NULL || !op->prepared) {
-        return NGX_ERROR;
+    if (event) {
+        event->iocp_op = op;
     }
 
-    owner = op->owner;
-
-    if (!pending) {
-        state = InterlockedCompareExchange(&op->state,
-                                           NGX_IOCP_OP_ARMED,
-                                           NGX_IOCP_OP_ARMING);
-        if (state != NGX_IOCP_OP_ARMING
-            && state != NGX_IOCP_OP_COMPLETED)
-        {
-            return NGX_ERROR;
-        }
-
-        if (owner->arming) {
-            owner->arming--;
-        }
-
-#if (NGX_DEBUG)
-        (void) ngx_atomic_fetch_add(&ngx_iocp_fast_sync, 1);
-#endif
-
-        return NGX_OK;
-    }
-
-    if (ngx_iocp_op_link(op) != NGX_OK) {
-        /*
-         * The pool can only enter destroy-pending state while another
-         * worker is closing the connection.  Keep the operation linked so
-         * the owner cannot be finalized before the cancellation completion;
-         * the normal path always takes the held-pool branch above.
-         */
-        ngx_log_error(NGX_LOG_ALERT, owner->log, 0,
-                      "IOCP operation pool hold failed");
-        ngx_queue_insert_tail(&owner->operations, &op->queue);
-        op->linked = 1;
-        owner->pending++;
-        ngx_iocp_pending++;
-    }
-
-    state = InterlockedCompareExchange(&op->state, NGX_IOCP_OP_ARMED,
-                                       NGX_IOCP_OP_ARMING);
-
-    if (owner->arming) {
-        owner->arming--;
-    }
-
-#if (NGX_DEBUG)
-    (void) ngx_atomic_fetch_add(&ngx_iocp_fast_pending, 1);
-#endif
-
-    if (state == NGX_IOCP_OP_COMPLETED) {
-        if (InterlockedCompareExchange(&op->state, NGX_IOCP_OP_PROCESSING,
-                                       NGX_IOCP_OP_COMPLETED)
-            == NGX_IOCP_OP_COMPLETED)
-        {
-            ngx_iocp_process_op(op);
-        }
-    }
-
-    return NGX_OK;
+    return op;
 }
 
 
@@ -1239,14 +943,6 @@ ngx_iocp_finish_op(ngx_iocp_op_t *op, ngx_uint_t cleanup)
     owner_pool = op->owner_pool;
     data_pool = op->data_pool;
 
-    if (op->state == NGX_IOCP_OP_ARMING) {
-        op->state = NGX_IOCP_OP_ARMED;
-
-        if (owner->arming) {
-            owner->arming--;
-        }
-    }
-
     if (op->event && op->event->iocp_op == op) {
         op->event->iocp_op = NULL;
     }
@@ -1262,140 +958,21 @@ ngx_iocp_finish_op(ngx_iocp_op_t *op, ngx_uint_t cleanup)
         ngx_iocp_pending--;
     }
 
-    finalize = owner->closing && owner->pending == 0
-               && owner->arming == 0 && owner->children == 0;
+    finalize = owner->closing && owner->pending == 0 && owner->children == 0;
 
     if (finalize) {
         ngx_iocp_finalize_owner(owner);
     }
 
-    if (data_pool && op->data_held) {
+    if (data_pool) {
         ngx_pool_release(data_pool);
     }
 
-    if (owner_pool && op->owner_held) {
+    if (owner_pool) {
         ngx_pool_release(owner_pool);
     }
 
-    ngx_iocp_op_free(op);
-}
-
-
-static void
-ngx_iocp_process_op(ngx_iocp_op_t *op)
-{
-    ngx_iocp_owner_t  *owner;
-
-    owner = op->owner;
-
-    if (!owner->closing && op->handler) {
-        op->handler(op);
-    }
-
-    ngx_iocp_finish_op(op, 1);
-}
-
-
-static ngx_uint_t
-ngx_iocp_op_cacheable(ngx_uint_t type)
-{
-    switch (type) {
-    case NGX_IOCP_OP_READ_NOTIFY:
-    case NGX_IOCP_OP_RECV:
-    case NGX_IOCP_OP_RECV_CHAIN:
-    case NGX_IOCP_OP_SEND:
-    case NGX_IOCP_OP_SEND_CHAIN:
-    case NGX_IOCP_OP_TRANSMIT:
-        return 1;
-
-    default:
-        return 0;
-    }
-}
-
-
-static ngx_iocp_op_t *
-ngx_iocp_op_alloc(size_t size, ngx_uint_t type, ngx_log_t *log)
-{
-    ngx_queue_t          *q;
-    ngx_iocp_op_t        *op;
-    ngx_iocp_op_cache_t  *cache;
-
-    if (type < NGX_IOCP_OP_MAX && ngx_iocp_op_cacheable(type)) {
-        cache = &ngx_iocp_op_caches[type];
-
-        if (cache->size == 0) {
-            cache->size = size;
-        }
-
-        if (cache->size == size && cache->count) {
-            q = ngx_queue_head(&cache->queue);
-            ngx_queue_remove(q);
-            cache->count--;
-
-            op = ngx_queue_data(q, ngx_iocp_op_t, queue);
-            ngx_memzero(op, size);
-
-#if (NGX_DEBUG)
-            ngx_iocp_op_cache_hits++;
-#endif
-
-            return op;
-        }
-    }
-
-#if (NGX_DEBUG)
-    if (type < NGX_IOCP_OP_MAX && ngx_iocp_op_cacheable(type)) {
-        ngx_iocp_op_cache_misses++;
-    }
-#endif
-
-    return ngx_calloc(size, log);
-}
-
-
-static void
-ngx_iocp_op_free(ngx_iocp_op_t *op)
-{
-    ngx_iocp_op_cache_t  *cache;
-
-    if (op->type < NGX_IOCP_OP_MAX && ngx_iocp_op_cacheable(op->type)) {
-        cache = &ngx_iocp_op_caches[op->type];
-
-        if (cache->size == op->allocation_size
-            && cache->count < NGX_IOCP_OP_CACHE_MAX)
-        {
-            ngx_queue_insert_head(&cache->queue, &op->queue);
-            cache->count++;
-            return;
-        }
-    }
-
     ngx_free(op);
-}
-
-
-static void
-ngx_iocp_free_op_caches(void)
-{
-    ngx_queue_t          *q;
-    ngx_iocp_op_t        *op;
-    ngx_uint_t            i;
-    ngx_iocp_op_cache_t  *cache;
-
-    for (i = 0; i < NGX_IOCP_OP_MAX; i++) {
-        cache = &ngx_iocp_op_caches[i];
-
-        while (!ngx_queue_empty(&cache->queue)) {
-            q = ngx_queue_head(&cache->queue);
-            ngx_queue_remove(q);
-            op = ngx_queue_data(q, ngx_iocp_op_t, queue);
-            ngx_free(op);
-        }
-
-        cache->size = 0;
-        cache->count = 0;
-    }
 }
 
 
@@ -1514,8 +1091,19 @@ ngx_iocp_close_connection(ngx_connection_t *c)
         ngx_delete_udp_connection(c);
     }
 
-    ngx_iocp_free_event_buffer(c->read);
-    ngx_iocp_free_event_buffer(c->write);
+    if (c->read->iocp_buffer) {
+        ngx_free(c->read->iocp_buffer);
+        c->read->iocp_buffer = NULL;
+        c->read->iocp_buffer_size = 0;
+        c->read->iocp_buffer_pos = 0;
+    }
+
+    if (c->write->iocp_buffer) {
+        ngx_free(c->write->iocp_buffer);
+        c->write->iocp_buffer = NULL;
+        c->write->iocp_buffer_size = 0;
+        c->write->iocp_buffer_pos = 0;
+    }
 
     ngx_iocp_cancel(owner);
 
@@ -1539,23 +1127,9 @@ ngx_iocp_close_connection(ngx_connection_t *c)
 
     owner->handle = INVALID_HANDLE_VALUE;
 
-    if (owner->pending == 0 && owner->arming == 0 && owner->children == 0) {
+    if (owner->pending == 0 && owner->children == 0) {
         ngx_iocp_finalize_owner(owner);
     }
-}
-
-
-void
-ngx_iocp_free_event_buffer(ngx_event_t *ev)
-{
-    if (ev->iocp_buffer && ev->iocp_buffer_owned) {
-        ngx_free(ev->iocp_buffer);
-    }
-
-    ev->iocp_buffer = NULL;
-    ev->iocp_buffer_size = 0;
-    ev->iocp_buffer_pos = 0;
-    ev->iocp_buffer_owned = 0;
 }
 
 
@@ -1578,7 +1152,7 @@ ngx_iocp_close_owner(ngx_iocp_owner_t *owner)
 
     owner->handle = INVALID_HANDLE_VALUE;
 
-    if (owner->pending == 0 && owner->arming == 0 && owner->children == 0) {
+    if (owner->pending == 0 && owner->children == 0) {
         ngx_iocp_finalize_owner(owner);
     }
 }
@@ -1610,7 +1184,6 @@ ngx_iocp_finalize_owner(ngx_iocp_owner_t *owner)
         port_owner->children--;
 
         if (port_owner->closing && port_owner->pending == 0
-            && port_owner->arming == 0
             && port_owner->children == 0)
         {
             ngx_iocp_finalize_owner(port_owner);
@@ -1730,7 +1303,6 @@ ngx_iocp_process_entry(ngx_cycle_t *cycle, OVERLAPPED_ENTRY *entry,
 {
     BOOL                rc;
     DWORD               bytes, op_flags;
-    const char         *reason;
     ngx_iocp_op_t      *op;
     ngx_iocp_owner_t   *owner;
     ngx_iocp_owner_t   *port_owner;
@@ -1759,31 +1331,10 @@ ngx_iocp_process_entry(ngx_cycle_t *cycle, OVERLAPPED_ENTRY *entry,
 
     if (port_owner == NULL || op == NULL
         || op->completion_owner != port_owner || op->owner == NULL
-        || op->generation != op->owner->generation
-        || (!op->linked && op->state != NGX_IOCP_OP_ARMING))
+        || op->generation != op->owner->generation || !op->linked)
     {
-        if (port_owner == NULL) {
-            reason = "missing completion owner";
-
-        } else if (op == NULL) {
-            reason = "missing operation";
-
-        } else if (op->completion_owner != port_owner) {
-            reason = "completion owner mismatch";
-
-        } else if (op->owner == NULL) {
-            reason = "missing operation owner";
-
-        } else if (op->generation != op->owner->generation) {
-            reason = "owner generation mismatch";
-
-        } else {
-            reason = "operation is not linked";
-        }
-
         ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
-                      "IOCP returned a stale operation (%s): key:%p op:%p",
-                      reason, port_owner, op);
+                      "IOCP returned a stale operation");
         return NGX_ERROR;
     }
 
@@ -1798,7 +1349,7 @@ ngx_iocp_process_entry(ngx_cycle_t *cycle, OVERLAPPED_ENTRY *entry,
     } else if (op->type == NGX_IOCP_OP_WRITE_NOTIFY) {
         /* posted by the thread-pool wait callback */
 
-    } else if (owner->socket && op->type == NGX_IOCP_OP_UDP_RECV) {
+    } else if (owner->socket) {
         bytes = op->bytes;
         op_flags = op->flags;
 
@@ -1812,72 +1363,28 @@ ngx_iocp_process_entry(ngx_cycle_t *cycle, OVERLAPPED_ENTRY *entry,
         }
 
     } else {
-        op->error = ngx_iocp_completion_error(owner, op, entry);
+        bytes = op->bytes;
+
+        rc = GetOverlappedResult(owner->handle, &op->overlapped, &bytes,
+                                 FALSE);
+        if (rc == 0) {
+            op->error = ngx_errno;
+        } else {
+            op->bytes = bytes;
+        }
     }
 
     ngx_log_debug5(NGX_LOG_DEBUG_EVENT, owner->log, op->error,
                    "iocp complete: owner:%p op:%p type:%ui bytes:%ul flags:%ul",
                    owner, op, op->type, op->bytes, op->flags);
 
-    if (op->state == NGX_IOCP_OP_ARMING) {
-#if (NGX_DEBUG)
-        (void) ngx_atomic_fetch_add(&ngx_iocp_fast_races, 1);
-#endif
-        InterlockedExchange(&op->state, NGX_IOCP_OP_COMPLETED);
-        return NGX_OK;
+    if (!owner->closing && op->handler) {
+        op->handler(op);
     }
 
-    if (InterlockedCompareExchange(&op->state, NGX_IOCP_OP_PROCESSING,
-                                   NGX_IOCP_OP_ARMED)
-        != NGX_IOCP_OP_ARMED)
-    {
-        return NGX_OK;
-    }
-
-    ngx_iocp_process_op(op);
+    ngx_iocp_finish_op(op, 1);
 
     return NGX_OK;
-}
-
-
-static ngx_err_t
-ngx_iocp_completion_error(ngx_iocp_owner_t *owner, ngx_iocp_op_t *op,
-    OVERLAPPED_ENTRY *entry)
-{
-    BOOL   rc;
-    DWORD  bytes, flags;
-    LONG   status;
-
-    status = (LONG) entry->Internal;
-
-    if (status >= 0) {
-        return 0;
-    }
-
-    bytes = op->bytes;
-
-    if (owner->socket) {
-        flags = op->flags;
-
-        rc = WSAGetOverlappedResult((SOCKET) owner->handle,
-                                    &op->overlapped, &bytes, FALSE, &flags);
-        if (rc == 0) {
-            return ngx_socket_errno;
-        }
-
-        op->flags = flags;
-
-    } else {
-        rc = GetOverlappedResult(owner->handle, &op->overlapped, &bytes,
-                                 FALSE);
-        if (rc == 0) {
-            return ngx_errno;
-        }
-    }
-
-    op->bytes = bytes;
-
-    return 0;
 }
 
 

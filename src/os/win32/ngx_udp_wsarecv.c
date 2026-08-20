@@ -236,7 +236,6 @@ ngx_iocp_udp_wsarecv_complete(ngx_iocp_op_t *base)
             rev->iocp_buffer = op->buffer;
             rev->iocp_buffer_size = base->bytes;
             rev->iocp_buffer_pos = 0;
-            rev->iocp_buffer_owned = 1;
             op->buffer = NULL;
         }
     }
@@ -278,7 +277,10 @@ ngx_iocp_udp_wsarecv_copy(ngx_event_t *rev, u_char *buf, size_t size)
         ngx_memcpy(buf, rev->iocp_buffer, n);
     }
 
-    ngx_iocp_free_event_buffer(rev);
+    ngx_free(rev->iocp_buffer);
+    rev->iocp_buffer = NULL;
+    rev->iocp_buffer_size = 0;
+    rev->iocp_buffer_pos = 0;
 
     return (ssize_t) n;
 }

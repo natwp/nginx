@@ -19,18 +19,6 @@
 #define NGX_IOCP_SEND_LIMIT  (2 * 1024 * 1024)
 #define NGX_IOCP_UDP_LIMIT   65535
 
-#ifndef NGX_IOCP_DIRECT_SEND
-#define NGX_IOCP_DIRECT_SEND  1
-#endif
-
-#ifndef NGX_IOCP_DIRECT_SEND_MIN_SIZE
-#define NGX_IOCP_DIRECT_SEND_MIN_SIZE  1024
-#endif
-
-#ifndef NGX_WIN32_GPROF
-#define NGX_WIN32_GPROF  0
-#endif
-
 
 typedef ssize_t (*ngx_recv_pt)(ngx_connection_t *c, u_char *buf, size_t size);
 typedef ssize_t (*ngx_recv_chain_pt)(ngx_connection_t *c, ngx_chain_t *in,
@@ -54,9 +42,6 @@ typedef struct {
 ngx_int_t ngx_os_init(ngx_log_t *log);
 void ngx_os_status(ngx_log_t *log);
 ngx_int_t ngx_os_signal_process(ngx_cycle_t *cycle, char *sig, ngx_pid_t pid);
-void ngx_win32_gprof_start(const char *role, ngx_uint_t slot, ngx_log_t *log);
-void ngx_win32_gprof_stop(void);
-void ngx_win32_gprof_finish(ngx_log_t *log);
 
 ssize_t ngx_wsarecv(ngx_connection_t *c, u_char *buf, size_t size);
 ssize_t ngx_overlapped_wsarecv(ngx_connection_t *c, u_char *buf, size_t size);
@@ -86,7 +71,6 @@ extern ngx_int_t    ngx_max_sockets;
 extern ngx_uint_t   ngx_inherited_nonblocking;
 extern ngx_uint_t   ngx_tcp_nodelay_and_tcp_nopush;
 extern ngx_uint_t   ngx_win32_version;
-extern ngx_uint_t   ngx_win32_workstation;
 extern char         ngx_unique[];
 
 

@@ -580,10 +580,6 @@ ngx_event_connect_iocp_complete(ngx_iocp_op_t *op)
         op->error = ngx_socket_errno;
     }
 
-    if (op->error == 0) {
-        (void) ngx_iocp_enable_skip_completion(c);
-    }
-
     wev->iocp_op = NULL;
     wev->iocp_error = op->error;
     wev->active = 0;

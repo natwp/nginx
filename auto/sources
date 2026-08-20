@@ -215,7 +215,6 @@ DARWIN_SENDFILE_SRCS=src/os/unix/ngx_darwin_sendfile_chain.c
 WIN32_INCS="$CORE_INCS $EVENT_INCS src/os/win32"
 
 WIN32_DEPS="$CORE_DEPS $EVENT_DEPS \
-            src/event/modules/ngx_iocp_module.h \
             src/os/win32/ngx_win32_config.h \
             src/os/win32/ngx_time.h \
             src/os/win32/ngx_errno.h \
@@ -243,7 +242,6 @@ WIN32_SRCS="$CORE_SRCS $EVENT_SRCS \
             src/os/win32/ngx_shmem.c \
             src/os/win32/ngx_time.c \
             src/os/win32/ngx_process.c \
-            src/os/win32/ngx_win32_gprof.c \
             src/os/win32/ngx_win32_worker.c \
             src/os/win32/ngx_win32_router.c \
             src/os/win32/ngx_thread.c \

@@ -31,10 +31,6 @@
 #define NGX_WIN32_ROUTER_UDP_SEND_LIMIT (8 * 1024 * 1024)
 #define NGX_WIN32_ROUTER_UDP_SENDS     4096
 
-#ifndef NGX_WIN32_ROUTER_ACCEPT_CACHE_MAX
-#define NGX_WIN32_ROUTER_ACCEPT_CACHE_MAX  128
-#endif
-
 #define NGX_WIN32_ROUTER_FLOW_TUPLE    1
 #define NGX_WIN32_ROUTER_FLOW_QUIC     2
 
@@ -307,10 +303,8 @@ static ngx_win32_router_worker_t *ngx_win32_router_select_worker(
     uint32_t hash, ngx_uint_t round_robin);
 static void ngx_win32_router_expire_accepts(void);
 static void ngx_win32_router_expire_flows(void);
-static ngx_win32_router_accept_t *ngx_win32_router_alloc_accept(void);
 static void ngx_win32_router_finish_accept(
     ngx_win32_router_accept_t *accept);
-static void ngx_win32_router_free_accept_cache(void);
 static void ngx_win32_router_free_listeners(void);
 static void ngx_win32_router_free_flows(void);
 
@@ -320,10 +314,8 @@ static HANDLE           ngx_win32_router_thread_handle;
 static ngx_log_t       *ngx_win32_router_log;
 static ngx_queue_t      ngx_win32_router_listeners;
 static ngx_queue_t      ngx_win32_router_handoffs;
-static ngx_queue_t      ngx_win32_router_accept_cache;
 static ngx_queue_t      ngx_win32_router_accept_buckets[
                                                NGX_WIN32_ROUTER_ACCEPT_BUCKETS];
-static ngx_uint_t       ngx_win32_router_accept_cache_n;
 static ngx_uint_t       ngx_win32_router_stream_accepting;
 static ngx_uint_t       ngx_win32_router_udp_accepting;
 static ngx_uint_t       ngx_win32_router_new_flows;
@@ -402,9 +394,7 @@ ngx_win32_router_start(ngx_cycle_t *cycle, ngx_uint_t generation)
     ngx_win32_router_log = cycle->log;
     ngx_queue_init(&ngx_win32_router_listeners);
     ngx_queue_init(&ngx_win32_router_handoffs);
-    ngx_queue_init(&ngx_win32_router_accept_cache);
     ngx_queue_init(&ngx_win32_router_flows);
-    ngx_win32_router_accept_cache_n = 0;
 
     for (i = 0; i < NGX_WIN32_ROUTER_ACCEPT_BUCKETS; i++) {
         ngx_queue_init(&ngx_win32_router_accept_buckets[i]);
@@ -631,7 +621,6 @@ ngx_win32_router_stop(ngx_cycle_t *cycle)
 
     ngx_win32_router_free_listeners();
     ngx_win32_router_free_flows();
-    ngx_win32_router_free_accept_cache();
 
     if (ngx_win32_router_port) {
         ngx_close_handle(ngx_win32_router_port);
@@ -662,8 +651,6 @@ ngx_win32_router_thread(void *data)
     ngx_win32_router_udp_send_t *send;
 
     (void) data;
-
-    ngx_win32_gprof_start("router", 0, ngx_win32_router_log);
 
     while (!ngx_win32_router_stopping) {
         events = 0;
@@ -755,8 +742,6 @@ ngx_win32_router_thread(void *data)
             ngx_win32_router_complete_control(control);
         }
     }
-
-    ngx_win32_gprof_stop();
 
     return 0;
 }
@@ -1460,7 +1445,8 @@ ngx_win32_router_post_accept(ngx_win32_router_listener_t *listener)
         return NGX_OK;
     }
 
-    accept = ngx_win32_router_alloc_accept();
+    accept = ngx_calloc(sizeof(ngx_win32_router_accept_t),
+                        ngx_win32_router_log);
     if (accept == NULL) {
         return NGX_ERROR;
     }
@@ -1475,7 +1461,7 @@ ngx_win32_router_post_accept(ngx_win32_router_listener_t *listener)
         ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, ngx_socket_errno,
                       "WSASocket() failed for routed listener %s",
                       listener->addr_text);
-        ngx_win32_router_finish_accept(accept);
+        ngx_free(accept);
         return NGX_ERROR;
     }
 
@@ -3166,64 +3152,12 @@ ngx_win32_router_expire_flows(void)
 
 
 static void
-ngx_win32_router_free_accept_cache(void)
-{
-    ngx_queue_t                *q;
-    ngx_win32_router_accept_t  *accept;
-
-    while (!ngx_queue_empty(&ngx_win32_router_accept_cache)) {
-        q = ngx_queue_head(&ngx_win32_router_accept_cache);
-        ngx_queue_remove(q);
-        accept = ngx_queue_data(q, ngx_win32_router_accept_t, queue);
-        ngx_free(accept);
-    }
-
-    ngx_win32_router_accept_cache_n = 0;
-}
-
-
-static ngx_win32_router_accept_t *
-ngx_win32_router_alloc_accept(void)
-{
-    ngx_queue_t                *q;
-    ngx_win32_router_accept_t  *accept;
-
-    if (NGX_WIN32_ROUTER_ACCEPT_CACHE_MAX
-        && ngx_win32_router_accept_cache_n)
-    {
-        q = ngx_queue_head(&ngx_win32_router_accept_cache);
-        ngx_queue_remove(q);
-        ngx_win32_router_accept_cache_n--;
-
-        accept = ngx_queue_data(q, ngx_win32_router_accept_t, queue);
-        ngx_memzero(accept, sizeof(ngx_win32_router_accept_t));
-
-        return accept;
-    }
-
-    return ngx_calloc(sizeof(ngx_win32_router_accept_t),
-                      ngx_win32_router_log);
-}
-
-
-static void
 ngx_win32_router_finish_accept(ngx_win32_router_accept_t *accept)
 {
     if (accept->socket != (ngx_socket_t) -1) {
         (void) ngx_close_socket(accept->socket);
         accept->socket = (ngx_socket_t) -1;
     }
-
-#if (NGX_WIN32_ROUTER_ACCEPT_CACHE_MAX > 0)
-    if (ngx_win32_router_accept_cache_n
-        < NGX_WIN32_ROUTER_ACCEPT_CACHE_MAX)
-    {
-        ngx_queue_insert_head(&ngx_win32_router_accept_cache,
-                              &accept->queue);
-        ngx_win32_router_accept_cache_n++;
-        return;
-    }
-#endif
 
     ngx_free(accept);
 }

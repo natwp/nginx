@@ -358,8 +358,6 @@ ngx_event_acceptex_complete(ngx_iocp_op_t *base)
         return;
     }
 
-    (void) ngx_iocp_enable_skip_completion(c);
-
     c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
     c->start_time = ngx_current_msec;
 
@@ -535,14 +533,6 @@ ngx_event_acceptex_import(ngx_listening_t *ls, ngx_socket_t s,
         ngx_close_iocp_accepted_connection(c);
         return NGX_ERROR;
     }
-
-    /*
-     * This socket was recreated from WSADuplicateSocket() protocol state.
-     * Some providers can still queue a completion packet after reporting a
-     * synchronous result when completion-on-success is disabled.  Keep the
-     * conservative completion path so an OVERLAPPED is not recycled while a
-     * late packet can still reference it.
-     */
 
     c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
     c->start_time = ngx_current_msec;

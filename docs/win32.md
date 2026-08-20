@@ -29,21 +29,8 @@ events {
 
 `iocp_threads` accepts `0` or `1`; it does not add parallel callbacks inside a
 worker. Increase `worker_processes` to use more CPU cores. `post_acceptex`
-controls the number of outstanding TCP accept requests per listener, not the
-number of established connections. It defaults to 10 and accepts values from
-1 through 1024; each completed accept is immediately replenished. Established
-connections are limited by `worker_connections` per worker. The select
-backend also remains limited by its compile-time `FD_SETSIZE`, while IOCP does
-not use that descriptor set. `iocp_udp_receives` controls outstanding UDP
-receives.
-
-For direct same-process accepted sockets and outbound IFS stream sockets, IOCP
-workers request `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`. A receive or send that
-completes synchronously is consumed immediately instead of making a redundant
-round trip through the completion port. Operations that return pending
-continue to deliver normal IOCP completion packets. Sockets reconstructed in
-a worker from `WSADuplicateSocket` protocol information, and providers without
-IFS handles, retain the conservative completion-packet path.
+controls outstanding TCP accepts, and `iocp_udp_receives` controls outstanding
+UDP receives.
 
 On systems with multiple Windows processor groups, workers are assigned to
 groups before their primary thread resumes. This preserves the single-threaded
@@ -55,12 +42,6 @@ IOCP workers use overlapped file IO when `aio on` is configured. With
 `sendfile on`, file responses use `TransmitPackets` or `TransmitFile` when
 available and fall back to buffered overlapped writes when required by the
 response chain or provider.
-
-Windows workstation editions limit native transmit operations and optimize
-them for reduced resource use rather than server throughput. IOCP therefore
-uses buffered overlapped writes for file responses on workstation editions,
-even when `sendfile on` is configured. Windows Server editions retain the
-native `TransmitPackets` and `TransmitFile` path.
 
 Only worker slot zero runs cache manager and loader threads. Named mutexes
 serialize ownership across reload generations, and shutdown waits for both
@@ -80,28 +61,20 @@ ABI, including `--with-compat` modules, because IOCP adds fields to core
 structures.
 
 Before packaging, run `nginx.exe -t`, HTTP loopback requests for each enabled
-event backend, IOCP connection churn and a UDP loopback request, worker
-crash/respawn, graceful
+event backend, an IOCP UDP loopback request, worker crash/respawn, graceful
 reload and quit, cache loader startup, Unicode executable-path, stderr logging,
 TLS, file AIO, and sendfile tests. Confirm the release binary is built without
 `--with-debug` and with the intended PCRE, zlib, and OpenSSL dependencies.
 
-Run the shell benchmark drivers from WSL.  They use `cmd.exe` for Windows
-telemetry and MSYS2/POSIX helpers for process startup and free-port selection.
-`misc/win32-iocp-repeat.sh` covers HTTP keepalive or connection churn, while
-`misc/win32-udp-repeat.sh` covers UDP loopback.  Each nginx start also runs
-`nginx.exe -t`; release validation must additionally exercise worker respawn,
-graceful reload and quit, TLS, file AIO, and sendfile.
+The repeatable smoke/lifecycle matrix is in `misc/win32-rc-test.ps1`. Run it
+from Windows PowerShell against a build with PCRE2 and zlib. Pass the OpenSSL
+executable used for the build to add a live TLS handshake:
 
-For Windows Node 22 runs, set `NODE_BIN` to the repository's
-`misc/win32-node22-wrapper.sh` and `NODE_OUTPUT_FILE=1`.  Set
-`CLIENT_PROCESSES` above one to start multiple native Node clients; the
-aggregated JSONL includes request rate, MiB/s, nginx CPU percentage/cores, and
-client CPU percentage/cores.  `WORKER_PROCESSES` can be paired with
-`CONTROL_WORKER_PROCESSES` to compare IOCP worker scaling against a control.
-
-The noise-aware benchmark method, completed optimization measurements, and
-rollback decisions are recorded in `docs/win32-iocp-performance.md`.
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe `
+    -OpenSSLBinary C:\path\to\openssl.exe
+```
 
 The fork does not currently register nginx directly with the Windows Service
 Control Manager. Use a service wrapper that starts the master as a console
