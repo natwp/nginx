@@ -350,6 +350,16 @@ ngx_overlapped_wsarecv_chain(ngx_connection_t *c, ngx_chain_t *chain,
         return NGX_AGAIN;
     }
 
+    /*
+     * Consume readiness reported by a zero-byte IOCP receive directly.  A
+     * second overlapped receive would add an operation allocation and another
+     * completion-port round trip before the caller can use the available
+     * bytes.
+     */
+    if (rev->ready) {
+        return ngx_wsarecv_chain(c, chain, limit);
+    }
+
     if (c->iocp == NULL && ngx_iocp_add_connection(c) != NGX_OK) {
         rev->error = 1;
         return NGX_ERROR;

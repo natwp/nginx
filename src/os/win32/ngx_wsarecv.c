@@ -214,6 +214,17 @@ ngx_overlapped_wsarecv(ngx_connection_t *c, u_char *buf, size_t size)
         return NGX_AGAIN;
     }
 
+    /*
+     * A zero-byte IOCP receive reports stream readability without consuming
+     * data.  Drain that readiness with a normal nonblocking receive instead
+     * of posting a second overlapped operation for the same bytes.  This is
+     * the pattern used by libuv's Windows TCP implementation and avoids an
+     * extra allocation and completion-port round trip on the common path.
+     */
+    if (rev->ready) {
+        return ngx_wsarecv(c, buf, size);
+    }
+
     if (size == 0) {
         return 0;
     }
