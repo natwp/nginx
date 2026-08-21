@@ -841,6 +841,10 @@ ngx_master_process_exit(ngx_cycle_t *cycle, ngx_uint_t status)
         }
     }
 
+#if (NGX_WIN32_GPROF)
+    ngx_win32_gprof_finish(cycle->log);
+#endif
+
     ngx_destroy_pool(cycle->pool);
 
     exit(status);
@@ -1067,6 +1071,10 @@ ngx_worker_thread(void *data)
 
     cycle = (ngx_cycle_t *) ngx_cycle;
 
+#if (NGX_WIN32_GPROF)
+    ngx_win32_gprof_start("worker", ngx_win32_worker_slot, cycle->log);
+#endif
+
     for (n = 0; cycle->modules[n]; n++) {
         if (cycle->modules[n]->init_process) {
             if (cycle->modules[n]->init_process(cycle) == NGX_ERROR) {
@@ -1099,6 +1107,9 @@ ngx_worker_thread(void *data)
         ngx_process_events_and_timers(cycle);
 
         if (ngx_win32_terminate_requested()) {
+#if (NGX_WIN32_GPROF)
+            ngx_win32_gprof_stop();
+#endif
             return 0;
         }
 
@@ -1121,6 +1132,10 @@ ngx_worker_thread(void *data)
     }
 
     ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0, "exiting");
+
+#if (NGX_WIN32_GPROF)
+    ngx_win32_gprof_stop();
+#endif
 
     return 0;
 }
@@ -1217,6 +1232,10 @@ ngx_worker_process_exit(ngx_cycle_t *cycle)
             }
         }
     }
+
+#if (NGX_WIN32_GPROF)
+    ngx_win32_gprof_finish(cycle->log);
+#endif
 
     ngx_destroy_pool(cycle->pool);
 

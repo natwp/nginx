@@ -251,6 +251,7 @@ WIN32_SRCS="$CORE_SRCS $EVENT_SRCS \
             src/os/win32/ngx_udp_wsarecv.c \
             src/os/win32/ngx_wsasend.c \
             src/os/win32/ngx_wsasend_chain.c \
+            src/os/win32/ngx_win32_gprof.c \
             src/os/win32/ngx_win32_init.c \
             src/os/win32/ngx_user.c \
             src/os/win32/ngx_dlopen.c \

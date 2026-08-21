@@ -652,6 +652,10 @@ ngx_win32_router_thread(void *data)
 
     (void) data;
 
+#if (NGX_WIN32_GPROF)
+    ngx_win32_gprof_start("router", 0, ngx_win32_router_log);
+#endif
+
     while (!ngx_win32_router_stopping) {
         events = 0;
         rc = GetQueuedCompletionStatusEx(ngx_win32_router_port, entries,
@@ -742,6 +746,10 @@ ngx_win32_router_thread(void *data)
             ngx_win32_router_complete_control(control);
         }
     }
+
+#if (NGX_WIN32_GPROF)
+    ngx_win32_gprof_stop();
+#endif
 
     return 0;
 }

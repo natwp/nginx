@@ -19,6 +19,10 @@
 #define NGX_IOCP_SEND_LIMIT  (2 * 1024 * 1024)
 #define NGX_IOCP_UDP_LIMIT   65535
 
+#ifndef NGX_WIN32_GPROF
+#define NGX_WIN32_GPROF  0
+#endif
+
 
 typedef ssize_t (*ngx_recv_pt)(ngx_connection_t *c, u_char *buf, size_t size);
 typedef ssize_t (*ngx_recv_chain_pt)(ngx_connection_t *c, ngx_chain_t *in,
@@ -42,6 +46,12 @@ typedef struct {
 ngx_int_t ngx_os_init(ngx_log_t *log);
 void ngx_os_status(ngx_log_t *log);
 ngx_int_t ngx_os_signal_process(ngx_cycle_t *cycle, char *sig, ngx_pid_t pid);
+
+#if (NGX_WIN32_GPROF)
+void ngx_win32_gprof_start(const char *role, ngx_uint_t slot, ngx_log_t *log);
+void ngx_win32_gprof_stop(void);
+void ngx_win32_gprof_finish(ngx_log_t *log);
+#endif
 
 ssize_t ngx_wsarecv(ngx_connection_t *c, u_char *buf, size_t size);
 ssize_t ngx_overlapped_wsarecv(ngx_connection_t *c, u_char *buf, size_t size);
