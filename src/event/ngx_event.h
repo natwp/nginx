@@ -98,10 +98,12 @@ struct ngx_event_s {
     u_char          *iocp_buffer;
     size_t           iocp_buffer_size;
     size_t           iocp_buffer_pos;
+    ngx_chain_t      *iocp_chain;
     size_t           iocp_bytes;
     ngx_err_t        iocp_error;
     size_t           iocp_expected;
     unsigned         iocp_direct_recv:1;
+    unsigned         iocp_direct_chain:1;
 #endif
 
     ngx_uint_t       index;

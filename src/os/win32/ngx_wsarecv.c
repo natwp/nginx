@@ -20,6 +20,7 @@ typedef struct {
 
 static void ngx_iocp_wsarecv_complete(ngx_iocp_op_t *base);
 static void ngx_iocp_wsarecv_cleanup(ngx_iocp_op_t *base);
+static ngx_int_t ngx_iocp_wsarecv_defer(ngx_iocp_op_t *base);
 static ssize_t ngx_iocp_wsarecv_copy(ngx_event_t *rev, u_char *buf,
     size_t size);
 
@@ -331,6 +332,20 @@ ngx_iocp_wsarecv_complete(ngx_iocp_op_t *base)
     }
 
     ngx_iocp_event_complete(base);
+
+    if (rev->iocp_direct_recv && rev->iocp_buffer
+        && ngx_iocp_wsarecv_defer(base) != NGX_OK)
+    {
+        rev->complete = 0;
+        rev->iocp_bytes = 0;
+        rev->iocp_expected = 0;
+        rev->error = 1;
+        rev->ready = 1;
+
+        if (rev->handler) {
+            rev->handler(rev);
+        }
+    }
 }
 
 
@@ -345,6 +360,59 @@ ngx_iocp_wsarecv_cleanup(ngx_iocp_op_t *base)
         ngx_free(op->buffer);
         op->buffer = NULL;
     }
+}
+
+
+static ngx_int_t
+ngx_iocp_wsarecv_defer(ngx_iocp_op_t *base)
+{
+    size_t        available;
+    u_char       *buffer;
+    ngx_event_t  *rev;
+
+    rev = base->event;
+
+    if (!rev->iocp_direct_recv || rev->iocp_buffer == NULL) {
+        return NGX_OK;
+    }
+
+    if (rev->iocp_buffer_pos > rev->iocp_buffer_size) {
+        rev->iocp_buffer = NULL;
+        rev->iocp_buffer_size = 0;
+        rev->iocp_buffer_pos = 0;
+        rev->iocp_direct_recv = 0;
+        rev->iocp_error = WSAEINVAL;
+        return NGX_ERROR;
+    }
+
+    available = rev->iocp_buffer_size - rev->iocp_buffer_pos;
+
+    if (available == 0) {
+        rev->iocp_buffer = NULL;
+        rev->iocp_buffer_size = 0;
+        rev->iocp_buffer_pos = 0;
+        rev->iocp_direct_recv = 0;
+        return NGX_OK;
+    }
+
+    buffer = ngx_alloc(available, base->owner->log);
+    if (buffer == NULL) {
+        rev->iocp_buffer = NULL;
+        rev->iocp_buffer_size = 0;
+        rev->iocp_buffer_pos = 0;
+        rev->iocp_direct_recv = 0;
+        rev->iocp_error = WSAENOBUFS;
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(buffer, rev->iocp_buffer + rev->iocp_buffer_pos, available);
+
+    rev->iocp_buffer = buffer;
+    rev->iocp_buffer_size = available;
+    rev->iocp_buffer_pos = 0;
+    rev->iocp_direct_recv = 0;
+
+    return NGX_OK;
 }
 
 
