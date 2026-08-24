@@ -19,6 +19,14 @@
 #define NGX_IOCP_SEND_LIMIT  (2 * 1024 * 1024)
 #define NGX_IOCP_UDP_LIMIT   65535
 
+#ifndef NGX_IOCP_DIRECT_SEND
+#define NGX_IOCP_DIRECT_SEND  1
+#endif
+
+#ifndef NGX_IOCP_DIRECT_SEND_MIN_SIZE
+#define NGX_IOCP_DIRECT_SEND_MIN_SIZE  1024
+#endif
+
 #ifndef NGX_WIN32_GPROF
 #define NGX_WIN32_GPROF  0
 #endif

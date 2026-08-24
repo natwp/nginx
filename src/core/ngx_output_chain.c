@@ -492,6 +492,11 @@ ngx_output_chain_get_buf(ngx_output_chain_ctx_t *ctx, off_t bsize)
     b->end = b->last + size;
     b->temporary = 1;
     b->tag = ctx->tag;
+
+#if (NGX_HAVE_IOCP)
+    b->iocp_direct = 1;
+#endif
+
     b->recycled = recycled;
 
     ctx->buf = b;

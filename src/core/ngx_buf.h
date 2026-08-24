@@ -52,6 +52,11 @@ struct ngx_buf_s {
     unsigned         last_shadow:1;
     unsigned         temp_file:1;
 
+#if (NGX_HAVE_IOCP)
+    /* the buffer storage remains owned until an overlapped send completes */
+    unsigned         iocp_direct:1;
+#endif
+
     /* STUB */ int   num;
 };
 

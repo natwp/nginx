@@ -21,6 +21,7 @@ typedef struct {
     u_char        *buffers[NGX_WSABUFS];
     ngx_uint_t     nbufs;
     u_long         size;
+    unsigned       direct:1;
 } ngx_iocp_wsasend_chain_op_t;
 
 
@@ -229,6 +230,7 @@ ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
     ngx_event_t                  *wev;
     ngx_chain_t                  *cl;
     ngx_uint_t                    max_bufs;
+    ngx_uint_t                    direct;
     ngx_iocp_wsasend_chain_op_t  *op;
 
     wev = c->write;
@@ -341,6 +343,8 @@ ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
         max_bufs = 1;
     }
 
+    direct = 1;
+
     for (cl = in; cl && op->size < (u_long) limit; cl = cl->next) {
 
         if (cl->buf == NULL) {
@@ -398,24 +402,41 @@ ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
             break;
         }
 
-        op->buffers[op->nbufs] = ngx_alloc(size, c->log);
-        if (op->buffers[op->nbufs] == NULL) {
-            wev->error = 1;
-            ngx_iocp_op_abort(&op->op);
-            return NGX_CHAIN_ERROR;
-        }
-
-        ngx_memcpy(op->buffers[op->nbufs], cl->buf->pos, size);
-        op->wsabufs[op->nbufs].buf =
-                                      (char *) op->buffers[op->nbufs];
+        op->wsabufs[op->nbufs].buf = (char *) cl->buf->pos;
         op->wsabufs[op->nbufs].len = size;
         op->nbufs++;
         op->size += size;
+
+        /* Only storage explicitly owned by the output-chain producer may
+         * remain referenced until the overlapped send completes. */
+        if (!cl->buf->iocp_direct) {
+            direct = 0;
+        }
     }
 
     if (op->nbufs == 0) {
         ngx_iocp_op_abort(&op->op);
         return ngx_iocp_skip_empty(in);
+    }
+
+    op->direct = NGX_IOCP_DIRECT_SEND && direct && wev->iocp_pool
+                 && op->size >= NGX_IOCP_DIRECT_SEND_MIN_SIZE;
+
+    if (!op->direct) {
+        ngx_uint_t  i;
+
+        for (i = 0; i < op->nbufs; i++) {
+            op->buffers[i] = ngx_alloc(op->wsabufs[i].len, c->log);
+            if (op->buffers[i] == NULL) {
+                wev->error = 1;
+                ngx_iocp_op_abort(&op->op);
+                return NGX_CHAIN_ERROR;
+            }
+
+            ngx_memcpy(op->buffers[i], op->wsabufs[i].buf,
+                       op->wsabufs[i].len);
+            op->wsabufs[i].buf = (char *) op->buffers[i];
+        }
     }
 
     op->op.bytes = 0;
@@ -461,7 +482,7 @@ ngx_iocp_wsasend_chain_cleanup(ngx_iocp_op_t *base)
     op = (ngx_iocp_wsasend_chain_op_t *) base;
 
     for (i = 0; i < op->nbufs; i++) {
-        if (op->buffers[i]) {
+        if (!op->direct && op->buffers[i]) {
             ngx_free(op->buffers[i]);
             op->buffers[i] = NULL;
         }
