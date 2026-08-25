@@ -46,10 +46,14 @@ for (const file of files) {
     }
 
     if (!(Number(row.nginxCpuCores) > 0)
-        || !(Number(row.clientCpuCores) > 0)
-        || !(Number(row.nginxCpuPidCount) > 0)
+        || !(Number(row.nginxCpuPidCount) > 0)) {
+      throw new Error(`missing nginx CPU sample in ${file}`);
+    }
+
+    if (!Number.isFinite(Number(row.clientCpuCores))
+        || Number(row.clientCpuCores) < 0
         || Number(row.clientCpuPidCount) !== Number(row.clientProcesses)) {
-      throw new Error(`missing CPU sample in ${file}`);
+      throw new Error(`invalid client CPU diagnostic in ${file}`);
     }
   }
 }

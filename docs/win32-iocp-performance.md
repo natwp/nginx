@@ -139,35 +139,55 @@ requests/s and 0.993 occupied nginx worker cores.  The worker report counted
 receives.  The saved report and JSON files are in
 `.codex-artifacts/win32-iocp-20260825-final/`.
 
-The final fair static 64 KiB matrix used the same optimized executable and
-changed only the event backend and worker count.  Rates are medians after the
-noise filter; CPU is the aggregate nginx worker/router utilization expressed
-as occupied logical cores.
+The final fair static matrix used the same optimized executable and changed
+only the event backend and worker count.  It used the native Windows
+`oha-windows-amd64-pgo.exe` client, a 0.5-second warm-up, a two-second sample,
+four rounds, and the CPU gate.  The fixed-total mode used 24 connections and
+one client process; the scaled mode used 12 connections per worker and one
+client process per worker (four clients for the four-worker rows).  Rates are
+per-condition medians after the noise filter; CPU is the aggregate nginx
+worker/router utilization expressed as occupied logical cores.  The raw and
+filtered JSONL is retained under
+`benchmark-artifacts/native-oha-matrix/`.
 
 | Load model | Backend | Workers | Requests/s | MiB/s | nginx CPU cores |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Fixed total | IOCP | 1 | 9,200.006 | 575.000 | 0.9991 |
-| Fixed total | select | 1 | 10,239.308 | 639.957 | 0.9983 |
-| Fixed total | poll | 1 | 10,303.222 | 643.951 | 1.0006 |
-| Fixed total | IOCP | 4 | 21,532.279 | 1,345.767 | 3.6070 |
-| Fixed total | select | 4 | 10,245.781 | 640.361 | 1.0014 |
-| Fixed total | poll | 4 | 10,271.097 | 641.944 | 1.0014 |
-| 12 connections/worker | IOCP | 1 | 9,102.787 | 568.924 | 1.0008 |
-| 12 connections/worker | select | 1 | 10,286.646 | 642.915 | 0.9986 |
-| 12 connections/worker | poll | 1 | 10,264.992 | 641.562 | 0.9991 |
-| 12 connections/worker | IOCP | 4 | 17,248.175 | 1,078.011 | 3.3941 |
-| 12 connections/worker | select | 4 | 17,933.096 | 1,120.819 | 1.9646 |
-| 12 connections/worker | poll | 4 | 17,345.686 | 1,084.105 | 1.9735 |
+| Fixed total | IOCP | 1 | 8,613.438 | 538.340 | 1.0047 |
+| Fixed total | select | 1 | 8,443.165 | 527.698 | 0.9927 |
+| Fixed total | poll | 1 | 10,112.264 | 632.017 | 1.0044 |
+| Fixed total | IOCP | 4 | 20,271.195 | 1,266.950 | 3.5359 |
+| Fixed total | select | 4 | 10,077.977 | 629.874 | 0.9991 |
+| Fixed total | poll | 4 | 10,142.791 | 633.924 | 0.9970 |
+| 12 connections/worker | IOCP | 1 | 9,014.136 | 563.383 | 0.9978 |
+| 12 connections/worker | select | 1 | 10,044.925 | 627.808 | 1.0005 |
+| 12 connections/worker | poll | 1 | 9,926.704 | 620.419 | 0.9991 |
+| 12 connections/worker | IOCP | 4 | 18,325.835 | 1,145.365 | 3.3827 |
+| 12 connections/worker | select | 4 | 17,181.216 | 1,073.826 | 1.9842 |
+| 12 connections/worker | poll | 4 | 12,848.806 | 803.050 | 1.4747 |
 
-At one worker, IOCP remains 11.137% behind select and 10.884% behind poll in
-the fixed-total 64 KiB test.  At four workers it is 119.562% ahead of select
-and 82.362% ahead of poll in that test.  Under the scaled load, four-worker
-IOCP is 3.115% behind select and 0.558% behind poll, while scaling 99.214%
-over one-worker IOCP.  The four-worker select and poll gains are much smaller
-because their event loops do not use the IOCP worker/router distribution path.
-All retained matrix samples completed without request errors.  A higher-load
-select sweep was rejected because Windows `FD_SETSIZE=64` was exceeded; that
-is a backend limit, not workstation noise.
+The paired, same-round MAD comparison is the authoritative backend delta:
+fixed-total one-worker IOCP was 12.499% behind select and 15.865% behind poll;
+fixed-total four-worker IOCP was 108.782% ahead of select and 101.180% ahead
+of poll.  Under the scaled load, four-worker IOCP was 4.739% ahead of select
+and 47.026% ahead of poll, while scaling 100.528% over one-worker IOCP.  The
+per-condition table and paired deltas intentionally differ slightly because
+the former filters each condition independently while the latter retains only
+same-round pairs.  Every retained native-oha row completed with zero request
+errors.  A higher-load select sweep was rejected because Windows `FD_SETSIZE`
+was exceeded; that is a backend limit, not workstation noise.
+
+The same run also measured the small `/empty.gif` response.  Per-condition
+medians were 84,868.634, 117,944.973, and 112,125.615 requests/s for fixed
+one-worker IOCP, select, and poll; fixed four-worker IOCP, select, and poll
+measured 145,289.655, 114,840.862, and 100,096.522 requests/s.  Under the
+scaled load, one-worker IOCP/select/poll measured 77,598.982, 100,991.693,
+and 97,978.609 requests/s, while four-worker IOCP/select/poll measured
+151,127.963, 91,808.591, and 100,691.638 requests/s.  The paired deltas for
+IOCP versus select/poll were -23.888%/-20.990% at fixed one worker,
++2.295%/+31.395% at fixed four workers, -23.163%/-19.210% at scaled one
+worker, and +63.819%/+47.779% at scaled four workers.  This confirms that the
+small-response path has the same real multi-worker IOCP gain, while its
+single-worker result remains generator- and event-loop-sensitive.
 
 The final lifecycle validation passed configuration testing, startup, reload,
 1 KiB and 64 KiB responses with `sendfile on`, graceful quit, and a separate
