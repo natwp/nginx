@@ -1,0 +1,346 @@
+# Windows IOCP Performance Validation
+
+This document records performance experiments used to decide whether an IOCP
+optimization remains in the tree.  It is intentionally limited to completed,
+repeatable measurements; unfinished experiments are marked pending.
+
+## Method
+
+Measurements were collected on August 17–25, 2026, on a shared Windows
+workstation with the benchmark driver running from WSL.  Candidate and control
+binaries were built from the same source revision with only the tested switch
+changed.  The historical isolated experiments used three two-second workload
+samples; the long Windows Node validation below used three five-second samples.
+Each paired run alternated candidate/control order.  CPU and available-memory
+gates delayed a run while either Windows or WSL was busy.
+
+Windows CPU and memory telemetry came from cmd.exe/wmic; free ports and
+process startup used MSYS2/POSIX helpers.
+
+The scripts first take the median of each run.  The paired comparison then
+rejects a pair when either its request-rate or bandwidth ratio lies farther
+than `max(2%, 2 * MAD)` from the median ratio.  At least three pairs must
+remain.  The median ratio of retained, same-round pairs is authoritative;
+positive deltas favor the candidate.  All measurements below completed with
+zero request errors.
+
+The repeatable drivers and filters are:
+
+- `misc/win32-iocp-repeat.sh` and `misc/win32-iocp-bench.sh`
+- `misc/http-loopback-bench.js` for keepalive traffic and
+  `misc/http-connect-bench.js` for TCP connection churn
+- `misc/win32-udp-repeat.sh` and `misc/win32-udp-bench.sh`
+- `misc/noise-compare.js` and `misc/noise-filter.js`
+
+The long validation runs additionally used
+`node.exe` (Node.js v22.16.0).  The WSL
+wrapper converts script paths and writes each Windows Node result to a native
+file before the WSL filter reads it; this avoids the `EISDIR` stdout-handle
+behavior of Windows Node when a WSL pipe is inherited.
+
+## Completed isolated experiments
+
+| Experiment | Workload | Pairs retained/raw | Request-rate delta | Latency p50, candidate/control | Latency p95, candidate/control | Decision |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Synchronous TCP receive ready path | 8 KiB padded request | 5/7 | +0.183% | 0.840/0.832 ms | 1.661/1.651 ms | Rolled back: throughput gain was within the noise floor and latency regressed. |
+| Synchronous TCP send ready path | Tiny response | 9/12 | +0.226% | 0.793/0.798 ms | 1.356/1.363 ms | Rolled back: no material throughput gain. |
+| UDP receive operation cache | 64-byte datagram | 8/12 | +3.760% | 0.979/1.011 ms | 1.832/1.925 ms | Rolled back after the 1200-byte reversal. |
+| UDP receive operation cache | 1200-byte datagram | 7/7 | -3.823% | 1.028/1.028 ms | 2.025/1.944 ms | Rolled back. |
+| Persistent UDP receive slot | 64-byte datagram | 11/12 | -0.061% | 1.113/1.098 ms | 2.276/2.265 ms | Rolled back. |
+| Persistent UDP receive slot | 1200-byte datagram | 6/7 | -4.002% | 1.067/1.056 ms | 2.086/2.015 ms | Rolled back. |
+| UDP send operation cache | 64-byte datagram | 5/7 | -0.733% | 1.059/1.075 ms | 2.070/2.064 ms | Rolled back. |
+| UDP send operation cache | 1200-byte datagram | 5/7 | -0.452% | 0.929/0.926 ms | 1.777/1.780 ms | Rolled back. |
+| Direct TCP receive buffer | 8 KiB padded request | 5/7 | +1.032% | 0.855/0.850 ms | 1.657/1.656 ms | Rolled back after the 12 KiB reversal. |
+| Direct TCP receive buffer | 12 KiB padded request | 7/7 | -0.748% | 1.155/1.148 ms | 1.777/1.758 ms | Rolled back. |
+| Router completion status fast path | TCP connection churn | 5/7 | -1.456% | 3.290/3.280 ms | 18.505/18.459 ms | Rolled back. |
+| Router completion status fast path | 64-byte UDP datagram | 4/7 | -0.646% | 1.005/0.986 ms | 1.893/1.888 ms | Rolled back. |
+| Router completion status fast path | 1200-byte UDP datagram | 5/7 | -1.073% | 0.928/0.933 ms | 1.785/1.780 ms | Rolled back. |
+| 128-entry router pipe-write buffer cache | 64-byte UDP datagram | 5/7 | -0.863% | 0.999/1.002 ms | 1.951/1.905 ms | Rolled back after the 1200-byte regression. |
+| 128-entry router pipe-write buffer cache | 1200-byte UDP datagram | 7/7 | -6.751% | 1.043/1.006 ms | 2.124/1.931 ms | Rolled back. |
+| Direct router UDP send ownership | 64-byte response datagram | 5/7 | -2.568% | 0.995/0.984 ms | 1.918/1.904 ms | Rolled back; small responses regressed. |
+| Direct router UDP send ownership | 1200-byte response datagram | 5/7 | -5.162% | 1.016/0.992 ms | 2.017/1.909 ms | Rolled back; removing the second copy did not offset the longer pipe-read ownership lifetime. |
+| Thresholded direct TCP send ownership | Empty response | 4/7 | +2.132% | 0.830/0.837 ms | 1.316/1.410 ms | Kept in that experiment: responses below the then-current 1024-byte threshold still used the copy path. |
+| Thresholded direct TCP send ownership | 1 KiB file | 4/7 | +0.452% | 2.830/2.816 ms | 3.599/3.614 ms | Kept; throughput is effectively neutral at this size. |
+| Thresholded direct TCP send ownership | 64 KiB file | 4/7 | +3.207% | 4.501/4.620 ms | 6.560/6.837 ms | Kept. |
+| Thresholded direct TCP send ownership | 1 MiB file | 6/7 | -1.252% | 31.680/32.133 ms | 45.143/44.666 ms | Kept provisionally: regression is inside the 2% noise floor; continue watching large responses. |
+| 128-entry worker completion batch | 256-way keepalive, empty response | 7/7 | +3.689% | 7.648/7.725 ms | 10.533/10.653 ms | Rolled back after the connection-churn reversal. |
+| 128-entry worker completion batch | 256-way keepalive, 64 KiB file | 6/7 | +1.715% | 41.868/42.277 ms | 49.556/51.015 ms | Rolled back after the connection-churn reversal. |
+| 128-entry worker completion batch | 128-way connection churn | 4/7 | -7.047% | 13.324/12.757 ms | 40.837/37.773 ms | Rolled back; the existing 64-entry batch remains. |
+| 128-entry routed AcceptEx bookkeeping cache | 128-way connection churn | 5/7 | +11.337% | 13.189/14.157 ms | 36.289/67.924 ms | Kept. |
+| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, empty response | 7/7 | +0.645% | 7.170/7.250 ms | 8.160/8.612 ms | Kept. |
+| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, 64 KiB file | 6/7 | +1.906% | 37.575/38.224 ms | 42.086/44.741 ms | Kept. |
+| TLS write-notification handle cache | HTTPS, 16-way throttled 4 MiB response | 7/7 | +0.019% | 635.507/638.477 ms | 646.911/651.473 ms | Rolled back: throughput was neutral under backpressure. |
+| TLS write-notification handle cache | HTTPS, 64-way connection churn | 7/7 | -12.705% | 98.405/94.641 ms | 167.722/136.845 ms | Rolled back: handle reuse regressed handshake/churn latency. |
+
+These results show why allocation or copy removal is not accepted from an
+instruction-count argument alone: lifetime management, cache locality, and
+completion scheduling can reverse the result as payload size changes.
+
+## August 21, 2026 reference-driven receive work
+
+MinGW gprof was enabled in the actual worker and router threads rather than
+only in the process entry thread.  A five-second fast-proxy profile recorded
+about 1.29 million `ngx_iocp_op_create()` calls and the same number of
+`ngx_calloc()` calls in the worker.  `ngx_iocp_post_read()` accounted for
+about 1.29 million submissions, while send-chain completion accounted for
+about 0.86 million operations.  These call counts identify operation
+bookkeeping as a real hot path; the short sampling interval is not used as a
+precise percentage attribution.
+
+The local libuv 1.52.1 source keeps a per-handle zero-byte read request and
+uses `OVERLAPPED.Internal`/`InternalHigh` rather than querying successful
+completions again.  The local Asio development source submits with
+`WSARecv()`/`WSASend()` and recycles operation storage through its operation
+queue and handler allocator.  Each pattern was tested separately so that a
+lifetime change was not confused with an allocation change.
+
+| Experiment | Workload | Pairs retained/raw | Request-rate delta | nginx CPU delta | Decision |
+| --- | --- | ---: | ---: | ---: | --- |
+| Direct scalar receive into a request-pool buffer | Fast proxy, 64 KiB | 4/5 | +2.650% | not used as a gate | Kept. |
+| Direct scalar receive into a request-pool buffer | Fast proxy, 1 KiB | 4/5 | -0.910% | not used as a gate | Kept: inside the 2% noise bound. |
+| Direct chain receive into request-pool buffers | Fast proxy, 64 KiB | 8/9 | +2.458% | +0.075 percentage points | Kept. |
+| Direct chain receive into request-pool buffers | Fast proxy, 1 KiB | 4/5 | +0.901% | -0.110 percentage points | Kept. |
+| Skip `WSAGetOverlappedResult()` when `OVERLAPPED.Internal` reports success | Static 64 KiB | 4/4 | +0.701% | +0.017 percentage points | Rolled back after small and proxy reversals. |
+| Skip successful-completion query | Fast proxy, 64 KiB | 3/4 | -0.940% | -0.007 percentage points | Rolled back. |
+| Skip successful-completion query | Empty response | 3/4 | -1.931% | -0.042 percentage points | Rolled back. |
+| Persistent per-owner zero-byte read notification | Static 64 KiB | 3/4 | -0.670% | +0.018 percentage points | Rolled back after the small-response reversal. |
+| Persistent per-owner zero-byte read notification | Empty response | 3/4 | -4.900% | -0.148 percentage points | Rolled back. |
+| Bounded retired read-notify object recycler | Empty response | 3/4 | -1.409% | -0.075 percentage points | Rolled back; no throughput gain. |
+| Bounded retired read-notify object recycler | Static 64 KiB | 3/4 | -1.559% | -0.030 percentage points | Rolled back; no throughput gain. |
+
+The persistent notification removed allocation but also changed completion
+retirement and callback/rearm ordering.  Its lower nginx CPU did not translate
+into higher throughput.  The implementation is absent from the tree.  Any
+follow-up allocation experiment must preserve the original operation and
+callback lifetime and must pass both small-response and 64 KiB gates before a
+proxy comparison.
+
+## August 24–25 final profiling and backend matrix
+
+The final accepted source revision is `2b41e6972`.  Its owned-send change was
+kept after the original paired gate measured +6.451% for a static 64 KiB
+response and +2.808% for the fast 64 KiB proxy path, with zero request errors.
+A later accepted-build profile recorded 265,537 send-chain calls, 371,752
+scalar send calls, 159,338 IOCP operation creations, 106,296 completion
+dispatches, and 53,123 zero-byte read posts.  These MinGW gprof call counts,
+rather than static inspection, were used to select the next experiment.
+The retained report files are under
+`.codex-artifacts/win32-iocp-20260820-final/` (including the static IOCP,
+fast-proxy, and select-worker reports); the separate completion-suppression
+profile is retained with its routed experiment artifacts.
+
+The release-candidate gprof pass was repeated on August 25 with the accepted
+gprof binary in foreground mode so the CRT emitted profiles reliably.  It
+used native oha, a one-second warm-up, a three-second 64 KiB sample, 24
+connections, and the CPU gate; it completed with zero errors at 7,680.863
+requests/s and 0.993 occupied nginx worker cores.  The worker report counted
+60,649 `ngx_iocp_op_create()` calls, 30,329 `ngx_iocp_post_read()` calls,
+30,401 completion dispatches, 60,640 send-chain calls, and 30,378 overlapped
+receives.  The saved report and JSON files are in
+`.codex-artifacts/win32-iocp-20260825-final/`.
+
+The final fair static 64 KiB matrix used the same optimized executable and
+changed only the event backend and worker count.  Rates are medians after the
+noise filter; CPU is the aggregate nginx worker/router utilization expressed
+as occupied logical cores.
+
+| Load model | Backend | Workers | Requests/s | MiB/s | nginx CPU cores |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Fixed total | IOCP | 1 | 9,200.006 | 575.000 | 0.9991 |
+| Fixed total | select | 1 | 10,239.308 | 639.957 | 0.9983 |
+| Fixed total | poll | 1 | 10,303.222 | 643.951 | 1.0006 |
+| Fixed total | IOCP | 4 | 21,532.279 | 1,345.767 | 3.6070 |
+| Fixed total | select | 4 | 10,245.781 | 640.361 | 1.0014 |
+| Fixed total | poll | 4 | 10,271.097 | 641.944 | 1.0014 |
+| 12 connections/worker | IOCP | 1 | 9,102.787 | 568.924 | 1.0008 |
+| 12 connections/worker | select | 1 | 10,286.646 | 642.915 | 0.9986 |
+| 12 connections/worker | poll | 1 | 10,264.992 | 641.562 | 0.9991 |
+| 12 connections/worker | IOCP | 4 | 17,248.175 | 1,078.011 | 3.3941 |
+| 12 connections/worker | select | 4 | 17,933.096 | 1,120.819 | 1.9646 |
+| 12 connections/worker | poll | 4 | 17,345.686 | 1,084.105 | 1.9735 |
+
+At one worker, IOCP remains 11.137% behind select and 10.884% behind poll in
+the fixed-total 64 KiB test.  At four workers it is 119.562% ahead of select
+and 82.362% ahead of poll in that test.  Under the scaled load, four-worker
+IOCP is 3.115% behind select and 0.558% behind poll, while scaling 99.214%
+over one-worker IOCP.  The four-worker select and poll gains are much smaller
+because their event loops do not use the IOCP worker/router distribution path.
+All retained matrix samples completed without request errors.  A higher-load
+select sweep was rejected because Windows `FD_SETSIZE=64` was exceeded; that
+is a backend limit, not workstation noise.
+
+The final lifecycle validation passed configuration testing, startup, reload,
+1 KiB and 64 KiB responses with `sendfile on`, graceful quit, and a separate
+close-mode connection-churn run with zero request errors.  The close-mode
+64 KiB request rate was not used as performance evidence because the native
+client/TIME_WAIT path was the limiting factor.
+
+## Routed socket completion lifetime
+
+Connection churn in an earlier experiment exposed late completion packets for
+worker sockets recreated from `WSADuplicateSocket` protocol information.
+Enabling `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` on those sockets allowed an
+operation to be completed synchronously and recycled before the late packet
+arrived; the packet could then refer to an operation owned by a different
+connection.  The diagnostic run reported completion-owner mismatches and
+unlinked operations, and that implementation was removed.
+
+A second, libuv-style experiment deferred synchronous successes onto a local
+ready queue so callbacks were not invoked inline.  The first profile showed
+that the enable helper was never reached for routed imported sockets.  After
+the import path was corrected, MinGW gprof recorded 49 calls to the enable
+helper and 151,794 synchronous-completion handoffs, proving that the measured
+binary exercised the intended path.
+
+The corrected implementation was compared with an exact `2b41e6972` control.
+It measured -0.092% for static 1 KiB, -0.139% for static 64 KiB, and -0.332%
+for a slow 64 KiB proxy.  The slow proxy also consumed 0.0467 more nginx CPU
+cores.  Four retained fast-proxy pairs measured +7.694%, but one additional
+candidate attempt produced 12 connection errors and a long timeout tail.
+Because the change was neutral or negative on static traffic, regressed the
+clean slow-proxy gate, and had a correctness failure, it was rejected and
+fully reverted.  The accepted source does not call
+`SetFileCompletionNotificationModes()`.
+
+## Completion and lifetime notes
+
+The direct-send implementation has a 1024-byte source default.  The final
+validated/package builds override `NGX_IOCP_DIRECT_SEND_MIN_SIZE` to 4096
+bytes, the threshold selected by the later profiling campaign.  The request
+pool is held by the IOCP operation, so buffers handed directly to `WSASend()`
+remain alive until completion; smaller operations retain the explicit copy
+for short-response stability.
+
+The routed AcceptEx cache retains at most 128 completed bookkeeping objects.
+It never caches or reuses an accepted socket, an outstanding OVERLAPPED
+operation, or an object still awaiting a worker acknowledgement.  An object
+enters the cache only after its socket has been closed and its router queues
+have been unlinked.
+
+The TLS wait-object experiment cached the `WSAEVENT` and thread-pool wait used
+by OpenSSL `WANT_WRITE` notifications.  A diagnostic run confirmed that the
+cache reduced handle creation (813 reuses out of 830 posts), but the paired
+backpressure result was neutral and the 64-way HTTPS churn result was 12.705%
+slower.  The cache is therefore absent from the implementation; each TLS wait
+still follows the conservative create/retire/close lifetime.
+
+The router pipe-write experiment cached completed message buffers of at most
+4096 bytes.  It never reused an in-flight `WriteFile` buffer, but the extra
+cache bookkeeping still reduced 1200-byte routed UDP throughput by 6.751%.
+The cache is therefore absent; router pipe writes retain the allocator's
+existing allocation/free path.
+
+The direct router UDP-send experiment transferred the pipe-read allocation to
+the overlapped `WSASendTo()`/`WSASendMsg()` operation and removed the second
+payload copy.  It regressed 2.568% for 64-byte responses and 5.162% for
+1200-byte responses, so the conservative copy-and-free lifetime remains.
+
+## Pending experiments
+
+No unmeasured optimization is present in the final build.  No additional safe
+router data-copy candidate remains after the measured rollbacks above.  A
+future completion-suppression design would need new profiling evidence and
+must pass static, fast-proxy, slow-proxy, and churn gates before being kept.
+
+## Final Windows packages
+
+The August 25 release artifacts use source commit `2b41e6972`, GCC 16.1.0,
+PCRE2 10.47 with JIT, zlib 1.3.2, `FD_SETSIZE=1024`, and the profiled
+`NGX_IOCP_DIRECT_SEND_MIN_SIZE=4096` package override.  Both are stripped
+PE32+ x86-64 executables with high-entropy ASLR, ASLR, NX/DEP, and only
+Windows system DLL imports.
+
+- Full: `nginx-1.31.4-win64-full-iocp-20260825`, statically linked with
+  OpenSSL 3.6.3 and the requested HTTP SSL/2/3, mail, and stream modules.
+  Executable SHA256:
+  `6ec266e0f82fc3ace578f1de5498b6b0658b8aa3f93813a31ec67f36e68260fb`.
+- Slim: `nginx-1.31.4-win64-slim-iocp-20260825`, without OpenSSL or TLS
+  modules.  Executable SHA256:
+  `ad28a3ab2c2f4390a3fe2d50fb791cb55cedd3bdfab28aa10aee5297581766ed`.
+
+The packaged binaries, not intermediate build copies, passed configuration
+testing.  Both passed CPU-gated HTTP startup, 1 KiB and 64 KiB requests,
+reload, and graceful quit with zero request errors.  The full package also
+passed the same HTTPS lifecycle; the slim package correctly rejected an SSL
+listener with `requires ngx_http_ssl_module`.
+
+## Historical August 18 cross-platform comparisons
+
+These are light, five-round, CPU-gated comparisons using three one-second
+samples per workload and 32 keepalive connections.  The Windows runs use
+`sendfile off` for both binaries.  Positive deltas favor the modified fork.
+
+| Candidate | Control | Workload | Pairs retained/raw | Request-rate delta | Errors |
+| --- | --- | --- | ---: | ---: | ---: |
+| 1.31.4 full IOCP | official 1.31.3 Windows select | empty response | 4/5 | +2.495% | 0 |
+| 1.31.4 full IOCP | official 1.31.3 Windows select | 64 KiB file | 4/5 | -6.458% | 0 |
+| 1.31.4 slim IOCP | official 1.31.3 Windows select | empty response | 4/5 | +6.852% | 0 |
+| 1.31.4 slim IOCP | official 1.31.3 Windows select | 64 KiB file | 4/5 | -5.177% | 0 |
+| 1.31.4 fork epoll | official 1.31.3 Linux epoll | empty response | 4/5 | -1.795% | 0 |
+| 1.31.4 fork epoll | official 1.31.3 Linux epoll | 64 KiB file | 3/5 | +0.464% | 0 |
+
+The official Windows archive contains a 32-bit debug build, while the two
+fork packages are 64-bit optimized MinGW builds; those Windows numbers are a
+directional reference, not an ABI-matched compiler comparison.  The Linux
+comparison builds both versions with the same dependency-free epoll feature
+set.  The fork rejects UDP listeners with the select and poll backends, so
+UDP comparisons continue to use an otherwise identical IOCP control binary.
+
+The official Windows select build is not a UDP control: this fork rejects UDP
+listeners with the select and poll backends.  UDP microbenchmarks therefore
+use an otherwise identical IOCP binary as their control.
+
+## Long Windows Node and worker-count validation
+
+On August 18, 2026, the long runs used a two-second warm-up followed by three
+five-second samples, five interleaved candidate/control rounds, 32 total
+keepalive connections, and the same CPU/memory gates.  `CLIENT_PROCESSES=4`
+starts four native Windows Node 22 clients and aggregates their JSONL samples;
+this is important for small responses because one Node event loop otherwise
+hits one CPU core before nginx does.
+
+Each sample now includes `nginxCpuPercent` and `nginxCpuCores`.  These are the
+sum of nginx master/worker user and kernel time over the sample, normalized by
+the eight logical processors in the workstation.  `clientCpuPercent` and
+`clientCpuCores` are recorded as a diagnostic for the generator.  CPU fields
+are not used to reject throughput outliers.
+
+The single-worker run shows that the Windows Node runtime was not hiding a
+server-side 64 KiB problem:
+
+| Candidate | Control | Workload | Request-rate delta | nginx CPU candidate/control |
+| --- | --- | --- | ---: | ---: |
+| Full IOCP, 1 worker | Official Windows select, 1 worker | Empty response | -0.987% | 10.16% / 11.48% |
+| Full IOCP, 1 worker | Official Windows select, 1 worker | 64 KiB file | -2.865% | 12.26% / 12.27% |
+
+The client-side measurement reached about one occupied core for the empty
+response, while nginx used less than one core.  Four clients remove that
+generator ceiling and expose the IOCP worker/router scaling path:
+
+| Candidate | Control | Workload | Pairs retained/raw | Request-rate delta | nginx CPU candidate/control |
+| --- | --- | --- | ---: | ---: | ---: |
+| Full IOCP, 4 workers / 4 clients | Official Windows select, 4 workers / 4 clients | Empty response | 5/5 | +25.695% | 24.11% / 12.19% |
+| Full IOCP, 4 workers / 4 clients | Official Windows select, 4 workers / 4 clients | 64 KiB file | 4/5 | +105.147% | 42.40% / 12.33% |
+| Slim IOCP, 4 workers / 4 clients | Official Windows select, 4 workers / 4 clients | Empty response | 4/5 | +22.099% | 24.15% / 12.19% |
+| Slim IOCP, 4 workers / 4 clients | Official Windows select, 4 workers / 4 clients | 64 KiB file | 3/5 | +110.903% | 44.56% / 12.33% |
+
+For connection churn, the safe long profile used one native Node client with
+eight concurrent sockets.  It retained 4/5 pairs, completed with zero errors,
+and measured +0.762% request rate for IOCP versus official select (inside the
+noise floor).  A four-client close-mode attempt was intentionally discarded:
+the client exhausted the Windows ephemeral-port/TIME_WAIT budget and both
+controls reported client errors, so it is not a server performance result.
+
+The direct IOCP worker-count comparison (four workers versus one, with one
+Node client) measured +90.866% for 64 KiB and -2.582% for empty responses.
+The former is a real server scaling gain; the latter remains client-limited.
+No additional single-worker source change was accepted from this follow-up:
+the fair multi-worker measurements already show a repeatable IOCP advantage,
+while the remaining single-worker 64 KiB gap is inside a low-single-digit
+throughput difference with indistinguishable nginx CPU use.
+
+An exploratory eight-worker/four-client sweep was not used to choose a
+default: its three-round empty-response filter retained only two runs after
+one noisy round.  The packages therefore keep their conservative one-worker
+configuration; operators can set `worker_processes auto;` or a fixed count
+after measuring their own client and CPU capacity.
