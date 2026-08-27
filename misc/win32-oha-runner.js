@@ -5,19 +5,22 @@ const fs = require('fs');
 const processCpu = require('./win32-process-cpu');
 
 const [ohaPath, url, connectionsText, durationText, nginxPrefix,
-  outputPath, backend, label, workload, clientProcessesText = '1'] =
+  outputPath, backend, label, workload, clientProcessesText = '1',
+  connectionAuditText = '0'] =
   process.argv.slice(2);
 
 if (!ohaPath || !url || !connectionsText || !durationText || !nginxPrefix
     || !outputPath) {
   throw new Error(
     'usage: win32-oha-runner.js oha.exe url connections duration '
-    + 'nginx-prefix output [backend] [label] [workload] [client-processes]'
+    + 'nginx-prefix output [backend] [label] [workload] [client-processes] '
+    + '[connection-audit]'
   );
 }
 
 const connections = Number(connectionsText);
 const clientProcesses = Number(clientProcessesText);
+const connectionAudit = Number(connectionAuditText);
 const duration = durationText;
 
 if (!Number.isInteger(connections) || connections < 1) {
@@ -29,6 +32,10 @@ if (!Number.isInteger(clientProcesses) || clientProcesses < 1
   throw new Error(
     'client-processes must be a positive integer no larger than connections'
   );
+}
+
+if (connectionAudit !== 0 && connectionAudit !== 1) {
+  throw new Error('connection-audit must be 0 or 1');
 }
 
 function durationMilliseconds(value) {
@@ -53,6 +60,29 @@ function median(values) {
 function finiteMedian(values) {
   const finite = values.map(Number).filter(Number.isFinite);
   return finite.length ? median(finite) : null;
+}
+
+function normalizeWindowsSocketError(value) {
+  const text = String(value);
+  const match = /\(os error ([0-9]+)\)/.exec(text);
+  const messages = {
+    10013: 'permission denied',
+    10048: 'address already in use',
+    10049: 'cannot assign requested address',
+    10054: 'connection reset by peer',
+    10055: 'no buffer space available',
+    10060: 'connection timed out',
+    10061: 'connection refused'
+  };
+
+  if (!match || !messages[match[1]]) {
+    return text;
+  }
+
+  const prefix = text.lastIndexOf(':', match.index);
+  const error = `${messages[match[1]]} (os error ${match[1]})`;
+
+  return prefix === -1 ? error : `${text.slice(0, prefix + 1)} ${error}`;
 }
 
 function spawnOha(clientConnections) {
@@ -82,7 +112,8 @@ function spawnOha(clientConnections) {
 
       if (code !== 0) {
         reject(new Error(
-          err || `oha exited with code ${code}, signal ${signal || 'none'}`
+          normalizeWindowsSocketError(err)
+            || `oha exited with code ${code}, signal ${signal || 'none'}`
         ));
         return;
       }
@@ -97,6 +128,49 @@ function spawnOha(clientConnections) {
   });
 
   return {child, done};
+}
+
+function tcpServerConnections(port) {
+  try {
+    const output = childProcess.execFileSync(
+      'C:\\Windows\\System32\\netstat.exe',
+      ['-ano', '-p', 'tcp'],
+      {
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+        windowsHide: true
+      }
+    );
+    let established = 0;
+    let total = 0;
+
+    for (const line of output.replace(/\r/g, '').split('\n')) {
+      const fields = line.trim().split(/\s+/);
+      if (fields.length < 4 || fields[0].toUpperCase() !== 'TCP') {
+        continue;
+      }
+
+      const local = fields[1];
+      const state = fields[3].toUpperCase();
+      if (!local.endsWith(`:${port}`)) {
+        continue;
+      }
+
+      total++;
+      if (state === 'ESTABLISHED') {
+        established++;
+      }
+    }
+
+    return {port, established, total, error: null};
+  } catch (error) {
+    return {
+      port,
+      established: null,
+      total: null,
+      error: String(error.message || error)
+    };
+  }
 }
 
 async function main() {
@@ -114,16 +188,26 @@ async function main() {
     .filter(pid => Number.isInteger(pid) && pid > 0);
   const nginxPids = nginxProcesses.map(process => process.pid);
   const sampledPids = [...nginxPids, ...clientPids];
+  const durationMs = durationMilliseconds(duration);
+  const target = new URL(url);
+  const targetPort = Number(target.port || (target.protocol === 'https:'
+    ? 443 : 80));
+  const auditDelay = Math.min(1000, Math.max(250, durationMs / 3));
+  const connectionAuditPromise = connectionAudit
+    ? new Promise(resolve => {
+      setTimeout(() => resolve(tcpServerConnections(targetPort)), auditDelay);
+    })
+    : Promise.resolve(null);
   await new Promise(resolve => setTimeout(resolve, 150));
   const cpuStart = processCpu.snapshot(sampledPids);
   const started = performance.now();
-  const durationMs = durationMilliseconds(duration);
   const probeDelay = Math.max(250, durationMs - 350);
   const cpuEndPromise = new Promise(resolve => {
     setTimeout(() => resolve(processCpu.snapshot(sampledPids)), probeDelay);
   });
   const results = await Promise.all(clients.map(client => client.done));
   const cpuEnd = await cpuEndPromise;
+  const tcpAudit = await connectionAuditPromise;
   const elapsed = (performance.now() - started) / 1000;
   const summaries = results.map(result => result.summary || {});
   const latencies = results.map(result =>
@@ -167,7 +251,9 @@ async function main() {
     for (const [error, count] of Object.entries(
       result.errorDistribution || {}
     )) {
-      errorDistribution[error] = (errorDistribution[error] || 0) + Number(count);
+      const normalized = normalizeWindowsSocketError(error);
+      errorDistribution[normalized] = (errorDistribution[normalized] || 0)
+        + Number(count);
     }
   }
 
@@ -196,6 +282,10 @@ async function main() {
     latencyP95Ms: finiteMedian(latencies.map(latency => latency.p95)),
     latencyP99Ms: finiteMedian(latencies.map(latency => latency.p99)),
     errorDistribution,
+    tcpServerPort: tcpAudit ? tcpAudit.port : null,
+    tcpEstablishedAtAudit: tcpAudit ? tcpAudit.established : null,
+    tcpConnectionsAtAudit: tcpAudit ? tcpAudit.total : null,
+    tcpConnectionAuditError: tcpAudit ? tcpAudit.error : null,
     ...nginxCpu,
     nginxWorkerCpuPercent: nginxWorkerCpu
       ? nginxWorkerCpu.cpuPercent : null,
@@ -213,6 +303,6 @@ async function main() {
 }
 
 main().catch(error => {
-  process.stderr.write(`${error.stack || error}\n`);
+  process.stderr.write(`${normalizeWindowsSocketError(error.stack || error)}\n`);
   process.exitCode = 1;
 });

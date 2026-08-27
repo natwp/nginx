@@ -94,8 +94,23 @@ condition_values() {
     local condition
 
     condition=$1
-    backend=${condition%-w*}
-    workers=${condition##*-w}
+    case "$condition" in
+        wepoll-level-w*)
+            backend=wepoll
+            workers=${condition##*-w}
+            wepoll_edge=off
+            ;;
+        wepoll-edge-w*)
+            backend=wepoll
+            workers=${condition##*-w}
+            wepoll_edge=on
+            ;;
+        *)
+            backend=${condition%-w*}
+            workers=${condition##*-w}
+            wepoll_edge=off
+            ;;
+    esac
 }
 
 load_values() {
@@ -145,6 +160,7 @@ run_one() {
            MASTER_PROCESS=on DAEMON=off BENCH_DIRECT_QUIT=0 \
            BENCH_PATHS="$paths" WORKER_PROCESSES="$workers" \
            CONNECTIONS="$connections" CLIENT_PROCESSES="$clients" \
+           WEPOLL_EDGE="$wepoll_edge" \
            OHA_WARMUP_DURATION="$warmup_duration" \
            OHA_DURATION="$sample_duration" \
            "$script_dir/win32-oha-bench.sh" "$binary" "$backend" \
@@ -223,6 +239,13 @@ for mode in $modes; do
     compare_pair "$mode" iocp-w4 iocp-w1
     compare_pair "$mode" select-w4 select-w1
     compare_pair "$mode" poll-w4 poll-w1
+    compare_pair "$mode" wepoll-level-w1 iocp-w1
+    compare_pair "$mode" wepoll-level-w1 select-w1
+    compare_pair "$mode" wepoll-level-w1 poll-w1
+    compare_pair "$mode" wepoll-edge-w1 iocp-w1
+    compare_pair "$mode" wepoll-edge-w1 select-w1
+    compare_pair "$mode" wepoll-edge-w1 poll-w1
+    compare_pair "$mode" wepoll-edge-w1 wepoll-level-w1
 done
 
 echo "matrix results written to $results_root" >&2

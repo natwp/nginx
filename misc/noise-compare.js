@@ -104,21 +104,35 @@ for (const key of keys) {
   const split = key.indexOf('\u0000');
   const workload = key.slice(split + 1);
   if (!byWorkload.has(workload)) {
-    byWorkload.set(workload, []);
+    byWorkload.set(workload, {
+      pairs: [],
+      candidateOnly: [],
+      controlOnly: []
+    });
   }
 
   const left = candidate.get(key);
   const right = control.get(key);
-  if (!left || !right) {
-    throw new Error(`missing paired run for ${key}`);
-  }
+  const group = byWorkload.get(workload);
 
-  byWorkload.get(workload).push({candidate: left, control: right});
+  if (left && right) {
+    group.pairs.push({candidate: left, control: right});
+  } else if (left) {
+    group.candidateOnly.push(left.run);
+  } else {
+    group.controlOnly.push(right.run);
+  }
 }
 
 const outputRows = [];
 
-for (const [workload, pairs] of byWorkload) {
+for (const [workload, group] of byWorkload) {
+  const pairs = group.pairs;
+
+  if (pairs.length < 3) {
+    throw new Error(`only ${pairs.length} paired runs for ${workload}`);
+  }
+
   const ratios = pairs.map(pair =>
     pair.candidate.requestsPerSecond / pair.control.requestsPerSecond);
   const bandwidthRatios = pairs.map(pair =>
@@ -165,7 +179,11 @@ for (const [workload, pairs] of byWorkload) {
     candidate: candidateLabel,
     control: controlLabel,
     workload,
+    candidateRuns: pairs.length + group.candidateOnly.length,
+    controlRuns: pairs.length + group.controlOnly.length,
     rawPairs: pairs.length,
+    unpairedCandidateRuns: group.candidateOnly.sort((a, b) => a - b),
+    unpairedControlRuns: group.controlOnly.sort((a, b) => a - b),
     retainedPairs: retained.length,
     rejectedPairs: rejected.length,
     rejected,

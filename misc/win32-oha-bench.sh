@@ -7,7 +7,7 @@ bench_scratch="$bench_repo/.git/benchmark-work"
 mkdir -p "$bench_scratch"
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-    echo "usage: $0 nginx.exe [iocp|select|poll] [label]" >&2
+    echo "usage: $0 nginx.exe [iocp|select|poll|wepoll] [label]" >&2
     exit 2
 fi
 
@@ -30,10 +30,14 @@ sendfile=${SENDFILE:-off}
 proxy_upstream=${BENCH_PROXY_UPSTREAM_URL:-}
 proxy_buffering=${BENCH_PROXY_BUFFERING:-off}
 proxy_keepalive=${BENCH_PROXY_KEEPALIVE:-64}
+memory_upstream_delay=${BENCH_MEMORY_UPSTREAM_DELAY_MS:-}
+memory_upstream_body=${BENCH_MEMORY_UPSTREAM_BODY_BYTES:-65536}
+connection_audit=${BENCH_CONNECTION_AUDIT:-0}
 master_process=${MASTER_PROCESS:-on}
 daemon=${DAEMON:-on}
 direct_quit=${BENCH_DIRECT_QUIT:-0}
 error_log_level=${ERROR_LOG_LEVEL:-notice}
+wepoll_edge=${WEPOLL_EDGE:-off}
 gprof_dir=${NGX_GPROF_DIR:-}
 msys_bash=${MSYS_BASH:-/usr/bin/bash}
 cmd_bin=${CMD_BIN:-$(command -v cmd.exe || true)}
@@ -45,8 +49,13 @@ cpu_gate_attempts=${CPU_GATE_ATTEMPTS:-120}
 cpu_gate_retry_delay=${CPU_GATE_RETRY_DELAY:-0}
 
 case "$backend" in
-    iocp|select|poll) ;;
+    iocp|select|poll|wepoll) ;;
     *) echo "unsupported event backend: $backend" >&2; exit 2 ;;
+esac
+
+case "$wepoll_edge" in
+    on|off) ;;
+    *) echo "WEPOLL_EDGE must be on or off" >&2; exit 2 ;;
 esac
 
 case "$sendfile" in
@@ -58,6 +67,25 @@ case "$proxy_buffering" in
     on|off) ;;
     *) echo "BENCH_PROXY_BUFFERING must be on or off" >&2; exit 2 ;;
 esac
+
+case "$connection_audit" in
+    0|1) ;;
+    *) echo "BENCH_CONNECTION_AUDIT must be 0 or 1" >&2; exit 2 ;;
+esac
+
+if [ -n "$memory_upstream_delay" ]; then
+    if [ -n "$proxy_upstream" ]; then
+        echo "BENCH_MEMORY_UPSTREAM_DELAY_MS and BENCH_PROXY_UPSTREAM_URL are mutually exclusive" >&2
+        exit 2
+    fi
+
+    if ! [[ "$memory_upstream_delay" =~ ^[0-9]+$ ]] \
+       || ! [[ "$memory_upstream_body" =~ ^[0-9]+$ ]]
+    then
+        echo "memory-upstream delay and body size must be non-negative integers" >&2
+        exit 2
+    fi
+fi
 
 if [ -n "$proxy_upstream" ]; then
     case "$proxy_upstream" in
@@ -151,7 +179,7 @@ wait_for_idle_cpu() {
     pass_streak=0
 
     for attempt in $(seq 1 "$cpu_gate_attempts"); do
-        sample=$(LC_ALL=C mpstat 1 2)
+        sample=$(LC_ALL=C mpstat 1 1)
         read -r linux_avg linux_max < <(
             awk '$2 == "all" {
                      used = 100 - $NF;
@@ -224,6 +252,14 @@ port=$(get_free_port)
 port_upstream=''
 health_url="http://127.0.0.1:$port/empty.gif"
 started=0
+upstream_started=0
+
+if [ -n "$memory_upstream_delay" ]; then
+    port_upstream=$(get_free_port)
+    proxy_upstream="http://127.0.0.1:$port_upstream/"
+    proxy_authority="127.0.0.1:$port_upstream"
+    proxy_path=/
+fi
 
 cleanup() {
     if [ "$started" -eq 1 ]; then
@@ -246,19 +282,77 @@ cleanup() {
                 wait "$starter_pid" 2>/dev/null || true
             fi
         fi
+
+        started=0
+    fi
+
+    if [ "$upstream_started" -eq 1 ]; then
+        curl -fsS --max-time 2 \
+            "http://127.0.0.1:$port_upstream/__shutdown" \
+            >/dev/null 2>&1 || true
+        wait "$upstream_pid" 2>/dev/null || true
+        upstream_started=0
+    fi
+
+    if [ -d "$prefix" ]; then
+        if [ "${prefix%/*}" = "$scratch_root" ]; then
+            case "${prefix##*/}" in
+                nginx-oha.??????)
+                    rm -rf -- "$prefix"
+                    return
+                    ;;
+            esac
+        fi
+
+        echo "refusing to remove unexpected scratch prefix: $prefix" >&2
     fi
 }
 
-trap cleanup EXIT INT TERM
+handle_signal() {
+    trap - EXIT INT TERM
+    cleanup
+    exit 130
+}
+
+trap cleanup EXIT
+trap handle_signal INT TERM
 
 mkdir -p "$prefix/logs" "$prefix/html" "$prefix/temp" "$prefix/control"
 truncate -s 1024 "$prefix/html/1k.bin"
 truncate -s 65536 "$prefix/html/64k.bin"
 truncate -s 1048576 "$prefix/html/1m.bin"
 
+if [ -n "$memory_upstream_delay" ]; then
+    WIN32_NODE_LOG="$prefix/logs/upstream.log" \
+      "$node_bin" "$script_dir/win32-memory-upstream.js" \
+        "$port_upstream" "$memory_upstream_delay" "$memory_upstream_body" \
+        >/dev/null &
+    upstream_pid=$!
+    upstream_started=1
+
+    for attempt in $(seq 1 100); do
+        if curl -fsS --max-time 1 \
+            "http://127.0.0.1:$port_upstream/__health" \
+            >/dev/null 2>&1
+        then
+            break
+        fi
+
+        if [ "$attempt" -eq 100 ]; then
+            echo "memory upstream did not become ready" >&2
+            exit 1
+        fi
+
+        sleep 0.05
+    done
+fi
+
 event_extra=''
 if [ "$backend" = iocp ]; then
     event_extra=$'    iocp_threads 1;\n    post_acceptex 32;'
+elif [ "$backend" = wepoll ]; then
+    event_extra=$(printf '    wepoll_events 512;\n    wepoll_edge %s;\n    wepoll_close_audit off;' \
+        "$wepoll_edge")
 fi
 
 cat >"$prefix/nginx.conf" <<EOF
@@ -347,8 +441,12 @@ metadata="$results_dir/$label.meta"
     printf 'proxy_upstream=%s\n' "$proxy_upstream"
     printf 'proxy_buffering=%s\n' "$proxy_buffering"
     printf 'proxy_keepalive=%s\n' "$proxy_keepalive"
+    printf 'memory_upstream_delay_ms=%s\n' "$memory_upstream_delay"
+    printf 'memory_upstream_body_bytes=%s\n' "$memory_upstream_body"
+    printf 'connection_audit=%s\n' "$connection_audit"
     printf 'master_process=%s\n' "$master_process"
     printf 'daemon=%s\n' "$daemon"
+    printf 'wepoll_edge=%s\n' "$wepoll_edge"
     printf 'gprof_dir=%s\n' "$gprof_dir"
     printf 'cpu_gate_linux_avg=%s\n' "$cpu_gate_linux_avg"
     printf 'cpu_gate_linux_max=%s\n' "$cpu_gate_linux_max"
@@ -397,14 +495,25 @@ for request_path in $paths; do
       "$node_bin" "$script_dir/win32-oha-runner.js" "$oha_win" \
         "http://127.0.0.1:$port$target_path" "$connections" \
         "$warmup_duration" "$prefix_win" "$result_win" "$backend" \
-        "$label-warmup" "$workload" "$client_processes" >/dev/null
+        "$label-warmup" "$workload" "$client_processes" 0 >/dev/null
+
+    if [ -n "$memory_upstream_delay" ]; then
+        curl -fsS --max-time 2 \
+            "http://127.0.0.1:$port_upstream/__reset" >/dev/null
+    fi
 
     wait_for_idle_cpu
     WIN32_NODE_LOG="$prefix/logs/node-$result_name-sample.log" \
       "$node_bin" "$script_dir/win32-oha-runner.js" "$oha_win" \
         "http://127.0.0.1:$port$target_path" "$connections" \
         "$duration" "$prefix_win" "$result_win" "$backend" "$label" \
-        "$workload" "$client_processes" >/dev/null
+        "$workload" "$client_processes" "$connection_audit" >/dev/null
+
+    if [ -n "$memory_upstream_delay" ]; then
+        curl -fsS --max-time 2 \
+            "http://127.0.0.1:$port_upstream/__stats" \
+            >"$results_dir/$label-$result_name-upstream.json"
+    fi
 
     cat "$result_file"
 done

@@ -14,8 +14,51 @@ if (!Number.isInteger(port) || port < 1 || port > 65535
 
 const body = Buffer.alloc(bodySize, 0x61);
 let closing = false;
+let activeRequests = 0;
+let maxActiveRequests = 0;
+let openConnections = 0;
+let maxOpenConnections = 0;
+let totalRequests = 0;
+
+function stats() {
+  return {
+    delayMs,
+    bodySize,
+    activeRequests,
+    maxActiveRequests,
+    openConnections,
+    maxOpenConnections,
+    totalRequests
+  };
+}
 
 const server = http.createServer((request, response) => {
+  if (request.url === '/__health') {
+    response.writeHead(200, {'Content-Length': '2'});
+    response.end('ok');
+    return;
+  }
+
+  if (request.url === '/__stats') {
+    const payload = Buffer.from(`${JSON.stringify(stats())}\n`);
+    response.writeHead(200, {
+      'Content-Length': String(payload.length),
+      'Content-Type': 'application/json',
+      'Connection': 'close'
+    });
+    response.end(payload);
+    return;
+  }
+
+  if (request.url === '/__reset') {
+    maxActiveRequests = 0;
+    maxOpenConnections = openConnections;
+    totalRequests = 0;
+    response.writeHead(200, {'Content-Length': '2'});
+    response.end('ok');
+    return;
+  }
+
   if (request.url === '/__shutdown') {
     response.writeHead(200, {
       'Content-Length': '2',
@@ -31,8 +74,24 @@ const server = http.createServer((request, response) => {
     return;
   }
 
+  activeRequests++;
+  totalRequests++;
+  maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+
+  let completed = false;
+  const complete = () => {
+    if (!completed) {
+      completed = true;
+      activeRequests--;
+    }
+  };
+
+  response.once('finish', complete);
+  response.once('close', complete);
+
   const respond = () => {
     if (closing) {
+      complete();
       return;
     }
 
@@ -49,6 +108,14 @@ const server = http.createServer((request, response) => {
   } else {
     respond();
   }
+});
+
+server.on('connection', socket => {
+  openConnections++;
+  maxOpenConnections = Math.max(maxOpenConnections, openConnections);
+  socket.once('close', () => {
+    openConnections--;
+  });
 });
 
 server.keepAliveTimeout = 30000;
