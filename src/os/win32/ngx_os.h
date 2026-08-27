@@ -27,6 +27,10 @@
 #define NGX_IOCP_DIRECT_SEND_MIN_SIZE  1024
 #endif
 
+#ifndef NGX_IOCP_TRY_SEND
+#define NGX_IOCP_TRY_SEND  1
+#endif
+
 #ifndef NGX_WIN32_GPROF
 #define NGX_WIN32_GPROF  0
 #endif

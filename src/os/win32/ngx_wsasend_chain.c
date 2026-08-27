@@ -223,6 +223,7 @@ ngx_chain_t *
 ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
 {
     int                           rc;
+    off_t                         sent_before;
     u_long                        expected, size, sent;
     ngx_err_t                     err;
     ngx_int_t                     trc;
@@ -306,6 +307,37 @@ ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
     if (limit == 0 || limit > NGX_IOCP_SEND_LIMIT) {
         limit = NGX_IOCP_SEND_LIMIT;
     }
+
+#if (NGX_IOCP_TRY_SEND)
+
+    /*
+     * Follow the libuv try-write pattern: avoid allocating an overlapped
+     * operation when a nonblocking scatter/gather send can make immediate
+     * progress.  Backpressure still falls through to a real IOCP send.
+     */
+    sent_before = c->sent;
+    cl = ngx_wsasend_chain(c, in, limit);
+
+    if (cl == NGX_CHAIN_ERROR || cl == NULL) {
+        return cl;
+    }
+
+    sent = (u_long) (c->sent - sent_before);
+    if ((off_t) sent >= limit) {
+        return cl;
+    }
+
+    in = cl;
+    limit -= sent;
+
+    /* ngx_wsasend_chain() clears ready after a partial send or EAGAIN. */
+    wev->ready = 1;
+
+#else
+
+    (void) sent_before;
+
+#endif
 
     pool = wev->iocp_pool ? wev->iocp_pool : c->pool;
 
