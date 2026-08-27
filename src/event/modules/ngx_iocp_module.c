@@ -826,6 +826,8 @@ ngx_iocp_read_notify_complete(ngx_iocp_op_t *op)
     rev->iocp_error = op->error;
     rev->active = 0;
     rev->ready = 1;
+    /* a zero-byte receive does not report the queued byte count */
+    rev->available = -1;
     rev->complete = 0;
 
     if (op->error) {
