@@ -37,6 +37,8 @@ typedef struct {
 static ngx_int_t ngx_iocp_chain_has_file(ngx_connection_t *c,
     ngx_chain_t *in, off_t limit);
 static ngx_chain_t *ngx_iocp_skip_empty(ngx_chain_t *in);
+static ngx_chain_t *ngx_wsasend_chain_internal(ngx_connection_t *c,
+    ngx_chain_t *in, off_t limit, ngx_uint_t stop_at_file);
 static void ngx_iocp_wsasend_chain_cleanup(ngx_iocp_op_t *base);
 static void ngx_iocp_transmit_cleanup(ngx_iocp_op_t *base);
 static ngx_int_t ngx_iocp_transmit_chain(ngx_connection_t *c,
@@ -51,6 +53,14 @@ static ngx_int_t ngx_iocp_send_file_buffer(ngx_connection_t *c,
 
 ngx_chain_t *
 ngx_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
+{
+    return ngx_wsasend_chain_internal(c, in, limit, 0);
+}
+
+
+static ngx_chain_t *
+ngx_wsasend_chain_internal(ngx_connection_t *c, ngx_chain_t *in, off_t limit,
+    ngx_uint_t stop_at_file)
 {
     int           rc;
     u_char       *prev;
@@ -122,6 +132,10 @@ ngx_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
 
             if (ngx_buf_special(cl->buf)) {
                 continue;
+            }
+
+            if (stop_at_file && cl->buf->in_file) {
+                break;
             }
 
             if (!ngx_buf_in_memory(cl->buf) || cl->buf->pos == NULL
@@ -308,6 +322,39 @@ ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
         limit = NGX_IOCP_SEND_LIMIT;
     }
 
+#if (NGX_IOCP_TRY_SEND)
+
+    /*
+     * Follow the libuv try-write pattern: avoid allocating an overlapped
+     * operation when a nonblocking scatter/gather send can make immediate
+     * progress.  Stop at a file buffer so it can continue to
+     * TransmitPackets or TransmitFile below.  Backpressure still falls
+     * through to a real IOCP send.
+     */
+    sent_before = c->sent;
+    cl = ngx_wsasend_chain_internal(c, in, limit, 1);
+
+    if (cl == NGX_CHAIN_ERROR || cl == NULL) {
+        return cl;
+    }
+
+    sent = (u_long) (c->sent - sent_before);
+    if ((off_t) sent >= limit) {
+        return cl;
+    }
+
+    in = cl;
+    limit -= sent;
+
+    /* The try-write helper clears ready after a partial send or EAGAIN. */
+    wev->ready = 1;
+
+#else
+
+    (void) sent_before;
+
+#endif
+
     pool = wev->iocp_pool ? wev->iocp_pool : c->pool;
 
     trc = ngx_iocp_chain_has_file(c, in, limit);
@@ -316,40 +363,6 @@ ngx_overlapped_wsasend_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
         wev->error = 1;
         return NGX_CHAIN_ERROR;
     }
-
-#if (NGX_IOCP_TRY_SEND)
-
-    /*
-     * Follow the libuv try-write pattern: avoid allocating an overlapped
-     * operation when a nonblocking scatter/gather send can make immediate
-     * progress.  Backpressure still falls through to a real IOCP send.
-     * File chains must continue to TransmitPackets or TransmitFile below.
-     */
-    if (trc == NGX_DECLINED) {
-        sent_before = c->sent;
-        cl = ngx_wsasend_chain(c, in, limit);
-
-        if (cl == NGX_CHAIN_ERROR || cl == NULL) {
-            return cl;
-        }
-
-        sent = (u_long) (c->sent - sent_before);
-        if ((off_t) sent >= limit) {
-            return cl;
-        }
-
-        in = cl;
-        limit -= sent;
-
-        /* ngx_wsasend_chain() clears ready after a partial send or EAGAIN. */
-        wev->ready = 1;
-    }
-
-#else
-
-    (void) sent_before;
-
-#endif
 
     if (trc == NGX_OK) {
         trc = ngx_iocp_transmit_chain(c, in, limit, pool);
