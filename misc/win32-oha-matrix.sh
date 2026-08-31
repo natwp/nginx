@@ -242,10 +242,19 @@ for mode in $modes; do
     compare_pair "$mode" wepoll-level-w1 iocp-w1
     compare_pair "$mode" wepoll-level-w1 select-w1
     compare_pair "$mode" wepoll-level-w1 poll-w1
+    compare_pair "$mode" wepoll-level-w4 iocp-w4
+    compare_pair "$mode" wepoll-level-w4 select-w4
+    compare_pair "$mode" wepoll-level-w4 poll-w4
+    compare_pair "$mode" wepoll-level-w4 wepoll-level-w1
     compare_pair "$mode" wepoll-edge-w1 iocp-w1
     compare_pair "$mode" wepoll-edge-w1 select-w1
     compare_pair "$mode" wepoll-edge-w1 poll-w1
+    compare_pair "$mode" wepoll-edge-w4 iocp-w4
+    compare_pair "$mode" wepoll-edge-w4 select-w4
+    compare_pair "$mode" wepoll-edge-w4 poll-w4
+    compare_pair "$mode" wepoll-edge-w4 wepoll-edge-w1
     compare_pair "$mode" wepoll-edge-w1 wepoll-level-w1
+    compare_pair "$mode" wepoll-edge-w4 wepoll-level-w4
 done
 
 echo "matrix results written to $results_root" >&2

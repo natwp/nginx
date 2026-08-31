@@ -6,7 +6,7 @@ repeatable measurements; unfinished experiments are marked pending.
 
 ## Method
 
-Measurements were collected on August 17–25, 2026, on a shared Windows
+Measurements were collected on August 17–27, 2026, on a shared Windows
 workstation with the benchmark driver running from WSL.  Candidate and control
 binaries were built from the same source revision with only the tested switch
 changed.  The historical isolated experiments used three two-second workload
@@ -37,6 +37,186 @@ The long validation runs additionally used
 wrapper converts script paths and writes each Windows Node result to a native
 file before the WSL filter reads it; this avoids the `EISDIR` stdout-handle
 behavior of Windows Node when a WSL pipe is inherited.
+
+## August 27, 2026 current IOCP source
+
+The current IOCP implementation is `d000c73ba`.  It includes the
+read-readiness fix `0182a46ca`, the libuv-style try-write change
+`c1b5f1c78`, and the file-prefix safety changes `83f2fe37f` and
+`d000c73ba`.  The final native executable is
+`.build-iocp-try-send-fd1024-prefix-final-20260827/nginx.exe`, SHA256
+`229bcb1712b4526e4e3235f22a2cff6330a7dc6068a7494ab3c50850664761a0`.
+The final wepoll-reference executable is
+`.build-wepoll-try-send-fd1024-filefix-20260827/nginx.exe`, SHA256
+`aa6edc52973178595eb15e4895cebc90e90114b4b8bc507913bf0e34baf89cb7`.
+Both were built with MinGW `-O2 -Werror`, `FD_SETSIZE=1024`, and
+`NGX_IOCP_DIRECT_SEND_MIN_SIZE=4096`.
+
+This is a hybrid IOCP path rather than a claim that every operation is a
+pure proactor.  A zero-byte `WSARecv()` notification tells the worker that a
+socket is readable; the worker drains immediately available bytes
+synchronously and records unknown notification byte counts as
+`available=-1`.  For writes, `ngx_overlapped_wsasend_chain()` first tries a
+nonblocking scatter/gather `WSASend()` over the leading memory-only prefix,
+in the same style as libuv's TCP try-write path.  It stops at the first file
+buffer so the remainder continues through `TransmitPackets()` or
+`TransmitFile()`.  A partial memory write or `WSAEWOULDBLOCK` falls through
+to a real overlapped `WSASend()`/IOCP completion, with the request pool
+retaining the buffers until completion.  This keeps the common writable
+loopback path out of operation allocation without removing the asynchronous
+backpressure or file-transmit paths.
+
+MinGW gprof measured the try-write effect at `c1b5f1c78`.  The read-fix
+control recorded 9,018
+requests, 209,075 `ngx_iocp_op_create()` calls, 187,057 send-side operation
+creations, and 374,111 send-chain calls.  The try-write candidate recorded
+21,041 requests, 50,542 total operation creations, 719 send-side operation
+creations, and 438,426 send-chain calls.  Normalized by request, send-side
+operation creation fell from 20.7426 to 0.0342 (99.835% fewer), while total
+operation creation fell from 23.18 to 2.40 (about 89.6% fewer).  The 719
+remaining send operations show that the overlapped fallback was exercised;
+these are call counts, not precise time percentages.  Reports are retained
+in `.codex-artifacts/iocp-gprof-read-available-worker-20260827.txt` and
+`.codex-artifacts/iocp-gprof-try-send-worker-20260827.txt`.
+
+The final file-prefix guard was then compared with the original try-write
+binary using six alternating, CPU-gated 64 KiB `sendfile off` pairs.  The
+filter retained four pairs and measured `-0.224%` request rate, `-0.224%`
+bandwidth, and `+0.0007` nginx CPU core for the final guard, with zero errors.
+That is neutral inside the documented 2% practical noise floor.  An exact-
+final `sendfile on` smoke served 8,763 64 KiB requests at 8,714.5 requests/s
+and 544.7 MiB/s with zero errors.  Compact final-source evidence is retained
+under `.codex-artifacts/iocp-final-source-20260827/`.
+
+The following fixed-load matrices used native
+`oha-windows-amd64-pgo.exe`, a CPU gate before every measured sample, a
+warm-up of at most 0.5 seconds, and the noise filter described above.  One-
+and four-worker rows use the same total client load and are compared only
+within their worker count.  CPU is aggregate nginx utilization in occupied
+logical cores.
+
+### Static 64 KiB response
+
+The static matrix used 128 keepalive connections, `sendfile off`, four raw
+rounds, a 0.3-second warm-up, and a 1.5-second sample.
+
+| Backend | Workers | Requests/s | MiB/s | nginx CPU cores |
+| --- | ---: | ---: | ---: | ---: |
+| IOCP | 1 | 9,112.7 | 569.5 | 1.0011 |
+| select | 1 | 9,360.6 | 585.0 | 0.9945 |
+| poll | 1 | 8,740.5 | 546.3 | 1.0027 |
+| IOCP | 4 | 19,195.6 | 1,199.7 | 3.4227 |
+| select | 4 | 14,904.7 | 931.5 | 2.6304 |
+| poll | 4 | 16,587.4 | 1,036.7 | 2.5355 |
+
+The retained same-round pair deltas were IOCP one worker versus select
+`-1.805%` and poll `-1.626%`; four-worker IOCP versus select was `+26.937%`
+and versus poll `+22.051%`.  Four-worker IOCP scaled `+114.337%` over its
+one-worker result.  Every retained row had zero errors.
+
+### Fast 64 KiB proxy response
+
+The fast proxy matrix used the in-memory upstream with zero delay, 128
+keepalive connections, proxy buffering off, six raw rounds, a 0.3-second
+warm-up, and a 1.5-second sample.
+
+| Backend | Workers | Requests/s | MiB/s | nginx CPU cores |
+| --- | ---: | ---: | ---: | ---: |
+| IOCP | 1 | 6,290.6 | 393.2 | 0.9798 |
+| select | 1 | 6,907.0 | 431.7 | 0.9467 |
+| poll | 1 | 7,812.5 | 488.3 | 0.9822 |
+| IOCP | 4 | 11,644.2 | 727.8 | 1.4559 |
+| select | 4 | 9,958.6 | 622.4 | 1.3949 |
+| poll | 4 | 11,498.3 | 718.6 | 1.6240 |
+
+The retained pair deltas were IOCP one worker versus select `+6.330%` and
+poll `-11.240%`; four-worker IOCP versus select was `+6.560%` and versus poll
+`-0.438%`.  Four-worker IOCP scaled `+80.372%` over one worker.  The
+one-worker IOCP condition had two noisy raw rounds rejected; the paired
+result above uses five of six same-round pairs and is the authoritative
+comparison under the documented filter.  All retained rows had zero errors.
+
+### Slow high-connection proxy response
+
+The slow proxy matrix used a 64 KiB in-memory upstream body delayed by 25 ms,
+proxy buffering off, 448 keepalive connections, four raw rounds, a 0.5-second
+warm-up, and a 2-second sample.
+
+| Backend | Workers | Requests/s | MiB/s | nginx CPU cores |
+| --- | ---: | ---: | ---: | ---: |
+| IOCP | 1 | 7,428.5 | 464.3 | 0.9964 |
+| select | 1 | 7,260.7 | 453.8 | 0.9859 |
+| poll | 1 | 6,738.2 | 421.1 | 0.9746 |
+| IOCP | 4 | 8,850.2 | 553.1 | 1.3927 |
+| select | 4 | 8,244.0 | 515.2 | 1.6503 |
+| poll | 4 | 8,731.5 | 545.7 | 1.7023 |
+
+The retained pair deltas were IOCP one worker versus select `-1.796%` and
+poll `+4.881%`; four-worker IOCP versus select was `+10.999%` and versus poll
+`-1.065%`.  Four-worker IOCP scaled `+21.985%` over one worker while using
+about 0.20 fewer nginx cores than select and 0.34 fewer than poll in the
+retained comparisons.  All retained rows had zero errors, and upstream stats
+confirmed that a delayed in-memory server rather than disk I/O was the proxy
+source.
+
+The compact filtered records are retained under
+`.codex-artifacts/iocp-try-send-static-matrix-20260827/`,
+`.codex-artifacts/iocp-try-send-fast-matrix-20260827/`, and
+`.codex-artifacts/iocp-try-send-fd1024-slow-matrix-20260827/`.
+
+### More-than-1,024 connection capacity
+
+A separate exact-final one-worker IOCP smoke used 2,048 keepalive
+connections, four native client processes, a 0.5-second warm-up, and a
+1.5-second sample.  The
+connection audit observed 2,048 established client sockets and 2,049 total
+server-side TCP rows, with zero request errors, 65,048.5 requests/s, and
+0.8876 occupied nginx cores.  Therefore `NGX_IOCP_MAX_ACCEPTS=1024` limits
+the number of preposted `AcceptEx` operations, not the number of live
+connections.  The compact record is under
+`.codex-artifacts/iocp-final-source-20260827/`.
+
+The repeatable current harness is committed as `902d45199`.  It records
+request rate, MiB/s, nginx CPU by role, optional TCP connection audits,
+in-memory upstream concurrency statistics, and unpaired rounds rather than
+silently treating missing samples as paired.  Successful runs remove only
+their validated `.git/benchmark-work/nginx-oha.XXXXXX` scratch directory from WSL.
+
+### Wepoll readiness reference
+
+For an external readiness reference, the try-write source was also rebuilt
+with the nginx module in `../wepoll-ex/nginx`, using the same `-O2`,
+`FD_SETSIZE=1024`, and direct-send threshold.  A compact static 64 KiB pass
+used 128 total connections, one- and four-worker IOCP and level-triggered
+wepoll conditions, five alternating rounds, a 0.2-second warm-up, and a
+one-second measured sample.  All raw runs completed with zero errors.
+
+The noise-aware paired result put level-triggered wepoll 4.675% behind native
+IOCP at one worker and 23.660% behind at four workers.  Native IOCP scaled
+99.262% from one to four workers; wepoll scaled 94.789%.  This is a reference
+comparison between different contracts: wepoll exposes readiness through an
+epoll-compatible AFD adapter, while native nginx IOCP uses zero-byte receive
+notification, synchronous drain/try-write fast paths, and overlapped fallback
+under backpressure.  Filtered records are under
+`.codex-artifacts/iocp-vs-wepoll-current-static-20260827/`.
+
+The final file-prefix refactor does not change wepoll's readiness contract:
+wepoll still calls the ordinary memory send-chain path, while only native
+IOCP requests the stop-at-file try-write behavior.  The final-source wepoll
+binary was rebuilt successfully with the hash recorded above.
+
+### Current performance conclusion
+
+The optimization is a large architectural improvement over the previous
+native IOCP implementation, but it does not make IOCP universally faster.
+At one worker, the retained matrices range from a 6.330% win over select in
+the fast proxy case to an 11.240% loss versus poll in that same case; static
+64 KiB is about 1.8% behind select and inside 2% of poll.  At four workers,
+IOCP is 6.560% to 26.937% ahead of select across the three main workloads,
+but ranges from 22.051% ahead of poll for static data to about 1% behind poll
+for fast and slow proxy traffic.  The evidence therefore supports keeping
+the IOCP architecture and its multi-worker path, not a claim that it wins
+every single-worker or readiness comparison.
 
 ## Completed isolated experiments
 
@@ -262,13 +442,17 @@ router data-copy candidate remains after the measured rollbacks above.  A
 future completion-suppression design would need new profiling evidence and
 must pass static, fast-proxy, slow-proxy, and churn gates before being kept.
 
-## Final Windows packages
+## Earlier Windows packages
 
 The August 25 release artifacts use source commit `2b41e6972`, GCC 16.1.0,
 PCRE2 10.47 with JIT, zlib 1.3.2, `FD_SETSIZE=1024`, and the profiled
 `NGX_IOCP_DIRECT_SEND_MIN_SIZE=4096` package override.  Both are stripped
 PE32+ x86-64 executables with high-entropy ASLR, ASLR, NX/DEP, and only
 Windows system DLL imports.
+
+These ZIPs predate the August 27 read-readiness and try-write changes.  They
+remain validated historical artifacts, but they are not packages of the
+current `d000c73ba` IOCP source.
 
 - Full: `nginx-1.31.4-win64-full-iocp-20260825`, statically linked with
   OpenSSL 3.6.3 and the requested HTTP SSL/2/3, mail, and stream modules.
