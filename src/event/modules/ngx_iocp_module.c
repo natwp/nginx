@@ -1294,10 +1294,16 @@ ngx_iocp_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
         return NGX_ERROR;
     }
 
+    /*
+     * GetQueuedCompletionStatusEx() has already removed every entry from the
+     * port, so an unusable entry must not abandon the rest of the batch: the
+     * remaining operations would never be completed again and would keep both
+     * their owner and ngx_iocp_pending references until shutdown.  Each entry
+     * is therefore reported and skipped independently.
+     */
+
     for (i = 0; i < events; i++) {
-        if (ngx_iocp_process_entry(cycle, &entries[i], flags) != NGX_OK) {
-            return NGX_ERROR;
-        }
+        (void) ngx_iocp_process_entry(cycle, &entries[i], flags);
     }
 
     return NGX_OK;
