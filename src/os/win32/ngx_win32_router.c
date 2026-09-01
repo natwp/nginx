@@ -238,7 +238,8 @@ static ngx_int_t ngx_win32_router_add_listener(ngx_cycle_t *cycle,
 static ngx_int_t ngx_win32_router_post_accept(
     ngx_win32_router_listener_t *listener);
 static ngx_int_t ngx_win32_router_post_udp_recv(
-    ngx_win32_router_listener_t *listener);
+    ngx_win32_router_listener_t *listener,
+    ngx_win32_router_udp_recv_t *op);
 static void ngx_win32_router_complete_accept(
     ngx_win32_router_accept_t *accept, DWORD bytes, ngx_err_t error);
 static void ngx_win32_router_complete_udp_recv(
@@ -1019,7 +1020,7 @@ ngx_win32_router_process_control(ngx_win32_router_control_t *control)
         for (i = 0; i < n; i++) {
             if ((listener->type == SOCK_STREAM
                  ? ngx_win32_router_post_accept(listener)
-                 : ngx_win32_router_post_udp_recv(listener)) != NGX_OK)
+                 : ngx_win32_router_post_udp_recv(listener, NULL)) != NGX_OK)
             {
                 goto failed;
             }
@@ -1503,21 +1504,42 @@ ngx_win32_router_post_accept(ngx_win32_router_listener_t *listener)
 
 
 static ngx_int_t
-ngx_win32_router_post_udp_recv(ngx_win32_router_listener_t *listener)
+ngx_win32_router_post_udp_recv(ngx_win32_router_listener_t *listener,
+    ngx_win32_router_udp_recv_t *op)
 {
     int                         rc;
     DWORD                       bytes;
     ngx_err_t                   error;
-    ngx_win32_router_udp_recv_t *op;
 
     if (!ngx_win32_router_udp_accepting) {
+        if (op) {
+            ngx_free(op);
+        }
+
         return NGX_OK;
     }
 
-    op = ngx_calloc(sizeof(ngx_win32_router_udp_recv_t),
-                    ngx_win32_router_log);
+    /*
+     * A receive operation embeds its own datagram and control buffers, so it
+     * is about 66 KB.  Reusing the completed operation for the replacement
+     * receive keeps that allocation, and the zeroing of those buffers, out of
+     * the per-datagram path; only the fields the next receive depends on are
+     * reset below.
+     */
+
     if (op == NULL) {
-        return NGX_ERROR;
+        op = ngx_calloc(sizeof(ngx_win32_router_udp_recv_t),
+                        ngx_win32_router_log);
+        if (op == NULL) {
+            return NGX_ERROR;
+        }
+
+    } else {
+        ngx_memzero(&op->op.overlapped, sizeof(OVERLAPPED));
+        ngx_memzero(&op->msg, sizeof(WSAMSG));
+        ngx_memzero(&op->remote, sizeof(ngx_sockaddr_t));
+        op->flags = 0;
+        op->recvmsg = 0;
     }
 
     op->op.type = NGX_WIN32_ROUTER_OP_UDP_RECV;
@@ -1639,13 +1661,11 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
     listener->pending--;
     ngx_win32_router_pending--;
 
-    if (ngx_win32_router_udp_accepting
-        && ngx_win32_router_post_udp_recv(listener) != NGX_OK)
-    {
-        ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
-                      "could not replenish routed UDP receives for %s",
-                      listener->addr_text);
-    }
+    /*
+     * The datagram is consumed before the replacement receive is posted so
+     * that this operation, and its embedded buffers, can be handed straight
+     * back to ngx_win32_router_post_udp_recv().
+     */
 
     if (error) {
         if (error != ERROR_OPERATION_ABORTED && error != WSAEMSGSIZE) {
@@ -1654,8 +1674,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
                           listener->addr_text);
         }
 
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     if (!ngx_win32_router_udp_accepting) {
@@ -1669,8 +1688,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
                       "routed UDP receive was truncated for %s",
                       listener->addr_text);
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     remote_socklen = op->recvmsg ? (socklen_t) op->msg.namelen
@@ -1682,8 +1700,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
                       "routed UDP receive returned an invalid peer for %s",
                       listener->addr_text);
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     ngx_memcpy(&local, &listener->sockaddr, listener->socklen);
@@ -1692,8 +1709,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
 
     if (listener->wildcard && op->recvmsg) {
         if (op->msg.Control.len > sizeof(op->control)) {
-            ngx_free(op);
-            return;
+            goto replenish;
         }
 
         ngx_memzero(&msg, sizeof(msg));
@@ -1732,13 +1748,19 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
                       "routed UDP receive returned no destination for %s",
                       listener->addr_text);
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     (void) ngx_win32_router_dispatch_udp(op, bytes, &local.sockaddr,
                                          local_socklen);
-    ngx_free(op);
+
+replenish:
+
+    if (ngx_win32_router_post_udp_recv(listener, op) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
+                      "could not replenish routed UDP receives for %s",
+                      listener->addr_text);
+    }
 }
 
 
