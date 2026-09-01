@@ -299,6 +299,8 @@ static ngx_win32_router_worker_t *ngx_win32_router_find_worker(
 static ngx_win32_router_worker_t *ngx_win32_router_find_quic_worker(
     ngx_uint_t slot, ngx_uint_t generation);
 static void ngx_win32_router_rebuild_ready_workers(void);
+static ngx_uint_t ngx_win32_router_worker_eligible(
+    ngx_win32_router_worker_t *worker);
 static ngx_win32_router_worker_t *ngx_win32_router_select_worker(
     uint32_t hash, ngx_uint_t round_robin);
 static void ngx_win32_router_expire_accepts(void);
@@ -3024,18 +3026,34 @@ ngx_win32_router_rebuild_ready_workers(void)
 }
 
 
+static ngx_uint_t
+ngx_win32_router_worker_eligible(ngx_win32_router_worker_t *worker)
+{
+    return worker->ready && worker->active
+           && worker->queued_messages < NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+           && worker->queued_bytes < NGX_WIN32_ROUTER_CHANNEL_LIMIT;
+}
+
+
 static ngx_win32_router_worker_t *
 ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
 {
-    ngx_uint_t                  i, n, start, target;
+    ngx_uint_t                  i, n, start;
     ngx_win32_router_worker_t  *best, *worker;
+
+    if (ngx_win32_router_ready_worker_n == 0) {
+        return NULL;
+    }
 
     if (round_robin) {
         best = NULL;
 
-        if (ngx_win32_router_ready_worker_n == 0) {
-            return NULL;
-        }
+        /*
+         * Accepted connections carry no affinity, so they go to the least
+         * loaded worker.  Rotating the starting point keeps equally loaded
+         * workers from all receiving the same connection, which matters
+         * while the queues are still empty.
+         */
 
         start = ngx_win32_router_next_worker++
                 % ngx_win32_router_ready_worker_n;
@@ -3044,11 +3062,7 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
             i = (start + n) % ngx_win32_router_ready_worker_n;
             worker = ngx_win32_router_ready_workers[i];
 
-            if (!worker->ready || !worker->active
-                || worker->queued_messages
-                   >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-                || worker->queued_bytes >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
-            {
+            if (!ngx_win32_router_worker_eligible(worker)) {
                 continue;
             }
 
@@ -3063,36 +3077,24 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
         return best;
     }
 
-    n = 0;
+    /*
+     * A datagram that starts a new flow is placed by hash so that the flow
+     * table, the QUIC route identifier, and this fallback all agree on an
+     * owner.  The hash is reduced modulo the whole ready set rather than
+     * modulo the eligible subset: using the eligible count would change the
+     * divisor whenever any worker hit its queue limit and would therefore
+     * remap every later flow onto a different worker.  Only the workers that
+     * are actually backlogged are skipped, by probing forward from the
+     * hashed position.
+     */
 
-    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
+    start = hash % ngx_win32_router_ready_worker_n;
+
+    for (n = 0; n < ngx_win32_router_ready_worker_n; n++) {
+        i = (start + n) % ngx_win32_router_ready_worker_n;
         worker = ngx_win32_router_ready_workers[i];
 
-        if (worker->ready && worker->active
-            && worker->queued_messages < NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-            && worker->queued_bytes < NGX_WIN32_ROUTER_CHANNEL_LIMIT)
-        {
-            n++;
-        }
-    }
-
-    if (n == 0) {
-        return NULL;
-    }
-
-    target = hash % n;
-
-    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
-        worker = ngx_win32_router_ready_workers[i];
-
-        if (!worker->ready || !worker->active
-            || worker->queued_messages >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-            || worker->queued_bytes >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
-        {
-            continue;
-        }
-
-        if (target-- == 0) {
+        if (ngx_win32_router_worker_eligible(worker)) {
             return worker;
         }
     }
