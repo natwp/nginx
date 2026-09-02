@@ -38,6 +38,54 @@ wrapper converts script paths and writes each Windows Node result to a native
 file before the WSL filter reads it; this avoids the `EISDIR` stdout-handle
 behavior of Windows Node when a WSL pipe is inherited.
 
+## September 1-2, 2026 correctness and router work
+
+Three changes landed after the August campaign.  All were built with MinGW
+`-O2 -Werror`, `FD_SETSIZE=1024`, and `NGX_IOCP_DIRECT_SEND_MIN_SIZE=4096`,
+and all benchmarks below ran from a ramdisk under the existing CPU gate.
+
+`8877cd2d0` stops `ngx_iocp_process_events()` from abandoning a completion
+batch.  `GetQueuedCompletionStatusEx()` has already removed every entry from
+the port, so returning `NGX_ERROR` on one unusable entry silently discarded
+up to 63 dequeued completions, each keeping its owner and `ngx_iocp_pending`
+references until shutdown; nothing observed the failure because
+`ngx_process_events_and_timers()` discards the return value.  Entries are now
+reported and skipped individually.  Validation: a two-worker lifecycle served
+129754 requests at 12978 req/s over 128 connections with reload under load and
+graceful quit, at a 100% success rate and with no alert, error,
+stale-operation, or shutdown drain message.
+
+`f1f4bcef4` makes routed UDP flow placement independent of backpressure.
+`ngx_win32_router_select_worker()` reduced the flow hash modulo the count of
+*eligible* workers, so one worker reaching its queue limit changed the divisor
+and remapped unrelated flows.  The hash is now reduced modulo the whole ready
+set, probing forward past backlogged workers.  An exhaustive check over 100000
+hashes with four ready workers showed the two forms agree on every hash while
+all workers are eligible, and that backlogging one worker remapped 50% of the
+unrelated flows before the change and none after it.
+
+`7ef90485d` recycles routed UDP receive operations.  Each datagram previously
+paid an `ngx_calloc()`, the zeroing, and the free of a ~66 KB operation, since
+the structure embeds a 65535-byte datagram buffer and a 512-byte control
+buffer.  The completion handler now consumes the datagram before posting the
+replacement receive and hands the same operation back, resetting only the
+overlapped structure, message header, peer address, flags, and recvmsg
+selector.  Measured at **+13.75%** request rate, 5/6 pairs retained, zero
+errors; reversing the candidate and control roles reproduced the win in the
+opposite direction at -6.09%.
+
+### Ordering bias in the paired UDP harness
+
+`misc/win32-udp-repeat.sh` alternates run order by repeat parity, so an odd
+`REPEATS` value leaves the candidate running second more often than first.
+That bias is worth roughly 3-4% on this workstation: the routing change above
+first measured -3.821% and -3.073% with the default `REPEATS=5`, even though
+an exhaustive check proves it cannot change placement in that workload.  With
+roles swapped and `REPEATS=6`, the same comparison returned +0.791%.  Use an
+even `REPEATS`, and confirm any accepted result by swapping the candidate and
+control roles.  Single-digit deltas recorded elsewhere in this document that
+used an odd repeat count may carry the same artifact.
+
 ## August 27, 2026 current IOCP source
 
 The current IOCP implementation is `d000c73ba`.  It includes the
@@ -246,9 +294,9 @@ every single-worker or readiness comparison.
 | 128-entry worker completion batch | 256-way keepalive, empty response | 7/7 | +3.689% | 7.648/7.725 ms | 10.533/10.653 ms | Rolled back after the connection-churn reversal. |
 | 128-entry worker completion batch | 256-way keepalive, 64 KiB file | 6/7 | +1.715% | 41.868/42.277 ms | 49.556/51.015 ms | Rolled back after the connection-churn reversal. |
 | 128-entry worker completion batch | 128-way connection churn | 4/7 | -7.047% | 13.324/12.757 ms | 40.837/37.773 ms | Rolled back; the existing 64-entry batch remains. |
-| 128-entry routed AcceptEx bookkeeping cache | 128-way connection churn | 5/7 | +11.337% | 13.189/14.157 ms | 36.289/67.924 ms | Kept. |
-| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, empty response | 7/7 | +0.645% | 7.170/7.250 ms | 8.160/8.612 ms | Kept. |
-| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, 64 KiB file | 6/7 | +1.906% | 37.575/38.224 ms | 42.086/44.741 ms | Kept. |
+| 128-entry routed AcceptEx bookkeeping cache | 128-way connection churn | 5/7 | +11.337% | 13.189/14.157 ms | 36.289/67.924 ms | Kept at the time, but absent from the current tree; see below. |
+| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, empty response | 7/7 | +0.645% | 7.170/7.250 ms | 8.160/8.612 ms | Kept at the time, but absent from the current tree; see below. |
+| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, 64 KiB file | 6/7 | +1.906% | 37.575/38.224 ms | 42.086/44.741 ms | Kept at the time, but absent from the current tree; see below. |
 | TLS write-notification handle cache | HTTPS, 16-way throttled 4 MiB response | 7/7 | +0.019% | 635.507/638.477 ms | 646.911/651.473 ms | Rolled back: throughput was neutral under backpressure. |
 | TLS write-notification handle cache | HTTPS, 64-way connection churn | 7/7 | -12.705% | 98.405/94.641 ms | 167.722/136.845 ms | Rolled back: handle reuse regressed handshake/churn latency. |
 
@@ -410,11 +458,22 @@ pool is held by the IOCP operation, so buffers handed directly to `WSASend()`
 remain alive until completion; smaller operations retain the explicit copy
 for short-response stability.
 
-The routed AcceptEx cache retains at most 128 completed bookkeeping objects.
-It never caches or reuses an accepted socket, an outstanding OVERLAPPED
-operation, or an object still awaiting a worker acknowledgement.  An object
-enters the cache only after its socket has been closed and its router queues
-have been unlinked.
+The routed AcceptEx cache is **not present in the current tree**.  It was
+measured and kept during the August campaign, then dropped by the
+`19c7ac777` router reset without a recorded decision; the rows above are
+retained because the measurement was real, not because the code survives.
+The implementation is still recoverable from `2214973ca`: a 128-entry free
+list where `ngx_win32_router_alloc_accept()` pops a cached object and
+`ngx_win32_router_finish_accept()` pushes one back after closing its
+socket.  Its safety rules were that it never cached or reused an accepted
+socket, an outstanding OVERLAPPED operation, or an object still awaiting a
+worker acknowledgement; an object entered the cache only after its socket
+had been closed and its router queues had been unlinked.  Restoring it
+requires re-porting onto the current router rather than reverting, and the
++11.337% churn result cannot currently be reproduced on this workstation:
+connection churn exhausts the 16384-port Windows ephemeral range and drives
+TIME_WAIT past 21000 sockets, so success rates collapse to 13-16% and the
+measurement characterizes the client rather than the server.
 
 The TLS wait-object experiment cached the `WSAEVENT` and thread-pool wait used
 by OpenSSL `WANT_WRITE` notifications.  A diagnostic run confirmed that the
