@@ -86,6 +86,94 @@ even `REPEATS`, and confirm any accepted result by swapping the candidate and
 control roles.  Single-digit deltas recorded elsewhere in this document that
 used an odd repeat count may carry the same artifact.
 
+### TCP regression check for the September changes
+
+The three changes above touch the IOCP dispatch loop and the routed UDP
+paths, so the TCP workloads were re-measured against the August control
+`.build-iocp-try-send-fd1024-prefix-final-20260827/nginx.exe`.  All runs used
+`misc/win32-oha-compare.sh` with `REPEATS=6`, four workers, the native
+`oha-windows-amd64-pgo.exe`, and the CPU gate.
+
+| Workload | Connections | Pairs retained | Request-rate delta | Errors |
+| --- | ---: | ---: | ---: | ---: |
+| Static 64 KiB | 64 | 4/6 | -2.153% | 0 |
+| Static 64 KiB, roles swapped | 64 | 5/6 | +1.186% | 0 |
+| Fast 64 KiB proxy, buffering off | 64 | 4/6 | +2.412% | 0 |
+| Slow 64 KiB proxy, 25 ms delay | 128 | 5/6 | +4.293% | 0 |
+
+No workload regressed.  The static row is the only negative number and it
+does not survive a role swap: reversing candidate and control moved it to
++1.186%, so both directions sit inside +-2.2% with opposite signs, which is
+noise rather than a deficit.  The per-round static rates make the same point
+directly: excluding one rejected 21% outlier, the remaining rounds scatter
+-0.5%, -3.8%, +6.6%, -0.5%, and -6.6% around zero.  Aggregate nginx CPU was
+also slightly *lower* for the candidate on the static workload (3.523 versus
+3.573 occupied cores).  HTTP/2 was not measured because these builds are
+configured without `ngx_http_v2_module`.
+
+### Connection churn is not measurable on this workstation
+
+An initial attempt to use `--disable-keepalive` churn for the regression
+check produced 13-96% success rates that looked like a candidate regression.
+It was not one: the control degraded identically when re-run, because churn
+drives TIME_WAIT past the 16384-entry Windows ephemeral port range
+(`netsh int ipv4 show dynamicport tcp` reports `Start 49152, Number 16384`),
+and the pool needs roughly 150 seconds to drain.  Any churn measurement taken
+before that drain characterizes port exhaustion in the client rather than the
+server.  Use keepalive workloads here, or drain the pool between runs.
+
+### Rejected September optimization candidates
+
+Four further candidates were built and measured; none is in the tree.
+
+The router pipe **write batching** candidate coalesced several queued
+channel messages into one `WriteFile()`.  The channel is a byte-mode pipe
+carrying length-prefixed messages and the worker reads to an exact byte
+count, so this needed no reader change.  It was rejected on engagement
+rather than on throughput: an instrumented build counted 1467 batched
+writes out of 412239 total (0.36%, averaging 2.6 messages per batch) at 64
+byte datagrams, falling to 0.06% at 1200 bytes.  The pipe drains faster
+than datagrams arrive, so the queue almost never holds a second message and
+the extra copy plus multi-message retirement logic buys nothing.
+
+A **128-entry worker completion batch** (`NGX_IOCP_BATCH=128`) was retried
+because the original rollback was driven by a connection-churn reversal
+that this workstation can no longer measure.  Six gated keepalive pairs
+returned -0.851% with 4/6 retained and CPU neutral at -0.007 cores, so the
+64-entry batch stands on its own merits, not only on the churn result.
+
+**Flow-key narrowing** hashed and compared only the populated key prefix,
+56 of 76 bytes for a tuple flow, since `cid[]` is zero for tuple flows and
+the remote address is zero for QUIC flows.  Six gated pairs with the native
+Windows client returned -0.130% with 5/6 retained: correct, but neutral,
+and not worth widening `ngx_win32_router_flow_key()`,
+`ngx_win32_router_find_flow()`, and `ngx_win32_router_set_flow()` by a
+length argument.
+
+**Accept-op recycling** in `ngx_event_acceptex_complete()` was left
+unmeasured.  It is the same alloc-and-free-per-event shape as the routed
+UDP receive, but the accept operation is small rather than ~66 KB, and it
+is only observable under the connection churn described above.
+
+### Where the routed UDP cost actually sits
+
+Per-process CPU accounting over an 8.5 second native-client UDP run put the
+router thread at 6.97 CPU seconds against 5.14 seconds for all four workers
+combined, so the router is **57.5% of nginx CPU** and about 0.82 of one
+core at roughly 43000 datagrams/s.  It is the bottleneck for routed UDP,
+and it is single-threaded by design.
+
+A gprof profile of that router, with instrumentation overhead excluded,
+attributes 64.3% of real work to the dispatch loop body itself,
+14.3% to `ngx_win32_router_find_flow()`, and 7.1% to `memcpy`.  Normalized
+per datagram the loop performs about 3.1 `ngx_alloc()` calls, 2.1
+`ngx_inet_get_port()` calls, and 1.0 `ngx_cmp_sockaddr()` call, the latter
+two from the `ngx_win32_router_find_udp_listener()` verification on the
+send path.  `find_flow` also refreshes an LRU deadline and moves two queue
+nodes on every lookup.  Any further routed-UDP work should target the
+dispatch loop and the flow lookup, not the copies: the copy-removal
+experiments recorded above were all measured and rejected.
+
 ## August 27, 2026 current IOCP source
 
 The current IOCP implementation is `d000c73ba`.  It includes the
