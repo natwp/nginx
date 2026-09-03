@@ -174,6 +174,42 @@ nodes on every lookup.  Any further routed-UDP work should target the
 dispatch loop and the flow lookup, not the copies: the copy-removal
 experiments recorded above were all measured and rejected.
 
+### Single-read channel framing, also rejected
+
+The profile above was then acted on directly.  The router read each worker
+message with two `ReadFile()` calls, a 16-byte header followed by the body,
+so a routed UDP response cost two pipe completions and one `ngx_alloc()`
+before its datagram was even sent.  The candidate replaced that with one
+speculative read into a per-worker buffer, parsing however many whole
+messages arrived, handling each in place with no allocation or copy, and
+retaining only a trailing partial message.  Two cheap items rode along: the
+listener port is precomputed at listener-add time instead of being read
+twice per datagram by `ngx_win32_router_listener_matches()`, and a flow
+deadline is refreshed at most once a minute instead of on every lookup.
+
+Progress is guaranteed because the buffer holds one maximum-sized message:
+a retained tail is at most `NGX_WIN32_CHANNEL_MAX_MESSAGE - 1` bytes, so the
+next read always requests at least one byte, and a validated length always
+fits.
+
+It did not pay.  Six gated pairs with the native Windows client measured
+-1.765% with 4/6 retained, and reversing the candidate and control roles
+returned +1.981% with 5/6 retained, so the result is noise with the sign
+following run order rather than the code.  Suspecting that a
+128 KiB overlapped `ReadFile()` was charging page-locking for a buffer that
+one queued message never fills, a second variant capped the request at 4096
+bytes; it measured -0.347% with 6/6 pairs retained, which is the cleanest
+run of the three and still neutral.
+
+Both variants were reverted.  The conclusion is that the two pipe reads per
+message were never the routed-UDP bottleneck: the read completion is
+already cheap relative to the rest of the dispatch loop, and removing one
+completion plus one allocation per message is not measurable at
+43000 datagrams/s.  The dispatch loop cost is dominated by the completion
+machinery itself rather than by the number of completions, so the remaining
+avenue for routed UDP is the single-threaded router design, not further
+micro-optimization inside it.
+
 ## August 27, 2026 current IOCP source
 
 The current IOCP implementation is `d000c73ba`.  It includes the
