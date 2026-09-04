@@ -115,6 +115,17 @@ ngx_http_degraded(ngx_http_request_t *r)
 
     if (dmcf->sbrk_size) {
 
+#if (NGX_WIN32)
+        /*
+         * sbrk() is not available on Windows. Memory-based degradation
+         * is not supported on this platform. The degrade directive
+         * should use other methods (e.g., load average via GetSystemTimes).
+         */
+        (void) log;
+        (void) now;
+        (void) sbrk_size;
+        (void) sbrk_time;
+#else
         log = 0;
         now = ngx_time();
 
@@ -145,6 +156,7 @@ ngx_http_degraded(ngx_http_request_t *r)
 
             return 1;
         }
+#endif
     }
 
     return 0;
