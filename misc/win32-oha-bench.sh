@@ -346,6 +346,9 @@ if [ -n "$memory_upstream_delay" ]; then
 fi
 
 event_extra=''
+if [ -n "${BENCH_ACCEPT_MUTEX:-}" ]; then
+    event_extra=$(printf '    accept_mutex %s;' "$BENCH_ACCEPT_MUTEX")
+fi
 if [ "$backend" = iocp ]; then
     event_extra=$'    iocp_threads 1;\n    post_acceptex 32;'
 elif [ "$backend" = wepoll ]; then

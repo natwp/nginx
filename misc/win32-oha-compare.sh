@@ -104,6 +104,7 @@ run_one() {
            OHA_WARMUP_DURATION="$warmup_duration" \
            OHA_DURATION="$sample_duration" \
            BENCH_HTTP2="${BENCH_HTTP2:-0}" \
+           BENCH_ACCEPT_MUTEX="${BENCH_ACCEPT_MUTEX:-}" \
            BENCH_HTTP_VERSION="${BENCH_HTTP_VERSION:-}" \
            BENCH_MEMORY_UPSTREAM_DELAY_MS="${BENCH_MEMORY_UPSTREAM_DELAY_MS:-}" \
            BENCH_MEMORY_UPSTREAM_BODY_BYTES="${BENCH_MEMORY_UPSTREAM_BODY_BYTES:-65536}" \
