@@ -108,8 +108,50 @@ noise rather than a deficit.  The per-round static rates make the same point
 directly: excluding one rejected 21% outlier, the remaining rounds scatter
 -0.5%, -3.8%, +6.6%, -0.5%, and -6.6% around zero.  Aggregate nginx CPU was
 also slightly *lower* for the candidate on the static workload (3.523 versus
-3.573 occupied cores).  HTTP/2 was not measured because these builds are
-configured without `ngx_http_v2_module`.
+3.573 occupied cores).  HTTP/2 is covered separately below.
+
+### HTTP/2 comparisons across backends are not meaningful
+
+An HTTP/2 build (`--with-http_v2_module`) was added and driven through the
+harness with `BENCH_HTTP2=1` and `BENCH_HTTP_VERSION=2`, using the same six
+CPU-gated rounds, four workers, and 64 connections as the HTTP/1.1 matrices.
+The one-worker rows are ordinary: IOCP measured `-2.804%` against select
+(6/6 pairs) and `-2.281%` against poll (5/6), matching the HTTP/1.1
+single-worker picture.
+
+The four-worker rows appear to show IOCP `+117.675%` over select and
+`+119.042%` over poll.  **Those two numbers do not measure the event
+method.**  On Windows, `ngx_event_process_init()` forces
+`ngx_use_accept_mutex` on for a multi-worker non-IOCP method and leaves it
+off for IOCP, so the select and poll conditions serialize their accepts
+while IOCP does not.  The per-condition CPU makes the artifact plain: at
+four workers select occupied 0.998 cores and poll 0.996, both essentially
+one core with five nginx processes present, against 3.376 cores for IOCP.
+Normalized per occupied core, select and poll are *ahead* of IOCP
+(8664 and 8737 requests/s/core versus 5616); they were simply prevented
+from using more than one core.  A connection audit confirmed 64 established
+client sockets on both sides, so this is not a connection-count artifact.
+
+The HTTP/1.1 multi-worker comparisons recorded above are not affected: with
+the router owning every listening socket, workers never call `accept()`
+themselves, so the accept mutex is not engaged for any backend.  The
+practical conclusion is that HTTP/2 multi-worker numbers may only be
+compared within one event method, and the useful HTTP/2 result is the
+one-worker row plus IOCP's own `+123.697%` one-to-four-worker scaling.
+
+### `sendfile on` uses TransmitPackets exclusively
+
+An instrumented build counted the branches of
+`ngx_iocp_transmit_chain()` and reported them when the worker exited.
+Serving a 64 MiB file with `sendfile on` recorded 6732
+`TransmitPackets()` calls, zero declines, and zero calls to either
+`TransmitFile()` or the read-into-buffer fallback; a 64 KiB run recorded
+42182 calls with the same zero declines.  `TransmitPackets()` therefore
+handles the whole static-file path on this platform, and the
+`TransmitFile()` and buffered-send branches exist only as fallbacks for
+hosts where the extension is unavailable.  The 64 MiB run sustained
+2.08 GiB/s from the ramdisk with zero errors, so there is no
+file-transmit overhead left to remove.
 
 ### Connection churn is not measurable on this workstation
 
