@@ -92,6 +92,7 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE
         ./objs/nginx.exe -V
+        mkdir -p logs
         ./objs/nginx.exe -t -p . -c conf/nginx.conf
 
     - name: Run release candidate tests
