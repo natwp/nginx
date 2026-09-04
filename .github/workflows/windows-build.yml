@@ -93,7 +93,8 @@ jobs:
         cd $GITHUB_WORKSPACE
         ./objs/nginx.exe -V
         mkdir -p logs
-        ./objs/nginx.exe -t -p . -c conf/nginx.conf
+        # Use -T to test config without binding to ports (which requires admin rights)
+        ./objs/nginx.exe -T -p . -c conf/nginx.conf > /dev/null
 
     - name: Run release candidate tests
       shell: pwsh
