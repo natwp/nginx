@@ -68,9 +68,8 @@ if [ $PCRE != NONE ]; then
 
 else
 
-    if [ "$NGX_PLATFORM" != win32 ]; then
-        PCRE=NO
-    fi
+    # Enable system PCRE detection on all platforms including Windows
+    PCRE=NO
 
     if [ $PCRE = NO -a $PCRE2 != DISABLED ]; then
 
