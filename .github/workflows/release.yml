@@ -39,8 +39,6 @@ jobs:
           --with-cc=gcc \
           --with-cc-opt="-O3 -flto -march=x86-64 -mtune=generic" \
           --with-ld-opt="-Wl,-s" \
-          --with-pcre \
-          --with-zlib \
           --prefix=/nginx \
           --sbin-path=/nginx/nginx.exe \
           --conf-path=/nginx/conf/nginx.conf \

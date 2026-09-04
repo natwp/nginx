@@ -56,8 +56,6 @@ jobs:
         ./auto/configure \
           --with-cc=gcc \
           --with-cpu-opt=generic \
-          --with-pcre \
-          --with-zlib \
           --builddir=objs \
           --with-http_ssl_module \
           --with-http_v2_module \

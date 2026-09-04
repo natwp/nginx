@@ -30,7 +30,7 @@ jobs:
       run: |
         # Install minimal dependencies for configure
         pacman -S --noconfirm mingw-w64-x86_64-pcre2 mingw-w64-x86_64-zlib || true
-        ./auto/configure --with-cc=gcc --with-debug --with-pcre --with-zlib 2>&1 | tee configure.log || echo "Configure may have warnings"
+        ./auto/configure --with-cc=gcc --with-debug 2>&1 | tee configure.log || echo "Configure may have warnings"
 
     - name: Check for configuration warnings
       shell: msys2 {0}

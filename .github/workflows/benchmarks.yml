@@ -40,8 +40,6 @@ jobs:
         ./auto/configure \
           --with-cc=gcc \
           --with-cc-opt="-O3" \
-          --with-pcre \
-          --with-zlib \
           --with-http_ssl_module \
           --with-http_v2_module \
           --with-stream \
