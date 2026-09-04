@@ -1,0 +1,72 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ master, 'fix/**', 'feature/**' ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  lint:
+    name: Check Code Quality
+    runs-on: windows-2022
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+
+    - name: Run configure to generate files
+      shell: msys2 {0}
+      run: |
+        ./auto/configure --with-cc=gcc --with-debug 2>&1 | tee configure.log
+
+    - name: Check for configuration warnings
+      shell: msys2 {0}
+      run: |
+        if grep -i "warning" configure.log; then
+          echo "⚠️ Configuration warnings found"
+        else
+          echo "✓ No configuration warnings"
+        fi
+
+    - name: Verify Windows-specific files
+      shell: pwsh
+      run: |
+        Write-Host "Checking Windows port files..."
+        $files = @(
+          "src/os/win32/ngx_process.c",
+          "src/os/win32/ngx_process.h",
+          "src/event/modules/ngx_iocp_module.c",
+          "src/event/modules/ngx_iocp_module.h",
+          "docs/win32.md"
+        )
+        
+        foreach ($file in $files) {
+          if (Test-Path $file) {
+            Write-Host "✓ $file exists"
+          } else {
+            Write-Host "✗ $file missing"
+            exit 1
+          }
+        }
+
+    - name: Check documentation
+      shell: pwsh
+      run: |
+        Write-Host "Checking documentation files..."
+        if (Test-Path "docs/win32.md") {
+          $content = Get-Content "docs/win32.md" -Raw
+          if ($content -match "iocp") {
+            Write-Host "✓ IOCP documentation present"
+          }
+        }
