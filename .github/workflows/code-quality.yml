@@ -24,12 +24,13 @@ jobs:
           base-devel
           mingw-w64-x86_64-gcc
           mingw-w64-x86_64-make
+          mingw-w64-x86_64-pcre2
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-pkg-config
 
     - name: Run configure to generate files
       shell: msys2 {0}
       run: |
-        # Install minimal dependencies for configure
-        pacman -S --noconfirm mingw-w64-x86_64-pcre2 mingw-w64-x86_64-zlib || true
         ./auto/configure --with-cc=gcc --with-debug 2>&1 | tee configure.log || echo "Configure may have warnings"
 
     - name: Check for configuration warnings

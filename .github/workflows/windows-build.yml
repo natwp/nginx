@@ -40,6 +40,7 @@ jobs:
           mingw-w64-x86_64-pcre2
           mingw-w64-x86_64-zlib
           mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-pkg-config
 
     - name: Build nginx with MinGW
       shell: msys2 {0}
