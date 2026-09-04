@@ -159,6 +159,11 @@ run_one() {
            WEPOLL_EDGE="$wepoll_edge" \
            OHA_WARMUP_DURATION="$warmup_duration" \
            OHA_DURATION="$sample_duration" \
+           BENCH_HTTP2="${BENCH_HTTP2:-0}" \
+           BENCH_HTTP_VERSION="${BENCH_HTTP_VERSION:-}" \
+           BENCH_MEMORY_UPSTREAM_DELAY_MS="${BENCH_MEMORY_UPSTREAM_DELAY_MS:-}" \
+           BENCH_MEMORY_UPSTREAM_BODY_BYTES="${BENCH_MEMORY_UPSTREAM_BODY_BYTES:-65536}" \
+           BENCH_PROXY_BUFFERING="${BENCH_PROXY_BUFFERING:-off}" \
            "$script_dir/win32-oha-bench.sh" "$binary" "$backend" \
                "$run_label" >"$attempt_dir/driver.stdout" \
                2>"$attempt_dir/driver.stderr" \

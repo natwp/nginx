@@ -6,7 +6,7 @@ const processCpu = require('./win32-process-cpu');
 
 const [ohaPath, url, connectionsText, durationText, nginxPrefix,
   outputPath, backend, label, workload, clientProcessesText = '1',
-  connectionAuditText = '0'] =
+  connectionAuditText = '0', httpVersionText = ''] =
   process.argv.slice(2);
 
 if (!ohaPath || !url || !connectionsText || !durationText || !nginxPrefix
@@ -14,7 +14,7 @@ if (!ohaPath || !url || !connectionsText || !durationText || !nginxPrefix
   throw new Error(
     'usage: win32-oha-runner.js oha.exe url connections duration '
     + 'nginx-prefix output [backend] [label] [workload] [client-processes] '
-    + '[connection-audit]'
+    + '[connection-audit] [http-version]'
   );
 }
 
@@ -93,6 +93,7 @@ function spawnOha(clientConnections) {
     '--no-tui',
     '--output-format', 'json',
     '--ipv4',
+    ...(httpVersionText ? ['--http-version', httpVersionText] : []),
     url
   ], {
     windowsHide: true,

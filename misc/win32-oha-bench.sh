@@ -34,6 +34,8 @@ daemon=${DAEMON:-on}
 direct_quit=${BENCH_DIRECT_QUIT:-0}
 error_log_level=${ERROR_LOG_LEVEL:-notice}
 wepoll_edge=${WEPOLL_EDGE:-off}
+http_version=${BENCH_HTTP_VERSION:-}
+http2_listen=${BENCH_HTTP2:-0}
 gprof_dir=${NGX_GPROF_DIR:-}
 msys_bash=${MSYS_BASH:-/usr/bin/bash}
 cmd_bin=${CMD_BIN:-$(command -v cmd.exe || true)}
@@ -386,6 +388,15 @@ fi
 cat >>"$prefix/nginx.conf" <<EOF
     server {
         listen 127.0.0.1:$port;
+EOF
+
+if [ "$http2_listen" = 1 ]; then
+    cat >>"$prefix/nginx.conf" <<EOF
+        http2 on;
+EOF
+fi
+
+cat >>"$prefix/nginx.conf" <<EOF
         location = /empty.gif { empty_gif; }
 EOF
 
@@ -491,7 +502,8 @@ for request_path in $paths; do
       "$node_bin" "$script_dir/win32-oha-runner.js" "$oha_win" \
         "http://127.0.0.1:$port$target_path" "$connections" \
         "$warmup_duration" "$prefix_win" "$result_win" "$backend" \
-        "$label-warmup" "$workload" "$client_processes" 0 >/dev/null
+        "$label-warmup" "$workload" "$client_processes" 0 \
+        "$http_version" >/dev/null
 
     if [ -n "$memory_upstream_delay" ]; then
         curl -fsS --max-time 2 \
@@ -503,7 +515,8 @@ for request_path in $paths; do
       "$node_bin" "$script_dir/win32-oha-runner.js" "$oha_win" \
         "http://127.0.0.1:$port$target_path" "$connections" \
         "$duration" "$prefix_win" "$result_win" "$backend" "$label" \
-        "$workload" "$client_processes" "$connection_audit" >/dev/null
+        "$workload" "$client_processes" "$connection_audit" \
+        "$http_version" >/dev/null
 
     if [ -n "$memory_upstream_delay" ]; then
         curl -fsS --max-time 2 \
