@@ -148,12 +148,39 @@ function Wait-Workers([string] $Prefix, [int] $MasterId, [int] $Expected,
 
 function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 30) {
     Write-Host "  Attempting HTTPS connection to https://127.0.0.1:$Port/" -ForegroundColor Yellow
+
+    # Try curl first if available (more reliable with self-signed certs)
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        Write-Host "  Using curl for HTTPS test" -ForegroundColor Yellow
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        do {
+            try {
+                $body = & curl.exe -k -s -m 2 "https://127.0.0.1:$Port/"
+                if ($LASTEXITCODE -eq 0 -and $body -eq $Expected) {
+                    Write-Host "  HTTPS response received via curl: '$body'" -ForegroundColor Green
+                    return
+                }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "  curl failed with exit code $LASTEXITCODE" -ForegroundColor DarkYellow
+                } elseif ($body -ne $Expected) {
+                    Write-Host "  Response mismatch: got '$body', expected '$Expected'" -ForegroundColor Red
+                }
+            } catch {
+                Write-Host "  curl exception: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            }
+            Start-Sleep -Milliseconds 500
+        } while ((Get-Date) -lt $deadline)
+        throw "HTTPS backend on port $Port did not return '$Expected' (curl method)"
+    }
+
+    # Fallback to WebClient
     $oldCallback = [Net.ServicePointManager]::ServerCertificateValidationCallback
     $oldProtocol = [Net.ServicePointManager]::SecurityProtocol
     $lastError = $null
     try {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
         $deadline = (Get-Date).AddSeconds($TimeoutSec)
         do {
             try {
