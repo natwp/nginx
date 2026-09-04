@@ -46,7 +46,7 @@ jobs:
           --with-http_v2_module \
           --with-stream \
           --with-stream_ssl_module
-        
+
         make -j$(nproc)
 
     - name: Install Node.js for benchmark tools

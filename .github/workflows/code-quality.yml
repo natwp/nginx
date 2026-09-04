@@ -28,13 +28,18 @@ jobs:
     - name: Run configure to generate files
       shell: msys2 {0}
       run: |
-        ./auto/configure --with-cc=gcc --with-debug 2>&1 | tee configure.log
+        # Install minimal dependencies for configure
+        pacman -S --noconfirm mingw-w64-x86_64-pcre2 mingw-w64-x86_64-zlib || true
+        ./auto/configure --with-cc=gcc --with-debug --with-pcre --with-zlib 2>&1 | tee configure.log || echo "Configure may have warnings"
 
     - name: Check for configuration warnings
       shell: msys2 {0}
       run: |
-        if grep -i "warning" configure.log; then
-          echo "⚠️ Configuration warnings found"
+        if grep -i "error" configure.log; then
+          echo "❌ Configuration errors found"
+          exit 1
+        elif grep -i "warning" configure.log; then
+          echo "⚠️ Configuration warnings found (non-fatal)"
         else
           echo "✓ No configuration warnings"
         fi
