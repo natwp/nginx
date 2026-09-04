@@ -36,6 +36,8 @@ error_log_level=${ERROR_LOG_LEVEL:-notice}
 wepoll_edge=${WEPOLL_EDGE:-off}
 http_version=${BENCH_HTTP_VERSION:-}
 http2_listen=${BENCH_HTTP2:-0}
+disable_keepalive=${BENCH_DISABLE_KEEPALIVE:-0}
+query_rate=${BENCH_QUERY_RATE:-}
 gprof_dir=${NGX_GPROF_DIR:-}
 msys_bash=${MSYS_BASH:-/usr/bin/bash}
 cmd_bin=${CMD_BIN:-$(command -v cmd.exe || true)}
@@ -506,7 +508,7 @@ for request_path in $paths; do
         "http://127.0.0.1:$port$target_path" "$connections" \
         "$warmup_duration" "$prefix_win" "$result_win" "$backend" \
         "$label-warmup" "$workload" "$client_processes" 0 \
-        "$http_version" >/dev/null
+        "$http_version" "$disable_keepalive" "$query_rate" >/dev/null
 
     if [ -n "$memory_upstream_delay" ]; then
         curl -fsS --max-time 2 \
@@ -519,7 +521,7 @@ for request_path in $paths; do
         "http://127.0.0.1:$port$target_path" "$connections" \
         "$duration" "$prefix_win" "$result_win" "$backend" "$label" \
         "$workload" "$client_processes" "$connection_audit" \
-        "$http_version" >/dev/null
+        "$http_version" "$disable_keepalive" "$query_rate" >/dev/null
 
     if [ -n "$memory_upstream_delay" ]; then
         curl -fsS --max-time 2 \
