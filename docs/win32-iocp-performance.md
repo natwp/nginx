@@ -139,6 +139,39 @@ practical conclusion is that HTTP/2 multi-worker numbers may only be
 compared within one event method, and the useful HTTP/2 result is the
 one-worker row plus IOCP's own `+123.697%` one-to-four-worker scaling.
 
+Every multi-worker select and poll figure recorded elsewhere in this
+document predates `0989c3c68`, so all of them serialized their accepts and
+understate those two methods.  The historical rows are left as measured; do
+not compare them against numbers taken after that commit.
+
+### The forced accept mutex cost select about 30%
+
+Investigating the artifact above showed that the serialization was not a
+property of the select and poll methods but an unconditional override in
+`ngx_event_process_init()`, which ignored the `accept_mutex` directive and
+warned that the method "does not support" turning it off.  `0989c3c68`
+honors the directive.
+
+A probe build was compared with the override still in place, using four
+select workers, 64 connections, the 64 KiB static workload, and six
+CPU-gated rounds.  Honoring the directive measured **+32.655%** with 4/6
+pairs retained; reversing the candidate and control roles returned
+`-25.855%` with 4/6 retained, so both directions agree.  Occupied nginx CPU
+rose from 1.979 to 3.553 cores, which is where the throughput came from:
+serialized accept left about 1.6 cores idle.
+
+Because a paired comparison alone cannot show that concurrent accept is
+safe, the concurrent path also ran a two-minute lifecycle soak: 2521983
+requests at 19399 req/s over 128 connections, two reloads under sustained
+load, and a graceful quit, at a 100% success rate.  Every old worker exited
+with code 0 and the log contained no alert, crit, emerg, stale-operation, or
+shutdown drain message.  Setting `accept_mutex on` still serializes and
+still measures the lower rate, and IOCP is unaffected either way.
+
+The unmeasured case is connection churn, where accept contention would be
+highest.  This workstation cannot benchmark it for the reason given above,
+so the change is accepted on steady-state and reload evidence only.
+
 ### `sendfile on` uses TransmitPackets exclusively
 
 An instrumented build counted the branches of
@@ -166,7 +199,7 @@ server.  Use keepalive workloads here, or drain the pool between runs.
 
 ### Rejected September optimization candidates
 
-Four further candidates were built and measured; none is in the tree.
+Five further candidates were built and measured; none is in the tree.
 
 The router pipe **write batching** candidate coalesced several queued
 channel messages into one `WriteFile()`.  The channel is a byte-mode pipe
@@ -196,6 +229,18 @@ length argument.
 unmeasured.  It is the same alloc-and-free-per-event shape as the routed
 UDP receive, but the accept operation is small rather than ~66 KB, and it
 is only observable under the connection churn described above.
+
+The **routed AcceptEx bookkeeping cache** was recovered from `2214973ca`
+and re-ported onto the current router: a 128-entry free list where
+`ngx_win32_router_alloc_accept()` pops a cached object and
+`ngx_win32_router_finish_accept()` pushes one back after closing its socket.
+Six gated pairs on the 256-connection keepalive empty response measured
+`-1.104%` with 4/6 retained, and swapping the roles returned `-1.442%` with
+5/6, with CPU neutral at 1.388 versus 1.421 cores.  Both directions are
+negative and inside the noise floor, which matches the historical `+0.645%`
+keepalive row being sub-noise as well.  The `+11.337%` churn row that
+originally justified the cache remains unverified rather than disproven, for
+the port-exhaustion reason above, so the cache stays out of the tree.
 
 ### Where the routed UDP cost actually sits
 
@@ -634,12 +679,13 @@ list where `ngx_win32_router_alloc_accept()` pops a cached object and
 socket.  Its safety rules were that it never cached or reused an accepted
 socket, an outstanding OVERLAPPED operation, or an object still awaiting a
 worker acknowledgement; an object entered the cache only after its socket
-had been closed and its router queues had been unlinked.  Restoring it
-requires re-porting onto the current router rather than reverting, and the
-+11.337% churn result cannot currently be reproduced on this workstation:
-connection churn exhausts the 16384-port Windows ephemeral range and drives
-TIME_WAIT past 21000 sockets, so success rates collapse to 13-16% and the
-measurement characterizes the client rather than the server.
+had been closed and its router queues had been unlinked.  It was re-ported
+and measured in September; see the rejected-candidates section above, where
+both role orders came out negative and inside the noise floor on keepalive.
+The +11.337% churn result cannot currently be reproduced on this
+workstation: connection churn exhausts the 16384-port Windows ephemeral
+range and drives TIME_WAIT past 21000 sockets, so success rates collapse to
+13-16% and the measurement characterizes the client rather than the server.
 
 The TLS wait-object experiment cached the `WSAEVENT` and thread-pool wait used
 by OpenSSL `WANT_WRITE` notifications.  A diagnostic run confirmed that the
