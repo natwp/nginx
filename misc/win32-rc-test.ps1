@@ -149,6 +149,7 @@ function Wait-Workers([string] $Prefix, [int] $MasterId, [int] $Expected,
 function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
     $oldCallback = [Net.ServicePointManager]::ServerCertificateValidationCallback
     $oldProtocol = [Net.ServicePointManager]::SecurityProtocol
+    $lastError = $null
     try {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -162,10 +163,15 @@ function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
                     return
                 }
             } catch {
+                $lastError = $_
                 Start-Sleep -Milliseconds 200
             }
         } while ((Get-Date) -lt $deadline)
-        throw "HTTPS backend on port $Port did not return '$Expected'"
+        $errorMsg = "HTTPS backend on port $Port did not return '$Expected'"
+        if ($lastError) {
+            $errorMsg += ". Last error: $($lastError.Exception.Message)"
+        }
+        throw $errorMsg
     } finally {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCallback
         [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
