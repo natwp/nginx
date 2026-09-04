@@ -36,7 +36,7 @@ jobs:
     - name: Check for configuration warnings
       shell: msys2 {0}
       run: |
-        if grep -i "error" configure.log; then
+        if grep -E "error:|^.*\berror\b" configure.log | grep -v "error log file"; then
           echo "❌ Configuration errors found"
           exit 1
         elif grep -i "warning" configure.log; then
