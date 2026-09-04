@@ -132,17 +132,24 @@ Normalized per occupied core, select and poll are *ahead* of IOCP
 from using more than one core.  A connection audit confirmed 64 established
 client sockets on both sides, so this is not a connection-count artifact.
 
-The HTTP/1.1 multi-worker comparisons recorded above are not affected: with
-the router owning every listening socket, workers never call `accept()`
-themselves, so the accept mutex is not engaged for any backend.  The
-practical conclusion is that HTTP/2 multi-worker numbers may only be
-compared within one event method, and the useful HTTP/2 result is the
-one-worker row plus IOCP's own `+123.697%` one-to-four-worker scaling.
+The HTTP/1.1 IOCP rows recorded above are not affected: the router owns
+every IOCP listening socket, so an IOCP worker never calls `accept()` and
+never engaged this mutex.  The HTTP/1.1 select and poll rows are affected in
+the same way as the HTTP/2 ones, because `ngx_win32_router_required()` gates
+the router on `ecf->use == ngx_iocp_module.ctx_index` and those methods
+therefore accept in the workers.  The practical conclusion is that HTTP/2
+multi-worker numbers may only be compared within one event method, and the
+useful HTTP/2 result is the one-worker row plus IOCP's own `+123.697%`
+one-to-four-worker scaling.
 
 Every multi-worker select and poll figure recorded elsewhere in this
 document predates `0989c3c68`, so all of them serialized their accepts and
-understate those two methods.  The historical rows are left as measured; do
-not compare them against numbers taken after that commit.
+understate those two methods.  That includes the three HTTP/1.1 backend
+matrices, whose four-worker IOCP-versus-select and IOCP-versus-poll deltas
+are consequently overstated by an unmeasured amount; the `+26.937%` static
+figure is the one most likely to shrink.  The historical rows are left as
+measured; do not compare them against numbers taken after that commit, and
+re-run any comparison that matters.
 
 ### The forced accept mutex cost select about 30%
 
