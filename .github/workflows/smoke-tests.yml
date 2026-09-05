@@ -120,8 +120,8 @@ jobs:
           '    }' \
           '}' > startup-test.conf
 
-        # Start nginx in background
-        ./objs/nginx.exe -c startup-test.conf
+        # Start nginx in background with -p prefix
+        ./objs/nginx.exe -p ./ -c startup-test.conf
         sleep 3
 
         # Check if nginx is running by looking for the pid file
@@ -135,15 +135,15 @@ jobs:
             echo "⚠ Nginx started but not responding (this is acceptable for smoke test)"
           fi
 
-          # Graceful shutdown
-          ./objs/nginx.exe -s quit -c startup-test.conf
+          # Graceful shutdown with -p prefix
+          ./objs/nginx.exe -p ./ -s quit -c startup-test.conf
           sleep 2
 
           if [ ! -f logs/nginx.pid ] || ! kill -0 $(cat logs/nginx.pid) 2>/dev/null; then
             echo "✓ Nginx stopped successfully"
           else
             echo "⚠ Nginx may still be running, forcing stop"
-            ./objs/nginx.exe -s stop -c startup-test.conf 2>/dev/null || true
+            ./objs/nginx.exe -p ./ -s stop -c startup-test.conf 2>/dev/null || true
           fi
         else
           echo "✗ Nginx failed to start - no PID file"
@@ -159,8 +159,8 @@ jobs:
       shell: msys2 {0}
       run: |
         # Force stop any remaining nginx processes
-        ./objs/nginx.exe -s stop -c startup-test.conf 2>/dev/null || true
-        ./objs/nginx.exe -s stop -c test-config.conf 2>/dev/null || true
+        ./objs/nginx.exe -p ./ -s stop -c startup-test.conf 2>/dev/null || true
+        ./objs/nginx.exe -p ./ -s stop -c test-config.conf 2>/dev/null || true
         sleep 1
 
     - name: Upload logs on failure
