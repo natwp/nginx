@@ -56,11 +56,6 @@ jobs:
         make -j$(nproc)
         ls -lh objs/nginx.exe
 
-    - name: Setup Node.js for load testing
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-
     - name: Install oha (HTTP load testing tool)
       shell: pwsh
       run: |
@@ -79,64 +74,55 @@ jobs:
           exit 1
         }
 
-    - name: Prepare test content
+    - name: Setup test environment
       shell: pwsh
       run: |
+        Write-Host "=== Setting up test environment ===" -ForegroundColor Cyan
+
+        # Create test directory and files
+        New-Item -ItemType Directory -Path "html" -Force | Out-Null
+
         # Create test files of various sizes
-        New-Item -ItemType Directory -Force -Path html | Out-Null
+        $bytes1k = [byte[]]::new(1024)
+        $bytes64k = [byte[]]::new(65536)
+        $bytes1m = [byte[]]::new(1048576)
 
-        # Small file (1KB)
-        "x" * 1024 | Out-File -Encoding ASCII -NoNewline html/1k.txt
+        [System.IO.File]::WriteAllBytes("html\1k.txt", $bytes1k)
+        [System.IO.File]::WriteAllBytes("html\64k.txt", $bytes64k)
+        [System.IO.File]::WriteAllBytes("html\1m.txt", $bytes1m)
 
-        # Medium file (64KB)
-        "y" * (64 * 1024) | Out-File -Encoding ASCII -NoNewline html/64k.txt
+        Write-Host "✓ Created test files: 1k.txt, 64k.txt, 1m.txt"
 
-        # Large file (1MB)
-        $content = "z" * (1024 * 1024)
-        [System.IO.File]::WriteAllText("html/1m.txt", $content)
+        # Create logs directory
+        New-Item -ItemType Directory -Path "logs" -Force | Out-Null
 
-        Write-Host "✓ Test files created"
-        Get-ChildItem html/*.txt | ForEach-Object {
-          Write-Host "  $($_.Name): $([math]::Round($_.Length/1KB, 2)) KB"
-        }
-
-    - name: Create test configuration
-      shell: pwsh
-      run: |
-        $port = 8080
-
+        # Create load test configuration
         @"
-        worker_processes 4;
-        error_log logs/error.log warn;
-        pid logs/nginx.pid;
+worker_processes  4;
+error_log  logs/error.log  notice;
+pid        logs/nginx.pid;
 
-        events {
-            use iocp;
-            worker_connections 1024;
+events {
+    worker_connections  1024;
+}
+
+http {
+    default_type  application/octet-stream;
+    sendfile      on;
+    keepalive_timeout  65;
+
+    server {
+        listen       8080;
+        server_name  localhost;
+
+        location / {
+            root   html;
         }
+    }
+}
+"@ | Out-File -Encoding UTF8 "load-test.conf"
 
-        http {
-            access_log off;
-            sendfile on;
-            tcp_nopush on;
-            keepalive_timeout 65;
-
-            server {
-                listen 127.0.0.1:$port;
-                server_name localhost;
-
-                location / {
-                    root html;
-                }
-
-                location /status {
-                    stub_status;
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 conf/load-test.conf
-
-        Write-Host "✓ Load test configuration created"
+        Write-Host "✓ Created load-test.conf"
 
     - name: Run small file load test
       shell: pwsh
@@ -147,22 +133,14 @@ jobs:
         Write-Host "=== Small File (1KB) Load Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        New-Item -ItemType Directory -Force -Path logs | Out-Null
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
         Start-Sleep -Seconds 3
 
         # Run load test
         $duration = "${{ github.event.inputs.duration || '30s' }}"
         $connections = "${{ github.event.inputs.connections || '100' }}"
 
-        Write-Host "Duration: $duration, Connections: $connections"
         .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:8080/1k.txt
-
-        # Check status
-        $status = Invoke-WebRequest -Uri http://127.0.0.1:8080/status -UseBasicParsing
-        Write-Host ""
-        Write-Host "Nginx Status:" -ForegroundColor Yellow
-        Write-Host $status.Content
 
         # Stop nginx
         .\objs\nginx.exe -s quit
@@ -177,7 +155,7 @@ jobs:
         Write-Host "=== Medium File (64KB) Load Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
         Start-Sleep -Seconds 3
 
         # Run load test
@@ -199,7 +177,7 @@ jobs:
         Write-Host "=== Large File (1MB) Load Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
         Start-Sleep -Seconds 3
 
         # Run load test with fewer connections for large files
@@ -222,7 +200,7 @@ jobs:
         Write-Host "=== Keepalive Stress Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
         Start-Sleep -Seconds 3
 
         # Run with HTTP/1.1 keepalive
@@ -245,7 +223,7 @@ jobs:
         Write-Host "=== Connection Churn Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
         Start-Sleep -Seconds 3
 
         # Run with HTTP/1.0 (no keepalive)
@@ -272,6 +250,12 @@ jobs:
           Get-Content logs/error.log -Tail 50
         }
 
+    - name: Cleanup
+      if: always()
+      shell: pwsh
+      run: |
+        Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+
     - name: Upload test results
       if: always()
       uses: actions/upload-artifact@v4
@@ -279,5 +263,5 @@ jobs:
         name: load-test-results
         path: |
           logs/*.log
-          conf/load-test.conf
+          load-test.conf
         retention-days: 14

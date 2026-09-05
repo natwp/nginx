@@ -44,7 +44,7 @@ jobs:
           mingw-w64-x86_64-openssl
           mingw-w64-x86_64-pkg-config
 
-    - name: Build optimized nginx (IOCP)
+    - name: Build optimized nginx
       shell: msys2 {0}
       run: |
         ./auto/configure \
@@ -59,346 +59,124 @@ jobs:
           --with-stream_ssl_module
 
         make -j$(nproc)
-        mv objs/nginx.exe objs/nginx-iocp.exe
+        ls -lh objs/nginx.exe
 
-    - name: Build select backend
-      shell: msys2 {0}
-      run: |
-        make clean
-
-        ./auto/configure \
-          --with-cc=gcc \
-          --with-cc-opt="-O3 -march=x86-64 -mtune=generic -DNGX_HAVE_IOCP=0" \
-          --with-pcre \
-          --with-http_ssl_module \
-          --with-http_v2_module \
-          --with-http_gzip_static_module \
-          --with-http_stub_status_module \
-          --with-stream \
-          --with-stream_ssl_module
-
-        make -j$(nproc)
-        mv objs/nginx.exe objs/nginx-select.exe
-
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-
-    - name: Install oha
+    - name: Install oha (HTTP benchmarking tool)
       shell: pwsh
       run: |
+        Write-Host "=== Installing oha benchmarking tool ===" -ForegroundColor Cyan
         $ohaVersion = "v1.4.5"
         $ohaUrl = "https://github.com/hatoo/oha/releases/download/$ohaVersion/oha-windows-amd64.zip"
+
         Invoke-WebRequest -Uri $ohaUrl -OutFile oha.zip
         Expand-Archive -Path oha.zip -DestinationPath . -Force
-        .\oha.exe --version
 
-    - name: Prepare benchmark content
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Force -Path html | Out-Null
-
-        # Create various test file sizes
-        "x" * 100 | Out-File -Encoding ASCII -NoNewline html/100b.txt
-        "x" * 1024 | Out-File -Encoding ASCII -NoNewline html/1k.txt
-        "x" * (4 * 1024) | Out-File -Encoding ASCII -NoNewline html/4k.txt
-        "x" * (16 * 1024) | Out-File -Encoding ASCII -NoNewline html/16k.txt
-        "x" * (64 * 1024) | Out-File -Encoding ASCII -NoNewline html/64k.txt
-
-        Get-ChildItem html/*.txt | ForEach-Object {
-          Write-Host "$($_.Name): $([math]::Round($_.Length/1KB, 2)) KB"
-        }
-
-    - name: Benchmark IOCP backend
-      shell: pwsh
-      run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-        $workers = "${{ github.event.inputs.worker_count || '4' }}"
-        $suite = "${{ github.event.inputs.test_suite || 'standard' }}"
-
-        # Determine test parameters based on suite
-        $params = @{
-          'quick' = @{ duration='10s'; connections=50; runs=1 }
-          'standard' = @{ duration='30s'; connections=100; runs=3 }
-          'comprehensive' = @{ duration='60s'; connections=200; runs=5 }
-        }
-        $config = $params[$suite]
-
-        Write-Host ""
-        Write-Host "=== IOCP Backend Benchmark ===" -ForegroundColor Cyan
-        Write-Host "Workers: $workers, Suite: $suite"
-        Write-Host "Duration: $($config.duration), Connections: $($config.connections), Runs: $($config.runs)"
-
-        $port = 8080
-        @"
-        worker_processes $workers;
-        error_log logs/error-iocp.log warn;
-        pid logs/nginx-iocp.pid;
-        events {
-            use iocp;
-            worker_connections 2048;
-        }
-        http {
-            access_log off;
-            sendfile on;
-            tcp_nopush on;
-            keepalive_timeout 65;
-            server {
-                listen 127.0.0.1:$port;
-                location / { root html; }
-                location /status { stub_status; }
-            }
-        }
-"@ | Out-File -Encoding UTF8 conf/bench-iocp.conf
-
-        New-Item -ItemType Directory -Force -Path logs | Out-Null
-        New-Item -ItemType Directory -Force -Path results | Out-Null
-
-        # Start nginx
-        Start-Process -FilePath ".\objs\nginx-iocp.exe" -ArgumentList "-c","conf/bench-iocp.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
-
-        $files = @('100b.txt', '1k.txt', '4k.txt', '16k.txt', '64k.txt')
-        $results = @()
-
-        foreach ($file in $files) {
-          Write-Host ""
-          Write-Host "Testing $file..." -ForegroundColor Yellow
-
-          $totalReqs = 0
-          $totalLatency = 0
-
-          for ($i = 1; $i -le $config.runs; $i++) {
-            $output = .\oha.exe -z $($config.duration) -c $($config.connections) --no-tui `
-              http://127.0.0.1:${port}/$file 2>&1 | Out-String
-
-            if ($output -match 'Requests/sec:\s+([\d.]+)') {
-              $rps = [double]$Matches[1]
-              $totalReqs += $rps
-              Write-Host "  Run $i`: $([math]::Round($rps, 2)) req/s"
-            }
-          }
-
-          $avgRps = $totalReqs / $config.runs
-          Write-Host "  Average: $([math]::Round($avgRps, 2)) req/s" -ForegroundColor Green
-
-          $results += [PSCustomObject]@{
-            Backend = "IOCP"
-            File = $file
-            AvgReqPerSec = [math]::Round($avgRps, 2)
-            Workers = $workers
-          }
-        }
-
-        # Stop nginx
-        .\objs\nginx-iocp.exe -s quit
-        Start-Sleep -Seconds 2
-
-        # Save results
-        $results | ConvertTo-Json | Out-File results/iocp-results.json
-        $results | Format-Table | Out-String | Write-Host
-
-    - name: Benchmark select backend
-      shell: pwsh
-      run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-        $workers = "${{ github.event.inputs.worker_count || '4' }}"
-        $suite = "${{ github.event.inputs.test_suite || 'standard' }}"
-
-        $params = @{
-          'quick' = @{ duration='10s'; connections=50; runs=1 }
-          'standard' = @{ duration='30s'; connections=100; runs=3 }
-          'comprehensive' = @{ duration='60s'; connections=200; runs=5 }
-        }
-        $config = $params[$suite]
-
-        Write-Host ""
-        Write-Host "=== Select Backend Benchmark ===" -ForegroundColor Cyan
-        Write-Host "Workers: $workers, Suite: $suite"
-
-        $port = 8081
-        @"
-        worker_processes $workers;
-        error_log logs/error-select.log warn;
-        pid logs/nginx-select.pid;
-        events {
-            use select;
-            worker_connections 512;
-        }
-        http {
-            access_log off;
-            sendfile on;
-            tcp_nopush on;
-            keepalive_timeout 65;
-            server {
-                listen 127.0.0.1:$port;
-                location / { root html; }
-                location /status { stub_status; }
-            }
-        }
-"@ | Out-File -Encoding UTF8 conf/bench-select.conf
-
-        # Start nginx
-        Start-Process -FilePath ".\objs\nginx-select.exe" -ArgumentList "-c","conf/bench-select.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
-
-        $files = @('100b.txt', '1k.txt', '4k.txt', '16k.txt', '64k.txt')
-        $results = @()
-
-        foreach ($file in $files) {
-          Write-Host ""
-          Write-Host "Testing $file..." -ForegroundColor Yellow
-
-          $totalReqs = 0
-
-          for ($i = 1; $i -le $config.runs; $i++) {
-            $output = .\oha.exe -z $($config.duration) -c $($config.connections) --no-tui `
-              http://127.0.0.1:${port}/$file 2>&1 | Out-String
-
-            if ($output -match 'Requests/sec:\s+([\d.]+)') {
-              $rps = [double]$Matches[1]
-              $totalReqs += $rps
-              Write-Host "  Run $i`: $([math]::Round($rps, 2)) req/s"
-            }
-          }
-
-          $avgRps = $totalReqs / $config.runs
-          Write-Host "  Average: $([math]::Round($avgRps, 2)) req/s" -ForegroundColor Green
-
-          $results += [PSCustomObject]@{
-            Backend = "Select"
-            File = $file
-            AvgReqPerSec = [math]::Round($avgRps, 2)
-            Workers = $workers
-          }
-        }
-
-        # Stop nginx
-        .\objs\nginx-select.exe -s quit
-        Start-Sleep -Seconds 2
-
-        # Save results
-        $results | ConvertTo-Json | Out-File results/select-results.json
-        $results | Format-Table | Out-String | Write-Host
-
-    - name: Generate comparison report
-      shell: pwsh
-      run: |
-        Write-Host ""
-        Write-Host "=== Performance Comparison Report ===" -ForegroundColor Cyan
-        Write-Host ""
-
-        $iocpResults = Get-Content results/iocp-results.json | ConvertFrom-Json
-        $selectResults = Get-Content results/select-results.json | ConvertFrom-Json
-
-        $comparison = @()
-        for ($i = 0; $i -lt $iocpResults.Count; $i++) {
-          $iocp = $iocpResults[$i]
-          $select = $selectResults[$i]
-          $improvement = (($iocp.AvgReqPerSec - $select.AvgReqPerSec) / $select.AvgReqPerSec) * 100
-
-          $comparison += [PSCustomObject]@{
-            File = $iocp.File
-            'IOCP (req/s)' = $iocp.AvgReqPerSec
-            'Select (req/s)' = $select.AvgReqPerSec
-            'Improvement %' = [math]::Round($improvement, 2)
-          }
-        }
-
-        $comparison | Format-Table | Out-String | Write-Host
-
-        # Save comparison
-        $comparison | ConvertTo-Json | Out-File results/comparison.json
-
-        Write-Host ""
-        Write-Host "✓ Benchmark suite completed" -ForegroundColor Green
-
-    - name: Upload benchmark results
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: benchmark-results-${{ github.event.inputs.test_suite || 'standard' }}
-        path: |
-          results/*.json
-          logs/*.log
-        retention-days: 90
-
-  benchmark-udp:
-    name: UDP Stream Benchmark
-    runs-on: windows-2022
-    timeout-minutes: 30
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Setup MSYS2
-      uses: msys2/setup-msys2@v2
-      with:
-        msystem: MINGW64
-        update: true
-        install: >-
-          base-devel
-          mingw-w64-x86_64-gcc
-          mingw-w64-x86_64-make
-          mingw-w64-x86_64-pcre2
-          mingw-w64-x86_64-zlib
-          mingw-w64-x86_64-openssl
-          mingw-w64-x86_64-pkg-config
-
-    - name: Build nginx with stream module
-      shell: msys2 {0}
-      run: |
-        ./auto/configure \
-          --with-cc=gcc \
-          --with-cc-opt="-O3 -march=x86-64" \
-          --with-stream \
-          --with-stream_ssl_module
-
-        make -j$(nproc)
-
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '22'
-
-    - name: Run UDP benchmark
-      shell: pwsh
-      run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-
-        Write-Host "=== UDP Stream Benchmark ===" -ForegroundColor Cyan
-
-        $port = 9000
-        @"
-        worker_processes 4;
-        error_log logs/error-udp.log warn;
-        pid logs/nginx-udp.pid;
-        events {
-            use iocp;
-            worker_connections 1024;
-        }
-        stream {
-            server {
-                listen 127.0.0.1:$port udp;
-                return "UDP Response";
-            }
-        }
-"@ | Out-File -Encoding UTF8 conf/bench-udp.conf
-
-        New-Item -ItemType Directory -Force -Path logs | Out-Null
-
-        # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/bench-udp.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
-
-        # Use Node.js UDP benchmark
-        if (Test-Path misc/udp-loopback-bench.js) {
-          Write-Host "Running UDP loopback benchmark..."
-          node misc/udp-loopback-bench.js
+        if (Test-Path ".\oha.exe") {
+          Write-Host "✓ oha installed successfully"
+          .\oha.exe --version
         } else {
-          Write-Host "UDP benchmark script not found, skipping"
+          Write-Host "✗ oha installation failed"
+          exit 1
+        }
+
+    - name: Setup benchmark environment
+      shell: pwsh
+      run: |
+        Write-Host "=== Setting up benchmark environment ===" -ForegroundColor Cyan
+
+        # Create test directory and files
+        New-Item -ItemType Directory -Path "html" -Force | Out-Null
+
+        # Create benchmark files
+        $sizes = @{
+          "1k.bin" = 1024
+          "4k.bin" = 4096
+          "16k.bin" = 16384
+          "64k.bin" = 65536
+          "256k.bin" = 262144
+          "1m.bin" = 1048576
+        }
+
+        foreach ($file in $sizes.Keys) {
+          $bytes = [byte[]]::new($sizes[$file])
+          [System.IO.File]::WriteAllBytes("html\$file", $bytes)
+        }
+
+        Write-Host "✓ Created benchmark files"
+
+        # Create logs directory
+        New-Item -ItemType Directory -Path "logs" -Force | Out-Null
+
+        $workers = "${{ github.event.inputs.worker_count || '4' }}"
+
+        # Create benchmark configuration
+        @"
+worker_processes  $workers;
+error_log  logs/error.log  warn;
+pid        logs/nginx.pid;
+
+events {
+    worker_connections  2048;
+}
+
+http {
+    default_type  application/octet-stream;
+    sendfile      on;
+    tcp_nopush    on;
+    keepalive_timeout  65;
+
+    server {
+        listen       8080;
+        server_name  localhost;
+
+        location / {
+            root   html;
+        }
+
+        location /status {
+            stub_status;
+        }
+    }
+}
+"@ | Out-File -Encoding UTF8 "benchmark.conf"
+
+        Write-Host "✓ Created benchmark.conf with $workers workers"
+
+    - name: Run IOCP benchmark
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== IOCP Event Method Benchmark ===" -ForegroundColor Cyan
+
+        $suite = "${{ github.event.inputs.test_suite || 'standard' }}"
+        $files = @()
+        
+        switch ($suite) {
+          'quick' { $files = @('1k.bin', '64k.bin') }
+          'standard' { $files = @('1k.bin', '16k.bin', '64k.bin', '256k.bin') }
+          'comprehensive' { $files = @('1k.bin', '4k.bin', '16k.bin', '64k.bin', '256k.bin', '1m.bin') }
+        }
+
+        # Start nginx
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","benchmark.conf" -NoNewWindow
+        Start-Sleep -Seconds 3
+
+        $results = @()
+
+        foreach ($file in $files) {
+          Write-Host ""
+          Write-Host "Benchmarking $file..." -ForegroundColor Yellow
+          
+          $output = .\oha.exe -z 10s -c 100 --no-tui http://127.0.0.1:8080/$file 2>&1 | Out-String
+          
+          # Extract key metrics
+          if ($output -match 'Requests/sec:\s+([\d.]+)') {
+            $reqSec = $Matches[1]
+            Write-Host "  Requests/sec: $reqSec"
+            $results += "$file : $reqSec req/s"
+          }
         }
 
         # Stop nginx
@@ -406,12 +184,80 @@ jobs:
         Start-Sleep -Seconds 2
 
         Write-Host ""
-        Write-Host "✓ UDP benchmark completed" -ForegroundColor Green
+        Write-Host "=== Benchmark Results ===" -ForegroundColor Green
+        $results | ForEach-Object { Write-Host "  $_" }
 
-    - name: Upload UDP results
+    - name: Benchmark comparison (select vs IOCP)
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Event Method Comparison ===" -ForegroundColor Cyan
+
+        $methods = @('select', 'poll')
+        $testFile = '64k.bin'
+
+        foreach ($method in $methods) {
+          Write-Host ""
+          Write-Host "Testing $method..." -ForegroundColor Yellow
+
+          # Update config for this method
+          $workers = "${{ github.event.inputs.worker_count || '4' }}"
+          @"
+worker_processes  $workers;
+error_log  logs/error.log  warn;
+pid        logs/nginx.pid;
+
+events {
+    use $method;
+    worker_connections  2048;
+}
+
+http {
+    default_type  application/octet-stream;
+    sendfile      on;
+    tcp_nopush    on;
+    keepalive_timeout  65;
+
+    server {
+        listen       8080;
+        server_name  localhost;
+        location / {
+            root   html;
+        }
+    }
+}
+"@ | Out-File -Encoding UTF8 "benchmark.conf"
+
+          # Start nginx
+          Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","benchmark.conf" -NoNewWindow
+          Start-Sleep -Seconds 3
+
+          $output = .\oha.exe -z 10s -c 100 --no-tui http://127.0.0.1:8080/$testFile 2>&1 | Out-String
+          
+          if ($output -match 'Requests/sec:\s+([\d.]+)') {
+            $reqSec = $Matches[1]
+            Write-Host "  $method: $reqSec req/s" -ForegroundColor Green
+          }
+
+          # Stop nginx
+          .\objs\nginx.exe -s quit
+          Start-Sleep -Seconds 2
+        }
+
+    - name: Cleanup
+      if: always()
+      shell: pwsh
+      run: |
+        Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+
+    - name: Upload benchmark results
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: udp-benchmark-results
-        path: logs/*.log
+        name: benchmark-results
+        path: |
+          logs/*.log
+          benchmark.conf
         retention-days: 30

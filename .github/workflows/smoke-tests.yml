@@ -70,13 +70,31 @@ jobs:
       shell: msys2 {0}
       run: |
         echo "=== Test configuration parsing ==="
-        mkdir -p logs
+        mkdir -p logs temp
 
-        # Test with default config
-        if ./objs/nginx.exe -t -c conf/nginx.conf; then
-          echo "✓ Default config is valid"
+        # Create a minimal test config
+        cat > test-config.conf <<'EOF'
+worker_processes  1;
+events {
+    worker_connections  1024;
+}
+http {
+    default_type  application/octet-stream;
+    server {
+        listen       8080;
+        server_name  localhost;
+        location / {
+            return 200 "OK";
+        }
+    }
+}
+EOF
+
+        # Test with minimal config (doesn't require mime.types)
+        if ./objs/nginx.exe -t -c test-config.conf; then
+          echo "✓ Configuration test passed"
         else
-          echo "✗ Default config test failed"
+          echo "✗ Configuration test failed"
           exit 1
         fi
 

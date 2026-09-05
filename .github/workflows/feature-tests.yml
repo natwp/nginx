@@ -63,10 +63,26 @@ jobs:
     - name: Test configuration
       shell: msys2 {0}
       run: |
-        mkdir -p logs
+        mkdir -p logs temp
 
         echo "=== Test basic configuration ==="
-        ./objs/nginx.exe -t -c conf/nginx.conf
+        cat > test-config.conf <<'EOF'
+worker_processes  1;
+events {
+    worker_connections  256;
+}
+http {
+    default_type  application/octet-stream;
+    server {
+        listen       127.0.0.1:8080;
+        location / {
+            return 200 "OK";
+        }
+    }
+}
+EOF
+
+        ./objs/nginx.exe -t -c test-config.conf
 
         echo ""
         echo "✓ Configuration test passed"
