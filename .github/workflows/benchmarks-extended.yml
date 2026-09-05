@@ -109,37 +109,38 @@ jobs:
 
         $workers = "${{ github.event.inputs.worker_count || '4' }}"
 
-        # Create benchmark configuration
-        @"
-worker_processes  $workers;
-error_log  logs/error.log  warn;
-pid        logs/nginx.pid;
-
-events {
-    worker_connections  2048;
-}
-
-http {
-    default_type  application/octet-stream;
-    sendfile      on;
-    tcp_nopush    on;
-    keepalive_timeout  65;
-
-    server {
-        listen       8080;
-        server_name  localhost;
-
-        location / {
-            root   html;
-        }
-
-        location /status {
-            stub_status;
-        }
-    }
-}
-"@ | Out-File -Encoding UTF8 "benchmark.conf"
-
+        # Create benchmark configuration using array join
+        $config = @(
+          "worker_processes  $workers;",
+          'error_log  logs/error.log  warn;',
+          'pid        logs/nginx.pid;',
+          '',
+          'events {',
+          '    worker_connections  2048;',
+          '}',
+          '',
+          'http {',
+          '    default_type  application/octet-stream;',
+          '    sendfile      on;',
+          '    tcp_nopush    on;',
+          '    keepalive_timeout  65;',
+          '',
+          '    server {',
+          '        listen       8080;',
+          '        server_name  localhost;',
+          '',
+          '        location / {',
+          '            root   html;',
+          '        }',
+          '',
+          '        location /status {',
+          '            stub_status;',
+          '        }',
+          '    }',
+          '}'
+        ) -join "`n"
+        
+        $config | Out-File -Encoding UTF8 "benchmark.conf"
         Write-Host "✓ Created benchmark.conf with $workers workers"
 
     - name: Run IOCP benchmark
@@ -204,31 +205,33 @@ http {
 
           # Update config for this method
           $workers = "${{ github.event.inputs.worker_count || '4' }}"
-          @"
-worker_processes  $workers;
-error_log  logs/error.log  warn;
-pid        logs/nginx.pid;
-
-events {
-    use $method;
-    worker_connections  2048;
-}
-
-http {
-    default_type  application/octet-stream;
-    sendfile      on;
-    tcp_nopush    on;
-    keepalive_timeout  65;
-
-    server {
-        listen       8080;
-        server_name  localhost;
-        location / {
-            root   html;
-        }
-    }
-}
-"@ | Out-File -Encoding UTF8 "benchmark.conf"
+          $config = @(
+            "worker_processes  $workers;",
+            'error_log  logs/error.log  warn;',
+            'pid        logs/nginx.pid;',
+            '',
+            'events {',
+            "    use $method;",
+            '    worker_connections  2048;',
+            '}',
+            '',
+            'http {',
+            '    default_type  application/octet-stream;',
+            '    sendfile      on;',
+            '    tcp_nopush    on;',
+            '    keepalive_timeout  65;',
+            '',
+            '    server {',
+            '        listen       8080;',
+            '        server_name  localhost;',
+            '        location / {',
+            '            root   html;',
+            '        }',
+            '    }',
+            '}'
+          ) -join "`n"
+          
+          $config | Out-File -Encoding UTF8 "benchmark.conf"
 
           # Start nginx
           Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","benchmark.conf" -NoNewWindow

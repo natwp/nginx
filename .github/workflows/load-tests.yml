@@ -96,32 +96,33 @@ jobs:
         # Create logs directory
         New-Item -ItemType Directory -Path "logs" -Force | Out-Null
 
-        # Create load test configuration
-        @"
-worker_processes  4;
-error_log  logs/error.log  notice;
-pid        logs/nginx.pid;
-
-events {
-    worker_connections  1024;
-}
-
-http {
-    default_type  application/octet-stream;
-    sendfile      on;
-    keepalive_timeout  65;
-
-    server {
-        listen       8080;
-        server_name  localhost;
-
-        location / {
-            root   html;
-        }
-    }
-}
-"@ | Out-File -Encoding UTF8 "load-test.conf"
-
+        # Create load test configuration (using -join to avoid YAML issues)
+        $config = @(
+          'worker_processes  4;',
+          'error_log  logs/error.log  notice;',
+          'pid        logs/nginx.pid;',
+          '',
+          'events {',
+          '    worker_connections  1024;',
+          '}',
+          '',
+          'http {',
+          '    default_type  application/octet-stream;',
+          '    sendfile      on;',
+          '    keepalive_timeout  65;',
+          '',
+          '    server {',
+          '        listen       8080;',
+          '        server_name  localhost;',
+          '',
+          '        location / {',
+          '            root   html;',
+          '        }',
+          '    }',
+          '}'
+        ) -join "`n"
+        
+        $config | Out-File -Encoding UTF8 "load-test.conf"
         Write-Host "✓ Created load-test.conf"
 
     - name: Run small file load test

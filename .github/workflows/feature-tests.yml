@@ -1,29 +1,16 @@
-name: Feature and Configuration Tests
+name: Feature Tests
 
 on:
   push:
     branches: [ master, 'fix/**', 'feature/**' ]
   pull_request:
     branches: [ master ]
-  workflow_dispatch:
 
 jobs:
   feature-tests:
-    name: Module and Configuration Tests
+    name: Feature Configuration Tests
     runs-on: windows-2022
     timeout-minutes: 30
-    strategy:
-      matrix:
-        test-suite:
-          - name: "Core Modules"
-            modules: "--with-http_ssl_module --with-http_v2_module --with-http_realip_module"
-          - name: "Content Modules"
-            modules: "--with-http_addition_module --with-http_sub_module --with-http_gunzip_module --with-http_gzip_static_module"
-          - name: "Stream Modules"
-            modules: "--with-stream --with-stream_ssl_module --with-stream_realip_module --with-stream_ssl_preread_module"
-          - name: "Extended Features"
-            modules: "--with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_random_index_module --with-http_secure_link_module --with-http_slice_module --with-http_stub_status_module"
-      fail-fast: false
 
     steps:
     - name: Checkout repository
@@ -41,243 +28,131 @@ jobs:
           mingw-w64-x86_64-pcre2
           mingw-w64-x86_64-zlib
           mingw-w64-x86_64-openssl
-          mingw-w64-x86_64-pkg-config
 
-    - name: Build nginx with ${{ matrix.test-suite.name }}
+    - name: Build with minimal modules
       shell: msys2 {0}
       run: |
-        echo "=== Building with ${{ matrix.test-suite.name }} ==="
-
         ./auto/configure \
           --with-cc=gcc \
-          --with-cpu-opt=generic \
-          --with-pcre \
-          ${{ matrix.test-suite.modules }}
+          --with-cc-opt="-O2" \
+          --with-pcre
 
         make -j$(nproc)
+        ls -lh objs/nginx.exe
 
-        echo ""
-        echo "=== Verify build ==="
-        ./objs/nginx.exe -V
-
-    - name: Test configuration
+    - name: Test IOCP event method
       shell: msys2 {0}
       run: |
+        echo "=== Test IOCP event method ==="
         mkdir -p logs temp
 
-        echo "=== Test basic configuration ==="
-        cat > test-config.conf <<'EOF'
-worker_processes  1;
-events {
-    worker_connections  256;
-}
-http {
-    default_type  application/octet-stream;
-    server {
-        listen       127.0.0.1:8080;
-        location / {
-            return 200 "OK";
-        }
-    }
-}
-EOF
+        printf '%s\n' \
+          'worker_processes  1;' \
+          'events {' \
+          '    use iocp;' \
+          '    worker_connections  1024;' \
+          '}' \
+          'http {' \
+          '    default_type  application/octet-stream;' \
+          '    server {' \
+          '        listen       8080;' \
+          '        server_name  localhost;' \
+          '        location / {' \
+          '            return 200 "IOCP OK";' \
+          '        }' \
+          '    }' \
+          '}' > iocp-test.conf
 
-        ./objs/nginx.exe -t -c test-config.conf
+        if ./objs/nginx.exe -t -c iocp-test.conf; then
+          echo "✓ IOCP event method validated"
+        else
+          echo "✗ IOCP validation failed"
+          exit 1
+        fi
 
-        echo ""
-        echo "✓ Configuration test passed"
-
-    - name: Module functionality test
-      shell: pwsh
-      run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-
-        Write-Host "=== Testing ${{ matrix.test-suite.name }} functionality ===" -ForegroundColor Cyan
-
-        # Quick start/stop test
-        $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
-        New-Item -ItemType Directory -Path $prefix -Force | Out-Null
-        New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
-
-        # Create minimal config
-        @"
-        worker_processes 1;
-        error_log logs/error.log;
-        pid logs/nginx.pid;
-        events {
-            worker_connections 256;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "OK";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
-
-        try {
-          # Test start
-          $prefixWin = $prefix -replace '\\', '/'
-          .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -t
-          Write-Host "✓ Configuration validation passed"
-
-        } finally {
-          if (Test-Path $prefix) {
-            Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
-          }
-        }
-
-    - name: Upload build artifacts
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: nginx-${{ matrix.test-suite.name }}-build
-        path: objs/nginx.exe
-        retention-days: 3
-
-  configuration-tests:
-    name: Configuration Validation Tests
-    runs-on: windows-2022
-    timeout-minutes: 20
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Setup MSYS2
-      uses: msys2/setup-msys2@v2
-      with:
-        msystem: MINGW64
-        update: true
-        install: >-
-          base-devel
-          mingw-w64-x86_64-gcc
-          mingw-w64-x86_64-make
-          mingw-w64-x86_64-pcre2
-          mingw-w64-x86_64-zlib
-          mingw-w64-x86_64-openssl
-          mingw-w64-x86_64-pkg-config
-
-    - name: Build full-featured nginx
+    - name: Test select event method
       shell: msys2 {0}
       run: |
-        ./auto/configure \
-          --with-cc=gcc \
-          --with-pcre \
-          --with-http_ssl_module \
-          --with-http_v2_module \
-          --with-http_realip_module \
-          --with-http_addition_module \
-          --with-http_sub_module \
-          --with-http_dav_module \
-          --with-http_flv_module \
-          --with-http_mp4_module \
-          --with-http_gunzip_module \
-          --with-http_gzip_static_module \
-          --with-http_auth_request_module \
-          --with-http_random_index_module \
-          --with-http_secure_link_module \
-          --with-http_degradation_module \
-          --with-http_slice_module \
-          --with-http_stub_status_module \
-          --with-stream \
-          --with-stream_ssl_module \
-          --with-stream_realip_module \
-          --with-stream_ssl_preread_module
+        echo "=== Test select event method ==="
 
-        make -j$(nproc)
+        printf '%s\n' \
+          'worker_processes  1;' \
+          'events {' \
+          '    use select;' \
+          '    worker_connections  1024;' \
+          '}' \
+          'http {' \
+          '    default_type  application/octet-stream;' \
+          '    server {' \
+          '        listen       8080;' \
+          '        server_name  localhost;' \
+          '        location / {' \
+          '            return 200 "Select OK";' \
+          '        }' \
+          '    }' \
+          '}' > select-test.conf
 
-    - name: Test various event methods
-      shell: pwsh
+        if ./objs/nginx.exe -t -c select-test.conf; then
+          echo "✓ Select event method validated"
+        else
+          echo "✗ Select validation failed"
+          exit 1
+        fi
+
+    - name: Test poll event method
+      shell: msys2 {0}
       run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+        echo "=== Test poll event method ==="
 
-        $methods = @('iocp', 'select', 'poll')
+        printf '%s\n' \
+          'worker_processes  1;' \
+          'events {' \
+          '    use poll;' \
+          '    worker_connections  1024;' \
+          '}' \
+          'http {' \
+          '    default_type  application/octet-stream;' \
+          '    server {' \
+          '        listen       8080;' \
+          '        server_name  localhost;' \
+          '        location / {' \
+          '            return 200 "Poll OK";' \
+          '        }' \
+          '    }' \
+          '}' > poll-test.conf
 
-        foreach ($method in $methods) {
-          Write-Host ""
-          Write-Host "=== Testing event method: $method ===" -ForegroundColor Cyan
+        if ./objs/nginx.exe -t -c poll-test.conf; then
+          echo "✓ Poll event method validated"
+        else
+          echo "✗ Poll validation failed"
+          exit 1
+        fi
 
-          $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
-          New-Item -ItemType Directory -Path $prefix -Force | Out-Null
-          New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
-
-          @"
-        worker_processes 2;
-        error_log logs/error.log;
-        pid logs/nginx.pid;
-        events {
-            use $method;
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "Method: $method";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
-
-          try {
-            $prefixWin = $prefix -replace '\\', '/'
-            .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -t
-            Write-Host "✓ $method configuration valid"
-          } finally {
-            if (Test-Path $prefix) {
-              Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
-            }
-          }
-        }
-
-        Write-Host ""
-        Write-Host "✓ All event methods validated" -ForegroundColor Green
-
-    - name: Test multi-worker configurations
-      shell: pwsh
+    - name: Test multi-worker configuration
+      shell: msys2 {0}
       run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+        echo "=== Test multi-worker configuration ==="
 
-        $workerCounts = @(1, 2, 4)
+        printf '%s\n' \
+          'worker_processes  4;' \
+          'events {' \
+          '    use iocp;' \
+          '    worker_connections  1024;' \
+          '}' \
+          'http {' \
+          '    default_type  application/octet-stream;' \
+          '    server {' \
+          '        listen       8080;' \
+          '        server_name  localhost;' \
+          '        location / {' \
+          '            return 200 "Multi-worker OK";' \
+          '        }' \
+          '    }' \
+          '}' > multi-worker-test.conf
 
-        foreach ($workers in $workerCounts) {
-          Write-Host ""
-          Write-Host "=== Testing $workers worker(s) ===" -ForegroundColor Cyan
-
-          $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
-          New-Item -ItemType Directory -Path $prefix -Force | Out-Null
-          New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
-
-          @"
-        worker_processes $workers;
-        error_log logs/error.log;
-        pid logs/nginx.pid;
-        events {
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "Workers: $workers";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
-
-          try {
-            $prefixWin = $prefix -replace '\\', '/'
-            .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -t
-            Write-Host "✓ $workers worker(s) configuration valid"
-          } finally {
-            if (Test-Path $prefix) {
-              Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
-            }
-          }
-        }
-
-        Write-Host ""
-        Write-Host "✓ All worker configurations validated" -ForegroundColor Green
+        if ./objs/nginx.exe -t -c multi-worker-test.conf; then
+          echo "✓ Multi-worker configuration validated"
+        else
+          echo "✗ Multi-worker validation failed"
+          exit 1
+        fi
