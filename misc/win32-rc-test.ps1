@@ -217,25 +217,71 @@ function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 30) {
     }
 }
 
-function Test-Gzip([int] $Port, [string] $Expected) {
-    $response = $null
-    $gzip = $null
-    $reader = $null
-    try {
-        $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/gzip.txt")
-        $request.Proxy = $null
-        $request.Headers.Add('Accept-Encoding', 'gzip')
-        $response = [Net.HttpWebResponse] $request.GetResponse()
-        Assert-True ($response.Headers['Content-Encoding'] -eq 'gzip') 'gzip response was not compressed'
-        $gzip = New-Object IO.Compression.GZipStream -ArgumentList ($response.GetResponseStream(), [IO.Compression.CompressionMode]::Decompress)
-        $reader = New-Object IO.StreamReader -ArgumentList $gzip
-        $body = $reader.ReadToEnd()
-        Assert-True ($body -eq $Expected) 'gzip response body mismatch'
-    } finally {
-        if ($reader) { $reader.Dispose() }
-        elseif ($gzip) { $gzip.Dispose() }
-        if ($response) { $response.Dispose() }
+function Get-HttpBody([int] $Port, [string] $Path, [int] $TimeoutSec = 20) {
+    # Retry transient connection failures.  A single reset on a loopback
+    # request should not fail the run, and these fetches happen right after a
+    # worker respawn, when a connection can still be torn down mid-flight.
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastError = $null
+
+    do {
+        $client = $null
+        try {
+            $client = New-Object System.Net.WebClient
+            $client.Proxy = $null
+            return $client.DownloadString("http://127.0.0.1:$Port$Path")
+        } catch {
+            $lastError = $_
+            Start-Sleep -Milliseconds 300
+        } finally {
+            if ($client) { $client.Dispose() }
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    $message = "GET $Path on port $Port failed"
+    if ($lastError) {
+        $message += ": $($lastError.Exception.Message)"
+        if ($lastError.Exception.InnerException) {
+            $message += " (inner: $($lastError.Exception.InnerException.Message))"
+        }
     }
+    throw $message
+}
+
+function Test-Gzip([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
+    # Retries transport failures for the same reason as Get-HttpBody, while
+    # still failing immediately on a wrong or uncompressed response.
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $lastError = $null
+
+    do {
+        $response = $null
+        $gzip = $null
+        $reader = $null
+        try {
+            $request = [Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/gzip.txt")
+            $request.Proxy = $null
+            $request.Headers.Add('Accept-Encoding', 'gzip')
+            $response = [Net.HttpWebResponse] $request.GetResponse()
+            Assert-True ($response.Headers['Content-Encoding'] -eq 'gzip') 'gzip response was not compressed'
+            $gzip = New-Object IO.Compression.GZipStream -ArgumentList ($response.GetResponseStream(), [IO.Compression.CompressionMode]::Decompress)
+            $reader = New-Object IO.StreamReader -ArgumentList $gzip
+            $body = $reader.ReadToEnd()
+            Assert-True ($body -eq $Expected) 'gzip response body mismatch'
+            return
+        } catch [Net.WebException] {
+            $lastError = $_
+            Start-Sleep -Milliseconds 300
+        } finally {
+            if ($reader) { $reader.Dispose() }
+            elseif ($gzip) { $gzip.Dispose() }
+            if ($response) { $response.Dispose() }
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    $message = "gzip request on port $Port failed"
+    if ($lastError) { $message += ": $($lastError.Exception.Message)" }
+    throw $message
 }
 
 function Invoke-Udp([int] $Port, [string] $Expected) {
@@ -409,14 +455,14 @@ $streamConfig
             Write-Host "HTTPS OK" -ForegroundColor Green
         }
 
-        $sendfile = (New-Object System.Net.WebClient).DownloadString("http://127.0.0.1:$httpPort/sendfile.txt")
+        $sendfile = Get-HttpBody $httpPort '/sendfile.txt'
         Assert-True ($sendfile -eq $fileBody) "$Backend sendfile response mismatch"
         if ($Backend -eq 'iocp') {
-            $aio = (New-Object System.Net.WebClient).DownloadString("http://127.0.0.1:$httpPort/aio.txt")
+            $aio = Get-HttpBody $httpPort '/aio.txt'
             Assert-True ($aio -eq $fileBody) 'IOCP file AIO response mismatch'
         }
         Test-Gzip $httpPort $fileBody
-        $regex = (New-Object System.Net.WebClient).DownloadString("http://127.0.0.1:$httpPort/regex/pcre2-ok")
+        $regex = Get-HttpBody $httpPort '/regex/pcre2-ok'
         Assert-True ($regex -eq 'pcre2-ok') "$Backend regex response mismatch"
     } finally {
         Write-Host "Stopping nginx for backend $Backend..." -ForegroundColor Yellow
