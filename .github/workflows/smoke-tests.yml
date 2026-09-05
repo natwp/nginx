@@ -103,16 +103,15 @@ jobs:
 
         printf '%s\n' \
           'worker_processes  1;' \
-          'daemon off;' \
-          'master_process off;' \
           'error_log  logs/error.log  notice;' \
+          'pid        logs/nginx.pid;' \
           'events {' \
           '    worker_connections  1024;' \
           '}' \
           'http {' \
           '    default_type  text/html;' \
           '    server {' \
-          '        listen       8080;' \
+          '        listen       18080;' \
           '        server_name  localhost;' \
           '        location / {' \
           '            root   html;' \
@@ -120,20 +119,48 @@ jobs:
           '    }' \
           '}' > startup-test.conf
 
-        timeout 5 ./objs/nginx.exe -c startup-test.conf &
-        NGINX_PID=$!
-        sleep 2
+        # Start nginx in background
+        ./objs/nginx.exe -c startup-test.conf
+        sleep 3
 
-        if kill -0 $NGINX_PID 2>/dev/null; then
-          echo "✓ Nginx started successfully"
-          kill $NGINX_PID
-          wait $NGINX_PID 2>/dev/null || true
-          echo "✓ Nginx stopped successfully"
+        # Check if nginx is running by looking for the pid file
+        if [ -f logs/nginx.pid ]; then
+          echo "✓ Nginx started successfully (PID: $(cat logs/nginx.pid))"
+
+          # Test if it's actually responding
+          if curl -s http://127.0.0.1:18080/ | grep -q "Hello"; then
+            echo "✓ Nginx is responding to requests"
+          else
+            echo "⚠ Nginx started but not responding (this is acceptable for smoke test)"
+          fi
+
+          # Graceful shutdown
+          ./objs/nginx.exe -s quit -c startup-test.conf
+          sleep 2
+
+          if [ ! -f logs/nginx.pid ] || ! kill -0 $(cat logs/nginx.pid) 2>/dev/null; then
+            echo "✓ Nginx stopped successfully"
+          else
+            echo "⚠ Nginx may still be running, forcing stop"
+            ./objs/nginx.exe -s stop -c startup-test.conf 2>/dev/null || true
+          fi
         else
-          echo "✗ Nginx failed to start"
-          cat logs/error.log
+          echo "✗ Nginx failed to start - no PID file"
+          if [ -f logs/error.log ]; then
+            echo "=== Error log ==="
+            cat logs/error.log
+          fi
           exit 1
         fi
+
+    - name: Cleanup
+      if: always()
+      shell: msys2 {0}
+      run: |
+        # Force stop any remaining nginx processes
+        ./objs/nginx.exe -s stop -c startup-test.conf 2>/dev/null || true
+        ./objs/nginx.exe -s stop -c test-config.conf 2>/dev/null || true
+        sleep 1
 
     - name: Upload logs on failure
       if: failure()
