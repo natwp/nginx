@@ -56,22 +56,24 @@ jobs:
         New-Item -ItemType Directory -Path $prefix -Force | Out-Null
         New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
 
-        @"
-        worker_processes 2;
-        error_log logs/error.log info;
-        pid logs/nginx.pid;
-        events {
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "OK";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+        $config = @(
+          'worker_processes 2;',
+          'error_log logs/error.log info;',
+          'pid logs/nginx.pid;',
+          'events {',
+          '    worker_connections 512;',
+          '}',
+          'http {',
+          '    server {',
+          '        listen 127.0.0.1:0;',
+          '        location / {',
+          '            return 200 "OK";',
+          '        }',
+          '    }',
+          '}'
+        ) -join "`n"
+
+        $config | Out-File -Encoding UTF8 "$prefix\nginx.conf"
 
         try {
           $prefixWin = $prefix -replace '\\', '/'
@@ -127,22 +129,24 @@ jobs:
         New-Item -ItemType Directory -Path $prefix -Force | Out-Null
         New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
 
-        @"
-        worker_processes 2;
-        error_log logs/error.log info;
-        pid logs/nginx.pid;
-        events {
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "Version 1";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+        $config = @(
+          'worker_processes 2;',
+          'error_log logs/error.log info;',
+          'pid logs/nginx.pid;',
+          'events {',
+          '    worker_connections 512;',
+          '}',
+          'http {',
+          '    server {',
+          '        listen 127.0.0.1:0;',
+          '        location / {',
+          '            return 200 "Version 1";',
+          '        }',
+          '    }',
+          '}'
+        ) -join "`n"
+
+        $config | Out-File -Encoding UTF8 "$prefix\nginx.conf"
 
         try {
           $prefixWin = $prefix -replace '\\', '/'
@@ -157,22 +161,24 @@ jobs:
 
           # Modify configuration
           Write-Host "Modifying configuration..."
-          @"
-        worker_processes 2;
-        error_log logs/error.log info;
-        pid logs/nginx.pid;
-        events {
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "Version 2";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+          $config2 = @(
+            'worker_processes 2;',
+            'error_log logs/error.log info;',
+            'pid logs/nginx.pid;',
+            'events {',
+            '    worker_connections 512;',
+            '}',
+            'http {',
+            '    server {',
+            '        listen 127.0.0.1:0;',
+            '        location / {',
+            '            return 200 "Version 2";',
+            '        }',
+            '    }',
+            '}'
+          ) -join "`n"
+
+          $config2 | Out-File -Encoding UTF8 "$prefix\nginx.conf"
 
           # Reload configuration
           Write-Host "Reloading configuration..."
@@ -215,22 +221,24 @@ jobs:
           New-Item -ItemType Directory -Path $prefix -Force | Out-Null
           New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
 
-          @"
-        worker_processes $workerCount;
-        error_log logs/error.log info;
-        pid logs/nginx.pid;
-        events {
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "Workers: $workerCount";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+          $config = @(
+            "worker_processes $workerCount;",
+            'error_log logs/error.log info;',
+            'pid logs/nginx.pid;',
+            'events {',
+            '    worker_connections 512;',
+            '}',
+            'http {',
+            '    server {',
+            '        listen 127.0.0.1:0;',
+            '        location / {',
+            "            return 200 `"Workers: $workerCount`";",
+            '        }',
+            '    }',
+            '}'
+          ) -join "`n"
+
+          $config | Out-File -Encoding UTF8 "$prefix\nginx.conf"
 
           try {
             $prefixWin = $prefix -replace '\\', '/'
@@ -276,23 +284,25 @@ jobs:
         New-Item -ItemType Directory -Path $prefix -Force | Out-Null
         New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
 
-        @"
-        worker_processes 1;
-        error_log logs/error.log info;
-        pid logs/nginx.pid;
-        events {
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                access_log logs/access.log;
-                location / {
-                    return 200 "OK";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+        $config = @(
+          'worker_processes 1;',
+          'error_log logs/error.log info;',
+          'pid logs/nginx.pid;',
+          'events {',
+            '    worker_connections 512;',
+          '}',
+          'http {',
+          '    server {',
+          '        listen 127.0.0.1:0;',
+          '        access_log logs/access.log;',
+          '        location / {',
+          '            return 200 "OK";',
+          '        }',
+          '    }',
+          '}'
+        ) -join "`n"
+
+        $config | Out-File -Encoding UTF8 "$prefix\nginx.conf"
 
         try {
           $prefixWin = $prefix -replace '\\', '/'
@@ -352,23 +362,25 @@ jobs:
           New-Item -ItemType Directory -Path $prefix -Force | Out-Null
           New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
 
-          @"
-        worker_processes 2;
-        error_log logs/error.log info;
-        pid logs/nginx.pid;
-        events {
-            use $method;
-            worker_connections 512;
-        }
-        http {
-            server {
-                listen 127.0.0.1:0;
-                location / {
-                    return 200 "Method: $method";
-                }
-            }
-        }
-"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+          $config = @(
+            'worker_processes 2;',
+            'error_log logs/error.log info;',
+            'pid logs/nginx.pid;',
+            'events {',
+            "    use $method;",
+            '    worker_connections 512;',
+            '}',
+            'http {',
+            '    server {',
+            '        listen 127.0.0.1:0;',
+            '        location / {',
+            "            return 200 `"Method: $method`";",
+            '        }',
+            '    }',
+            '}'
+          ) -join "`n"
+
+          $config | Out-File -Encoding UTF8 "$prefix\nginx.conf"
 
           try {
             $prefixWin = $prefix -replace '\\', '/'
@@ -408,3 +420,4 @@ jobs:
         path: |
           logs/*.log
         retention-days: 7
+
