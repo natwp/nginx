@@ -86,7 +86,9 @@ jobs:
           '    }' \
           '}' > test-config.conf
 
-        if ./objs/nginx.exe -t -c "$PWD/test-config.conf"; then
+        # Use absolute path with proper conversion for Windows binary
+        config_path=$(cygpath -w "$PWD/test-config.conf")
+        if ./objs/nginx.exe -t -c "$config_path"; then
           echo "✓ Configuration test passed"
         else
           echo "✗ Configuration test failed"
