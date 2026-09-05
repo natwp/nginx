@@ -94,12 +94,10 @@ jobs:
           exit 1
         fi
 
-    - name: Test basic startup and shutdown
+    - name: Write startup test config
       shell: msys2 {0}
       run: |
-        echo "=== Test basic startup and shutdown ==="
         mkdir -p logs html temp
-
         echo "Hello from nginx" > html/index.html
 
         printf '%s\n' \
@@ -120,48 +118,57 @@ jobs:
           '    }' \
           '}' > startup-test.conf
 
-        # Start nginx in background with -p prefix
-        ./objs/nginx.exe -p ./ -c startup-test.conf
-        sleep 3
+        ./objs/nginx.exe -t -p ./ -c startup-test.conf
 
-        # Check if nginx is running by looking for the pid file
-        if [ -f logs/nginx.pid ]; then
-          echo "✓ Nginx started successfully (PID: $(cat logs/nginx.pid))"
+    - name: Test basic startup and shutdown
+      shell: pwsh
+      run: |
+        # nginx on Windows runs in the foreground, so it must be launched
+        # detached; otherwise the step blocks until the job timeout.
+        Write-Host "=== Test basic startup and shutdown ==="
 
-          # Test if it's actually responding
-          if curl -s http://127.0.0.1:18080/ | grep -q "Hello"; then
-            echo "✓ Nginx is responding to requests"
-          else
-            echo "⚠ Nginx started but not responding (this is acceptable for smoke test)"
-          fi
+        Start-Process -FilePath ".\objs\nginx.exe" `
+          -ArgumentList "-p","./","-c","startup-test.conf" -NoNewWindow
+        Start-Sleep -Seconds 3
 
-          # Graceful shutdown with -p prefix
-          ./objs/nginx.exe -p ./ -s quit -c startup-test.conf
-          sleep 2
-
-          if [ ! -f logs/nginx.pid ] || ! kill -0 $(cat logs/nginx.pid) 2>/dev/null; then
-            echo "✓ Nginx stopped successfully"
-          else
-            echo "⚠ Nginx may still be running, forcing stop"
-            ./objs/nginx.exe -p ./ -s stop -c startup-test.conf 2>/dev/null || true
-          fi
-        else
-          echo "✗ Nginx failed to start - no PID file"
-          if [ -f logs/error.log ]; then
-            echo "=== Error log ==="
-            cat logs/error.log
-          fi
+        $processes = @(Get-Process nginx -ErrorAction SilentlyContinue)
+        if ($processes.Count -lt 2) {
+          Write-Host "nginx failed to start (found $($processes.Count) processes)"
+          if (Test-Path logs/error.log) {
+            Write-Host "=== Error log ==="
+            Get-Content logs/error.log
+          }
           exit 1
-        fi
+        }
+        Write-Host "OK: master + worker started ($($processes.Count) processes)"
+
+        $body = (Invoke-WebRequest -Uri http://127.0.0.1:18080/ -UseBasicParsing).Content
+        if ($body -match 'Hello') {
+          Write-Host "OK: nginx served the test page"
+        } else {
+          Write-Host "nginx responded with unexpected body: $body"
+          exit 1
+        }
+
+        .\objs\nginx.exe -p ./ -s quit -c startup-test.conf
+
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+               ((Get-Date) -lt $deadline)) {
+          Start-Sleep -Seconds 1
+        }
+
+        if (Get-Process nginx -ErrorAction SilentlyContinue) {
+          Write-Host "nginx did not exit after quit"
+          exit 1
+        }
+        Write-Host "OK: nginx stopped gracefully"
 
     - name: Cleanup
       if: always()
-      shell: msys2 {0}
+      shell: pwsh
       run: |
-        # Force stop any remaining nginx processes
-        ./objs/nginx.exe -p ./ -s stop -c startup-test.conf 2>/dev/null || true
-        ./objs/nginx.exe -p ./ -s stop -c test-config.conf 2>/dev/null || true
-        sleep 1
+        Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
 
     - name: Upload logs on failure
       if: failure()
