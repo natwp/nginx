@@ -64,7 +64,7 @@ jobs:
           '    }' \
           '}' > iocp-test.conf
 
-        if ./objs/nginx.exe -t -c iocp-test.conf; then
+        if ./objs/nginx.exe -t -c "$PWD/iocp-test.conf"; then
           echo "✓ IOCP event method validated"
         else
           echo "✗ IOCP validation failed"
@@ -94,7 +94,7 @@ jobs:
           '    }' \
           '}' > select-test.conf
 
-        if ./objs/nginx.exe -t -c select-test.conf; then
+        if ./objs/nginx.exe -t -c "$PWD/select-test.conf"; then
           echo "✓ Select event method validated"
         else
           echo "✗ Select validation failed"
@@ -124,7 +124,7 @@ jobs:
           '    }' \
           '}' > poll-test.conf
 
-        if ./objs/nginx.exe -t -c poll-test.conf; then
+        if ./objs/nginx.exe -t -c "$PWD/poll-test.conf"; then
           echo "✓ Poll event method validated"
         else
           echo "✗ Poll validation failed"
@@ -154,7 +154,7 @@ jobs:
           '    }' \
           '}' > multi-worker-test.conf
 
-        if ./objs/nginx.exe -t -c multi-worker-test.conf; then
+        if ./objs/nginx.exe -t -c "$PWD/multi-worker-test.conf"; then
           echo "✓ Multi-worker configuration validated"
         else
           echo "✗ Multi-worker validation failed"

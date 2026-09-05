@@ -78,7 +78,7 @@ jobs:
           'http {' \
           '    default_type  application/octet-stream;' \
           '    server {' \
-          '        listen       8080;' \
+          '        listen       18080;' \
           '        server_name  localhost;' \
           '        location / {' \
           '            return 200 "OK";' \
@@ -86,7 +86,7 @@ jobs:
           '    }' \
           '}' > test-config.conf
 
-        if ./objs/nginx.exe -t -c test-config.conf; then
+        if ./objs/nginx.exe -t -c "$PWD/test-config.conf"; then
           echo "✓ Configuration test passed"
         else
           echo "✗ Configuration test failed"
