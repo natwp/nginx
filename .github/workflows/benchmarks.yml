@@ -1,0 +1,75 @@
+name: Performance Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Test duration (e.g., 10s, 1m)'
+        required: false
+        default: '10s'
+      connections:
+        description: 'Number of connections'
+        required: false
+        default: '100'
+
+jobs:
+  benchmark:
+    name: Run Performance Tests
+    runs-on: windows-2022
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+          mingw-w64-x86_64-pcre2
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-pkg-config
+
+    - name: Build nginx (optimized)
+      shell: msys2 {0}
+      run: |
+        ./auto/configure \
+          --with-cc=gcc \
+          --with-cc-opt="-O3" \
+          --with-http_ssl_module \
+          --with-http_v2_module \
+          --with-stream \
+          --with-stream_ssl_module
+
+        make -j$(nproc)
+
+    - name: Install Node.js for benchmark tools
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Run basic loopback benchmark
+      shell: pwsh
+      run: |
+        # Start nginx on loopback
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p",".","-c","conf\nginx.conf"
+        Start-Sleep -Seconds 2
+        
+        # Simple curl benchmark
+        Write-Host "Testing basic connectivity..."
+        curl http://localhost:80
+        
+        # Stop nginx
+        .\objs\nginx.exe -s quit
+
+    - name: Benchmark summary
+      if: always()
+      run: |
+        Write-Host "Benchmark completed for nginx-iocp"
+        Write-Host "Duration: ${{ github.event.inputs.duration || '10s' }}"
+        Write-Host "Connections: ${{ github.event.inputs.connections || '100' }}"

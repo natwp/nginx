@@ -238,7 +238,8 @@ static ngx_int_t ngx_win32_router_add_listener(ngx_cycle_t *cycle,
 static ngx_int_t ngx_win32_router_post_accept(
     ngx_win32_router_listener_t *listener);
 static ngx_int_t ngx_win32_router_post_udp_recv(
-    ngx_win32_router_listener_t *listener);
+    ngx_win32_router_listener_t *listener,
+    ngx_win32_router_udp_recv_t *op);
 static void ngx_win32_router_complete_accept(
     ngx_win32_router_accept_t *accept, DWORD bytes, ngx_err_t error);
 static void ngx_win32_router_complete_udp_recv(
@@ -299,6 +300,8 @@ static ngx_win32_router_worker_t *ngx_win32_router_find_worker(
 static ngx_win32_router_worker_t *ngx_win32_router_find_quic_worker(
     ngx_uint_t slot, ngx_uint_t generation);
 static void ngx_win32_router_rebuild_ready_workers(void);
+static ngx_uint_t ngx_win32_router_worker_eligible(
+    ngx_win32_router_worker_t *worker);
 static ngx_win32_router_worker_t *ngx_win32_router_select_worker(
     uint32_t hash, ngx_uint_t round_robin);
 static void ngx_win32_router_expire_accepts(void);
@@ -1017,7 +1020,7 @@ ngx_win32_router_process_control(ngx_win32_router_control_t *control)
         for (i = 0; i < n; i++) {
             if ((listener->type == SOCK_STREAM
                  ? ngx_win32_router_post_accept(listener)
-                 : ngx_win32_router_post_udp_recv(listener)) != NGX_OK)
+                 : ngx_win32_router_post_udp_recv(listener, NULL)) != NGX_OK)
             {
                 goto failed;
             }
@@ -1501,21 +1504,42 @@ ngx_win32_router_post_accept(ngx_win32_router_listener_t *listener)
 
 
 static ngx_int_t
-ngx_win32_router_post_udp_recv(ngx_win32_router_listener_t *listener)
+ngx_win32_router_post_udp_recv(ngx_win32_router_listener_t *listener,
+    ngx_win32_router_udp_recv_t *op)
 {
     int                         rc;
     DWORD                       bytes;
     ngx_err_t                   error;
-    ngx_win32_router_udp_recv_t *op;
 
     if (!ngx_win32_router_udp_accepting) {
+        if (op) {
+            ngx_free(op);
+        }
+
         return NGX_OK;
     }
 
-    op = ngx_calloc(sizeof(ngx_win32_router_udp_recv_t),
-                    ngx_win32_router_log);
+    /*
+     * A receive operation embeds its own datagram and control buffers, so it
+     * is about 66 KB.  Reusing the completed operation for the replacement
+     * receive keeps that allocation, and the zeroing of those buffers, out of
+     * the per-datagram path; only the fields the next receive depends on are
+     * reset below.
+     */
+
     if (op == NULL) {
-        return NGX_ERROR;
+        op = ngx_calloc(sizeof(ngx_win32_router_udp_recv_t),
+                        ngx_win32_router_log);
+        if (op == NULL) {
+            return NGX_ERROR;
+        }
+
+    } else {
+        ngx_memzero(&op->op.overlapped, sizeof(OVERLAPPED));
+        ngx_memzero(&op->msg, sizeof(WSAMSG));
+        ngx_memzero(&op->remote, sizeof(ngx_sockaddr_t));
+        op->flags = 0;
+        op->recvmsg = 0;
     }
 
     op->op.type = NGX_WIN32_ROUTER_OP_UDP_RECV;
@@ -1637,13 +1661,11 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
     listener->pending--;
     ngx_win32_router_pending--;
 
-    if (ngx_win32_router_udp_accepting
-        && ngx_win32_router_post_udp_recv(listener) != NGX_OK)
-    {
-        ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
-                      "could not replenish routed UDP receives for %s",
-                      listener->addr_text);
-    }
+    /*
+     * The datagram is consumed before the replacement receive is posted so
+     * that this operation, and its embedded buffers, can be handed straight
+     * back to ngx_win32_router_post_udp_recv().
+     */
 
     if (error) {
         if (error != ERROR_OPERATION_ABORTED && error != WSAEMSGSIZE) {
@@ -1652,8 +1674,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
                           listener->addr_text);
         }
 
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     if (!ngx_win32_router_udp_accepting) {
@@ -1667,8 +1688,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
                       "routed UDP receive was truncated for %s",
                       listener->addr_text);
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     remote_socklen = op->recvmsg ? (socklen_t) op->msg.namelen
@@ -1680,8 +1700,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
                       "routed UDP receive returned an invalid peer for %s",
                       listener->addr_text);
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     ngx_memcpy(&local, &listener->sockaddr, listener->socklen);
@@ -1690,8 +1709,7 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
 
     if (listener->wildcard && op->recvmsg) {
         if (op->msg.Control.len > sizeof(op->control)) {
-            ngx_free(op);
-            return;
+            goto replenish;
         }
 
         ngx_memzero(&msg, sizeof(msg));
@@ -1730,13 +1748,19 @@ ngx_win32_router_complete_udp_recv(ngx_win32_router_udp_recv_t *op,
         ngx_log_error(NGX_LOG_ERR, ngx_win32_router_log, 0,
                       "routed UDP receive returned no destination for %s",
                       listener->addr_text);
-        ngx_free(op);
-        return;
+        goto replenish;
     }
 
     (void) ngx_win32_router_dispatch_udp(op, bytes, &local.sockaddr,
                                          local_socklen);
-    ngx_free(op);
+
+replenish:
+
+    if (ngx_win32_router_post_udp_recv(listener, op) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ALERT, ngx_win32_router_log, 0,
+                      "could not replenish routed UDP receives for %s",
+                      listener->addr_text);
+    }
 }
 
 
@@ -3024,18 +3048,34 @@ ngx_win32_router_rebuild_ready_workers(void)
 }
 
 
+static ngx_uint_t
+ngx_win32_router_worker_eligible(ngx_win32_router_worker_t *worker)
+{
+    return worker->ready && worker->active
+           && worker->queued_messages < NGX_WIN32_ROUTER_CHANNEL_MESSAGES
+           && worker->queued_bytes < NGX_WIN32_ROUTER_CHANNEL_LIMIT;
+}
+
+
 static ngx_win32_router_worker_t *
 ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
 {
-    ngx_uint_t                  i, n, start, target;
+    ngx_uint_t                  i, n, start;
     ngx_win32_router_worker_t  *best, *worker;
+
+    if (ngx_win32_router_ready_worker_n == 0) {
+        return NULL;
+    }
 
     if (round_robin) {
         best = NULL;
 
-        if (ngx_win32_router_ready_worker_n == 0) {
-            return NULL;
-        }
+        /*
+         * Accepted connections carry no affinity, so they go to the least
+         * loaded worker.  Rotating the starting point keeps equally loaded
+         * workers from all receiving the same connection, which matters
+         * while the queues are still empty.
+         */
 
         start = ngx_win32_router_next_worker++
                 % ngx_win32_router_ready_worker_n;
@@ -3044,11 +3084,7 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
             i = (start + n) % ngx_win32_router_ready_worker_n;
             worker = ngx_win32_router_ready_workers[i];
 
-            if (!worker->ready || !worker->active
-                || worker->queued_messages
-                   >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-                || worker->queued_bytes >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
-            {
+            if (!ngx_win32_router_worker_eligible(worker)) {
                 continue;
             }
 
@@ -3063,36 +3099,24 @@ ngx_win32_router_select_worker(uint32_t hash, ngx_uint_t round_robin)
         return best;
     }
 
-    n = 0;
+    /*
+     * A datagram that starts a new flow is placed by hash so that the flow
+     * table, the QUIC route identifier, and this fallback all agree on an
+     * owner.  The hash is reduced modulo the whole ready set rather than
+     * modulo the eligible subset: using the eligible count would change the
+     * divisor whenever any worker hit its queue limit and would therefore
+     * remap every later flow onto a different worker.  Only the workers that
+     * are actually backlogged are skipped, by probing forward from the
+     * hashed position.
+     */
 
-    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
+    start = hash % ngx_win32_router_ready_worker_n;
+
+    for (n = 0; n < ngx_win32_router_ready_worker_n; n++) {
+        i = (start + n) % ngx_win32_router_ready_worker_n;
         worker = ngx_win32_router_ready_workers[i];
 
-        if (worker->ready && worker->active
-            && worker->queued_messages < NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-            && worker->queued_bytes < NGX_WIN32_ROUTER_CHANNEL_LIMIT)
-        {
-            n++;
-        }
-    }
-
-    if (n == 0) {
-        return NULL;
-    }
-
-    target = hash % n;
-
-    for (i = 0; i < ngx_win32_router_ready_worker_n; i++) {
-        worker = ngx_win32_router_ready_workers[i];
-
-        if (!worker->ready || !worker->active
-            || worker->queued_messages >= NGX_WIN32_ROUTER_CHANNEL_MESSAGES
-            || worker->queued_bytes >= NGX_WIN32_ROUTER_CHANNEL_LIMIT)
-        {
-            continue;
-        }
-
-        if (target-- == 0) {
+        if (ngx_win32_router_worker_eligible(worker)) {
             return worker;
         }
     }

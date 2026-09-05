@@ -1,0 +1,137 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'release-*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Create Release Build
+    runs-on: windows-2022
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+          mingw-w64-x86_64-pcre2
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-pkg-config
+          zip
+
+    - name: Build optimized release
+      shell: msys2 {0}
+      run: |
+        ./auto/configure \
+          --with-cc=gcc \
+          --with-cc-opt="-O3 -flto -march=x86-64 -mtune=generic" \
+          --with-ld-opt="-Wl,-s" \
+          --prefix=/nginx \
+          --sbin-path=/nginx/nginx.exe \
+          --conf-path=/nginx/conf/nginx.conf \
+          --pid-path=/nginx/logs/nginx.pid \
+          --error-log-path=/nginx/logs/error.log \
+          --http-log-path=/nginx/logs/access.log \
+          --with-http_ssl_module \
+          --with-http_v2_module \
+          --with-http_realip_module \
+          --with-http_addition_module \
+          --with-http_sub_module \
+          --with-http_dav_module \
+          --with-http_flv_module \
+          --with-http_mp4_module \
+          --with-http_gunzip_module \
+          --with-http_gzip_static_module \
+          --with-http_auth_request_module \
+          --with-http_random_index_module \
+          --with-http_secure_link_module \
+          --with-http_degradation_module \
+          --with-http_slice_module \
+          --with-http_stub_status_module \
+          --with-stream \
+          --with-stream_ssl_module \
+          --with-stream_realip_module \
+          --with-stream_ssl_preread_module
+        
+        make -j$(nproc)
+        
+        # Verify binary
+        ./objs/nginx.exe -V
+
+    - name: Run RC tests
+      shell: pwsh
+      run: |
+        Set-ExecutionPolicy -Scope Process Bypass
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+        
+        $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+        if ($openssl) {
+          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe -OpenSSLBinary $openssl.Source
+        } else {
+          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe
+        }
+
+    - name: Prepare release package
+      shell: msys2 {0}
+      run: |
+        VERSION=$(./objs/nginx.exe -v 2>&1 | grep -oP 'nginx/\K[0-9.]+')
+        PACKAGE_NAME="nginx-iocp-${VERSION}-win64"
+        
+        mkdir -p ${PACKAGE_NAME}/{conf,logs,html,docs}
+        
+        # Copy binary
+        cp objs/nginx.exe ${PACKAGE_NAME}/
+        
+        # Copy configuration
+        cp -r conf/* ${PACKAGE_NAME}/conf/
+        
+        # Copy HTML
+        cp -r html/* ${PACKAGE_NAME}/html/
+        
+        # Copy documentation
+        cp LICENSE ${PACKAGE_NAME}/
+        cp README.md ${PACKAGE_NAME}/
+        cp docs/win32*.md ${PACKAGE_NAME}/docs/
+        
+        # Copy dependencies
+        ldd objs/nginx.exe | grep mingw64 | awk '{print $3}' | while read dll; do
+          cp "$dll" ${PACKAGE_NAME}/
+        done
+        
+        # Create zip
+        zip -r ${PACKAGE_NAME}.zip ${PACKAGE_NAME}
+        
+        echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
+        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+    - name: Upload release artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.PACKAGE_NAME }}
+        path: ${{ env.PACKAGE_NAME }}.zip
+        retention-days: 30
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ env.PACKAGE_NAME }}.zip
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

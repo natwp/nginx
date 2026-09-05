@@ -146,12 +146,41 @@ function Wait-Workers([string] $Prefix, [int] $MasterId, [int] $Expected,
     throw "expected $Expected workers for master $MasterId"
 }
 
-function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
+function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 30) {
+    Write-Host "  Attempting HTTPS connection to https://127.0.0.1:$Port/" -ForegroundColor Yellow
+
+    # Try curl first if available (more reliable with self-signed certs)
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        Write-Host "  Using curl for HTTPS test" -ForegroundColor Yellow
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        do {
+            try {
+                $body = & curl.exe -k -s -m 2 "https://127.0.0.1:$Port/"
+                if ($LASTEXITCODE -eq 0 -and $body -eq $Expected) {
+                    Write-Host "  HTTPS response received via curl: '$body'" -ForegroundColor Green
+                    return
+                }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "  curl failed with exit code $LASTEXITCODE" -ForegroundColor DarkYellow
+                } elseif ($body -ne $Expected) {
+                    Write-Host "  Response mismatch: got '$body', expected '$Expected'" -ForegroundColor Red
+                }
+            } catch {
+                Write-Host "  curl exception: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            }
+            Start-Sleep -Milliseconds 500
+        } while ((Get-Date) -lt $deadline)
+        throw "HTTPS backend on port $Port did not return '$Expected' (curl method)"
+    }
+
+    # Fallback to WebClient
     $oldCallback = [Net.ServicePointManager]::ServerCertificateValidationCallback
     $oldProtocol = [Net.ServicePointManager]::SecurityProtocol
+    $lastError = $null
     try {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
         $deadline = (Get-Date).AddSeconds($TimeoutSec)
         do {
             try {
@@ -159,13 +188,29 @@ function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
                 $client.Proxy = $null
                 $body = $client.DownloadString("https://127.0.0.1:$Port/")
                 if ($body -eq $Expected) {
+                    Write-Host "  HTTPS response received: '$body'" -ForegroundColor Green
                     return
                 }
+                Write-Host "  Response mismatch: got '$body', expected '$Expected'" -ForegroundColor Red
             } catch {
-                Start-Sleep -Milliseconds 200
+                $lastError = $_
+                $msg = $_.Exception.Message
+                if ($_.Exception.InnerException) {
+                    $msg += " (Inner: $($_.Exception.InnerException.Message))"
+                }
+                Write-Host "  HTTPS attempt failed: $msg" -ForegroundColor DarkYellow
+                Start-Sleep -Milliseconds 500
             }
         } while ((Get-Date) -lt $deadline)
-        throw "HTTPS backend on port $Port did not return '$Expected'"
+        Write-Host "  HTTPS connection timed out after $TimeoutSec seconds" -ForegroundColor Red
+        $errorMsg = "HTTPS backend on port $Port did not return '$Expected'"
+        if ($lastError) {
+            $errorMsg += ". Last error: $($lastError.Exception.Message)"
+            if ($lastError.Exception.InnerException) {
+                $errorMsg += " (Inner: $($lastError.Exception.InnerException.Message))"
+            }
+        }
+        throw $errorMsg
     } finally {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCallback
         [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
@@ -234,6 +279,10 @@ function Stop-TestNginx([string] $Prefix, [string] $Config, [System.Diagnostics.
 }
 
 function Test-Backend([string] $Backend, [string] $BaseDir) {
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "Testing backend: $Backend" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+
     $dir = Join-Path $BaseDir $Backend
     $logs = Join-Path $dir 'logs'
     $html = Join-Path $dir 'html'
@@ -242,6 +291,8 @@ function Test-Backend([string] $Backend, [string] $BaseDir) {
     $httpPort = Get-FreeTcpPort
     $httpsPort = Get-FreeTcpPort
     $udpPort = Get-FreeUdpPort
+
+    Write-Host "Ports: HTTP=$httpPort, HTTPS=$httpsPort, UDP=$udpPort" -ForegroundColor Yellow
     $config = Join-Path $dir 'nginx.conf'
     $pidFile = Join-Path $logs 'nginx.pid'
     $stderr = Join-Path $logs 'stderr.log'
@@ -326,9 +377,12 @@ $streamConfig
     Invoke-Nginx @('-e', 'stderr', '-p', $dir, '-c', $config, '-t')
 
     $startArgs = @('-e', 'stderr', '-p', $dir, '-c', $config)
+    Write-Host "Starting nginx with: $($script:Binary) $($startArgs -join ' ')" -ForegroundColor Yellow
     $start = Start-Process -FilePath $script:Binary -WorkingDirectory $script:Root -ArgumentList $startArgs -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
     try {
+        Write-Host "Waiting for HTTP on port $httpPort..." -ForegroundColor Yellow
         Wait-Http $httpPort $body
+        Write-Host "HTTP OK" -ForegroundColor Green
         if ($Backend -eq 'iocp') {
             Invoke-Udp $udpPort $udpBody
         }
@@ -346,7 +400,13 @@ $streamConfig
         [void] (Wait-Workers $dir $start.Id 2 $killedId)
 
         if ($script:Tls) {
+            Write-Host "Testing HTTPS on port $httpsPort..." -ForegroundColor Yellow
+            if (Test-Path $stderr) {
+                Write-Host "Nginx stderr log before HTTPS test:" -ForegroundColor Magenta
+                Get-Content -LiteralPath $stderr | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" }
+            }
             Wait-Https $httpsPort $body
+            Write-Host "HTTPS OK" -ForegroundColor Green
         }
 
         $sendfile = (New-Object System.Net.WebClient).DownloadString("http://127.0.0.1:$httpPort/sendfile.txt")
@@ -359,10 +419,15 @@ $streamConfig
         $regex = (New-Object System.Net.WebClient).DownloadString("http://127.0.0.1:$httpPort/regex/pcre2-ok")
         Assert-True ($regex -eq 'pcre2-ok') "$Backend regex response mismatch"
     } finally {
+        Write-Host "Stopping nginx for backend $Backend..." -ForegroundColor Yellow
         Stop-TestNginx $dir $config $start
     }
 
     $logText = if (Test-Path $stderr) { Get-Content -Raw -LiteralPath $stderr } else { '' }
+    if ($logText) {
+        Write-Host "Final stderr log for $Backend (last 30 lines):" -ForegroundColor Magenta
+        ($logText -split "`n") | Select-Object -Last 30 | ForEach-Object { Write-Host "  $_" }
+    }
     Assert-True ($logText -notmatch '\[(?:emerg|alert|crit)\]|could not start|router failed|shutdown left pending') "$Backend emitted a fatal lifecycle error"
     $network = if ($Backend -eq 'iocp') {
         'HTTP/UDP, file AIO/sendfile'

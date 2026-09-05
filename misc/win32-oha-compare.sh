@@ -103,6 +103,14 @@ run_one() {
            CONNECTIONS="$connections" CLIENT_PROCESSES="$clients" \
            OHA_WARMUP_DURATION="$warmup_duration" \
            OHA_DURATION="$sample_duration" \
+           BENCH_HTTP2="${BENCH_HTTP2:-0}" \
+           BENCH_ACCEPT_MUTEX="${BENCH_ACCEPT_MUTEX:-}" \
+           BENCH_DISABLE_KEEPALIVE="${BENCH_DISABLE_KEEPALIVE:-0}" \
+           BENCH_QUERY_RATE="${BENCH_QUERY_RATE:-}" \
+           BENCH_HTTP_VERSION="${BENCH_HTTP_VERSION:-}" \
+           BENCH_MEMORY_UPSTREAM_DELAY_MS="${BENCH_MEMORY_UPSTREAM_DELAY_MS:-}" \
+           BENCH_MEMORY_UPSTREAM_BODY_BYTES="${BENCH_MEMORY_UPSTREAM_BODY_BYTES:-65536}" \
+           BENCH_PROXY_BUFFERING="${BENCH_PROXY_BUFFERING:-off}" \
            "$script_dir/win32-oha-bench.sh" "$binary" "$backend" \
                "$group" >"$attempt_dir/driver.stdout" \
                2>"$attempt_dir/driver.stderr" \

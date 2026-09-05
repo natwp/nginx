@@ -38,6 +38,272 @@ wrapper converts script paths and writes each Windows Node result to a native
 file before the WSL filter reads it; this avoids the `EISDIR` stdout-handle
 behavior of Windows Node when a WSL pipe is inherited.
 
+## September 1-2, 2026 correctness and router work
+
+Three changes landed after the August campaign.  All were built with MinGW
+`-O2 -Werror`, `FD_SETSIZE=1024`, and `NGX_IOCP_DIRECT_SEND_MIN_SIZE=4096`,
+and all benchmarks below ran from a ramdisk under the existing CPU gate.
+
+`8877cd2d0` stops `ngx_iocp_process_events()` from abandoning a completion
+batch.  `GetQueuedCompletionStatusEx()` has already removed every entry from
+the port, so returning `NGX_ERROR` on one unusable entry silently discarded
+up to 63 dequeued completions, each keeping its owner and `ngx_iocp_pending`
+references until shutdown; nothing observed the failure because
+`ngx_process_events_and_timers()` discards the return value.  Entries are now
+reported and skipped individually.  Validation: a two-worker lifecycle served
+129754 requests at 12978 req/s over 128 connections with reload under load and
+graceful quit, at a 100% success rate and with no alert, error,
+stale-operation, or shutdown drain message.
+
+`f1f4bcef4` makes routed UDP flow placement independent of backpressure.
+`ngx_win32_router_select_worker()` reduced the flow hash modulo the count of
+*eligible* workers, so one worker reaching its queue limit changed the divisor
+and remapped unrelated flows.  The hash is now reduced modulo the whole ready
+set, probing forward past backlogged workers.  An exhaustive check over 100000
+hashes with four ready workers showed the two forms agree on every hash while
+all workers are eligible, and that backlogging one worker remapped 50% of the
+unrelated flows before the change and none after it.
+
+`7ef90485d` recycles routed UDP receive operations.  Each datagram previously
+paid an `ngx_calloc()`, the zeroing, and the free of a ~66 KB operation, since
+the structure embeds a 65535-byte datagram buffer and a 512-byte control
+buffer.  The completion handler now consumes the datagram before posting the
+replacement receive and hands the same operation back, resetting only the
+overlapped structure, message header, peer address, flags, and recvmsg
+selector.  Measured at **+13.75%** request rate, 5/6 pairs retained, zero
+errors; reversing the candidate and control roles reproduced the win in the
+opposite direction at -6.09%.
+
+### Ordering bias in the paired UDP harness
+
+`misc/win32-udp-repeat.sh` alternates run order by repeat parity, so an odd
+`REPEATS` value leaves the candidate running second more often than first.
+That bias is worth roughly 3-4% on this workstation: the routing change above
+first measured -3.821% and -3.073% with the default `REPEATS=5`, even though
+an exhaustive check proves it cannot change placement in that workload.  With
+roles swapped and `REPEATS=6`, the same comparison returned +0.791%.  Use an
+even `REPEATS`, and confirm any accepted result by swapping the candidate and
+control roles.  Single-digit deltas recorded elsewhere in this document that
+used an odd repeat count may carry the same artifact.
+
+### TCP regression check for the September changes
+
+The three changes above touch the IOCP dispatch loop and the routed UDP
+paths, so the TCP workloads were re-measured against the August control
+`.build-iocp-try-send-fd1024-prefix-final-20260827/nginx.exe`.  All runs used
+`misc/win32-oha-compare.sh` with `REPEATS=6`, four workers, the native
+`oha-windows-amd64-pgo.exe`, and the CPU gate.
+
+| Workload | Connections | Pairs retained | Request-rate delta | Errors |
+| --- | ---: | ---: | ---: | ---: |
+| Static 64 KiB | 64 | 4/6 | -2.153% | 0 |
+| Static 64 KiB, roles swapped | 64 | 5/6 | +1.186% | 0 |
+| Fast 64 KiB proxy, buffering off | 64 | 4/6 | +2.412% | 0 |
+| Slow 64 KiB proxy, 25 ms delay | 128 | 5/6 | +4.293% | 0 |
+
+No workload regressed.  The static row is the only negative number and it
+does not survive a role swap: reversing candidate and control moved it to
++1.186%, so both directions sit inside +-2.2% with opposite signs, which is
+noise rather than a deficit.  The per-round static rates make the same point
+directly: excluding one rejected 21% outlier, the remaining rounds scatter
+-0.5%, -3.8%, +6.6%, -0.5%, and -6.6% around zero.  Aggregate nginx CPU was
+also slightly *lower* for the candidate on the static workload (3.523 versus
+3.573 occupied cores).  HTTP/2 is covered separately below.
+
+### HTTP/2 comparisons across backends are not meaningful
+
+An HTTP/2 build (`--with-http_v2_module`) was added and driven through the
+harness with `BENCH_HTTP2=1` and `BENCH_HTTP_VERSION=2`, using the same six
+CPU-gated rounds, four workers, and 64 connections as the HTTP/1.1 matrices.
+The one-worker rows are ordinary: IOCP measured `-2.804%` against select
+(6/6 pairs) and `-2.281%` against poll (5/6), matching the HTTP/1.1
+single-worker picture.
+
+The four-worker rows appear to show IOCP `+117.675%` over select and
+`+119.042%` over poll.  **Those two numbers do not measure the event
+method.**  On Windows, `ngx_event_process_init()` forces
+`ngx_use_accept_mutex` on for a multi-worker non-IOCP method and leaves it
+off for IOCP, so the select and poll conditions serialize their accepts
+while IOCP does not.  The per-condition CPU makes the artifact plain: at
+four workers select occupied 0.998 cores and poll 0.996, both essentially
+one core with five nginx processes present, against 3.376 cores for IOCP.
+Normalized per occupied core, select and poll are *ahead* of IOCP
+(8664 and 8737 requests/s/core versus 5616); they were simply prevented
+from using more than one core.  A connection audit confirmed 64 established
+client sockets on both sides, so this is not a connection-count artifact.
+
+The HTTP/1.1 IOCP rows recorded above are not affected: the router owns
+every IOCP listening socket, so an IOCP worker never calls `accept()` and
+never engaged this mutex.  The HTTP/1.1 select and poll rows are affected in
+the same way as the HTTP/2 ones, because `ngx_win32_router_required()` gates
+the router on `ecf->use == ngx_iocp_module.ctx_index` and those methods
+therefore accept in the workers.  The practical conclusion is that HTTP/2
+multi-worker numbers may only be compared within one event method, and the
+useful HTTP/2 result is the one-worker row plus IOCP's own `+123.697%`
+one-to-four-worker scaling.
+
+Every multi-worker select and poll figure recorded elsewhere in this
+document predates `0989c3c68`, so all of them serialized their accepts and
+understate those two methods.  That includes the three HTTP/1.1 backend
+matrices, whose four-worker IOCP-versus-select and IOCP-versus-poll deltas
+are consequently overstated by an unmeasured amount; the `+26.937%` static
+figure is the one most likely to shrink.  The historical rows are left as
+measured; do not compare them against numbers taken after that commit, and
+re-run any comparison that matters.
+
+### The forced accept mutex cost select about 30%
+
+Investigating the artifact above showed that the serialization was not a
+property of the select and poll methods but an unconditional override in
+`ngx_event_process_init()`, which ignored the `accept_mutex` directive and
+warned that the method "does not support" turning it off.  `0989c3c68`
+honors the directive.
+
+A probe build was compared with the override still in place, using four
+select workers, 64 connections, the 64 KiB static workload, and six
+CPU-gated rounds.  Honoring the directive measured **+32.655%** with 4/6
+pairs retained; reversing the candidate and control roles returned
+`-25.855%` with 4/6 retained, so both directions agree.  Occupied nginx CPU
+rose from 1.979 to 3.553 cores, which is where the throughput came from:
+serialized accept left about 1.6 cores idle.
+
+Because a paired comparison alone cannot show that concurrent accept is
+safe, the concurrent path also ran a two-minute lifecycle soak: 2521983
+requests at 19399 req/s over 128 connections, two reloads under sustained
+load, and a graceful quit, at a 100% success rate.  Every old worker exited
+with code 0 and the log contained no alert, crit, emerg, stale-operation, or
+shutdown drain message.  Setting `accept_mutex on` still serializes and
+still measures the lower rate, and IOCP is unaffected either way.
+
+The unmeasured case is connection churn, where accept contention would be
+highest.  This workstation cannot benchmark it for the reason given above,
+so the change is accepted on steady-state and reload evidence only.
+
+### `sendfile on` uses TransmitPackets exclusively
+
+An instrumented build counted the branches of
+`ngx_iocp_transmit_chain()` and reported them when the worker exited.
+Serving a 64 MiB file with `sendfile on` recorded 6732
+`TransmitPackets()` calls, zero declines, and zero calls to either
+`TransmitFile()` or the read-into-buffer fallback; a 64 KiB run recorded
+42182 calls with the same zero declines.  `TransmitPackets()` therefore
+handles the whole static-file path on this platform, and the
+`TransmitFile()` and buffered-send branches exist only as fallbacks for
+hosts where the extension is unavailable.  The 64 MiB run sustained
+2.08 GiB/s from the ramdisk with zero errors, so there is no
+file-transmit overhead left to remove.
+
+### Connection churn is not measurable on this workstation
+
+An initial attempt to use `--disable-keepalive` churn for the regression
+check produced 13-96% success rates that looked like a candidate regression.
+It was not one: the control degraded identically when re-run, because churn
+drives TIME_WAIT past the 16384-entry Windows ephemeral port range
+(`netsh int ipv4 show dynamicport tcp` reports `Start 49152, Number 16384`),
+and the pool needs roughly 150 seconds to drain.  Any churn measurement taken
+before that drain characterizes port exhaustion in the client rather than the
+server.  Use keepalive workloads here, or drain the pool between runs.
+
+### Rejected September optimization candidates
+
+Five further candidates were built and measured; none is in the tree.
+
+The router pipe **write batching** candidate coalesced several queued
+channel messages into one `WriteFile()`.  The channel is a byte-mode pipe
+carrying length-prefixed messages and the worker reads to an exact byte
+count, so this needed no reader change.  It was rejected on engagement
+rather than on throughput: an instrumented build counted 1467 batched
+writes out of 412239 total (0.36%, averaging 2.6 messages per batch) at 64
+byte datagrams, falling to 0.06% at 1200 bytes.  The pipe drains faster
+than datagrams arrive, so the queue almost never holds a second message and
+the extra copy plus multi-message retirement logic buys nothing.
+
+A **128-entry worker completion batch** (`NGX_IOCP_BATCH=128`) was retried
+because the original rollback was driven by a connection-churn reversal
+that this workstation can no longer measure.  Six gated keepalive pairs
+returned -0.851% with 4/6 retained and CPU neutral at -0.007 cores, so the
+64-entry batch stands on its own merits, not only on the churn result.
+
+**Flow-key narrowing** hashed and compared only the populated key prefix,
+56 of 76 bytes for a tuple flow, since `cid[]` is zero for tuple flows and
+the remote address is zero for QUIC flows.  Six gated pairs with the native
+Windows client returned -0.130% with 5/6 retained: correct, but neutral,
+and not worth widening `ngx_win32_router_flow_key()`,
+`ngx_win32_router_find_flow()`, and `ngx_win32_router_set_flow()` by a
+length argument.
+
+**Accept-op recycling** in `ngx_event_acceptex_complete()` was left
+unmeasured.  It is the same alloc-and-free-per-event shape as the routed
+UDP receive, but the accept operation is small rather than ~66 KB, and it
+is only observable under the connection churn described above.
+
+The **routed AcceptEx bookkeeping cache** was recovered from `2214973ca`
+and re-ported onto the current router: a 128-entry free list where
+`ngx_win32_router_alloc_accept()` pops a cached object and
+`ngx_win32_router_finish_accept()` pushes one back after closing its socket.
+Six gated pairs on the 256-connection keepalive empty response measured
+`-1.104%` with 4/6 retained, and swapping the roles returned `-1.442%` with
+5/6, with CPU neutral at 1.388 versus 1.421 cores.  Both directions are
+negative and inside the noise floor, which matches the historical `+0.645%`
+keepalive row being sub-noise as well.  The `+11.337%` churn row that
+originally justified the cache remains unverified rather than disproven, for
+the port-exhaustion reason above, so the cache stays out of the tree.
+
+### Where the routed UDP cost actually sits
+
+Per-process CPU accounting over an 8.5 second native-client UDP run put the
+router thread at 6.97 CPU seconds against 5.14 seconds for all four workers
+combined, so the router is **57.5% of nginx CPU** and about 0.82 of one
+core at roughly 43000 datagrams/s.  It is the bottleneck for routed UDP,
+and it is single-threaded by design.
+
+A gprof profile of that router, with instrumentation overhead excluded,
+attributes 64.3% of real work to the dispatch loop body itself,
+14.3% to `ngx_win32_router_find_flow()`, and 7.1% to `memcpy`.  Normalized
+per datagram the loop performs about 3.1 `ngx_alloc()` calls, 2.1
+`ngx_inet_get_port()` calls, and 1.0 `ngx_cmp_sockaddr()` call, the latter
+two from the `ngx_win32_router_find_udp_listener()` verification on the
+send path.  `find_flow` also refreshes an LRU deadline and moves two queue
+nodes on every lookup.  Any further routed-UDP work should target the
+dispatch loop and the flow lookup, not the copies: the copy-removal
+experiments recorded above were all measured and rejected.
+
+### Single-read channel framing, also rejected
+
+The profile above was then acted on directly.  The router read each worker
+message with two `ReadFile()` calls, a 16-byte header followed by the body,
+so a routed UDP response cost two pipe completions and one `ngx_alloc()`
+before its datagram was even sent.  The candidate replaced that with one
+speculative read into a per-worker buffer, parsing however many whole
+messages arrived, handling each in place with no allocation or copy, and
+retaining only a trailing partial message.  Two cheap items rode along: the
+listener port is precomputed at listener-add time instead of being read
+twice per datagram by `ngx_win32_router_listener_matches()`, and a flow
+deadline is refreshed at most once a minute instead of on every lookup.
+
+Progress is guaranteed because the buffer holds one maximum-sized message:
+a retained tail is at most `NGX_WIN32_CHANNEL_MAX_MESSAGE - 1` bytes, so the
+next read always requests at least one byte, and a validated length always
+fits.
+
+It did not pay.  Six gated pairs with the native Windows client measured
+-1.765% with 4/6 retained, and reversing the candidate and control roles
+returned +1.981% with 5/6 retained, so the result is noise with the sign
+following run order rather than the code.  Suspecting that a
+128 KiB overlapped `ReadFile()` was charging page-locking for a buffer that
+one queued message never fills, a second variant capped the request at 4096
+bytes; it measured -0.347% with 6/6 pairs retained, which is the cleanest
+run of the three and still neutral.
+
+Both variants were reverted.  The conclusion is that the two pipe reads per
+message were never the routed-UDP bottleneck: the read completion is
+already cheap relative to the rest of the dispatch loop, and removing one
+completion plus one allocation per message is not measurable at
+43000 datagrams/s.  The dispatch loop cost is dominated by the completion
+machinery itself rather than by the number of completions, so the remaining
+avenue for routed UDP is the single-threaded router design, not further
+micro-optimization inside it.
+
 ## August 27, 2026 current IOCP source
 
 The current IOCP implementation is `d000c73ba`.  It includes the
@@ -246,9 +512,9 @@ every single-worker or readiness comparison.
 | 128-entry worker completion batch | 256-way keepalive, empty response | 7/7 | +3.689% | 7.648/7.725 ms | 10.533/10.653 ms | Rolled back after the connection-churn reversal. |
 | 128-entry worker completion batch | 256-way keepalive, 64 KiB file | 6/7 | +1.715% | 41.868/42.277 ms | 49.556/51.015 ms | Rolled back after the connection-churn reversal. |
 | 128-entry worker completion batch | 128-way connection churn | 4/7 | -7.047% | 13.324/12.757 ms | 40.837/37.773 ms | Rolled back; the existing 64-entry batch remains. |
-| 128-entry routed AcceptEx bookkeeping cache | 128-way connection churn | 5/7 | +11.337% | 13.189/14.157 ms | 36.289/67.924 ms | Kept. |
-| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, empty response | 7/7 | +0.645% | 7.170/7.250 ms | 8.160/8.612 ms | Kept. |
-| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, 64 KiB file | 6/7 | +1.906% | 37.575/38.224 ms | 42.086/44.741 ms | Kept. |
+| 128-entry routed AcceptEx bookkeeping cache | 128-way connection churn | 5/7 | +11.337% | 13.189/14.157 ms | 36.289/67.924 ms | Kept at the time, but absent from the current tree; see below. |
+| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, empty response | 7/7 | +0.645% | 7.170/7.250 ms | 8.160/8.612 ms | Kept at the time, but absent from the current tree; see below. |
+| 128-entry routed AcceptEx bookkeeping cache | 256-way keepalive, 64 KiB file | 6/7 | +1.906% | 37.575/38.224 ms | 42.086/44.741 ms | Kept at the time, but absent from the current tree; see below. |
 | TLS write-notification handle cache | HTTPS, 16-way throttled 4 MiB response | 7/7 | +0.019% | 635.507/638.477 ms | 646.911/651.473 ms | Rolled back: throughput was neutral under backpressure. |
 | TLS write-notification handle cache | HTTPS, 64-way connection churn | 7/7 | -12.705% | 98.405/94.641 ms | 167.722/136.845 ms | Rolled back: handle reuse regressed handshake/churn latency. |
 
@@ -410,11 +676,23 @@ pool is held by the IOCP operation, so buffers handed directly to `WSASend()`
 remain alive until completion; smaller operations retain the explicit copy
 for short-response stability.
 
-The routed AcceptEx cache retains at most 128 completed bookkeeping objects.
-It never caches or reuses an accepted socket, an outstanding OVERLAPPED
-operation, or an object still awaiting a worker acknowledgement.  An object
-enters the cache only after its socket has been closed and its router queues
-have been unlinked.
+The routed AcceptEx cache is **not present in the current tree**.  It was
+measured and kept during the August campaign, then dropped by the
+`19c7ac777` router reset without a recorded decision; the rows above are
+retained because the measurement was real, not because the code survives.
+The implementation is still recoverable from `2214973ca`: a 128-entry free
+list where `ngx_win32_router_alloc_accept()` pops a cached object and
+`ngx_win32_router_finish_accept()` pushes one back after closing its
+socket.  Its safety rules were that it never cached or reused an accepted
+socket, an outstanding OVERLAPPED operation, or an object still awaiting a
+worker acknowledgement; an object entered the cache only after its socket
+had been closed and its router queues had been unlinked.  It was re-ported
+and measured in September; see the rejected-candidates section above, where
+both role orders came out negative and inside the noise floor on keepalive.
+The +11.337% churn result cannot currently be reproduced on this
+workstation: connection churn exhausts the 16384-port Windows ephemeral
+range and drives TIME_WAIT past 21000 sockets, so success rates collapse to
+13-16% and the measurement characterizes the client rather than the server.
 
 The TLS wait-object experiment cached the `WSAEVENT` and thread-pool wait used
 by OpenSSL `WANT_WRITE` notifications.  A diagnostic run confirmed that the

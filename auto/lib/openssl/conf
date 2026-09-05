@@ -54,9 +54,8 @@ if [ $OPENSSL != NONE ]; then
 
 else
 
-    if [ "$NGX_PLATFORM" != win32 ]; then
-
-        OPENSSL=NO
+    # Enable system OpenSSL detection on all platforms including Windows
+    OPENSSL=NO
 
         ngx_feature="OpenSSL library"
         ngx_feature_name="NGX_OPENSSL"
@@ -178,7 +177,6 @@ END
                 fi
             fi
         fi
-    fi
 
     if [ $OPENSSL != YES ]; then
 
