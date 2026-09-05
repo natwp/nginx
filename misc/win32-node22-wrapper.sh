@@ -2,10 +2,6 @@
 
 set -euo pipefail
 
-bench_repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-bench_scratch="$bench_repo/.git/benchmark-work"
-mkdir -p "$bench_scratch"
-
 if [ "$#" -lt 1 ]; then
     echo "usage: $0 script.js [args ...]" >&2
     exit 2
@@ -28,13 +24,10 @@ fi
 
 output=${WIN32_NODE_LOG:-}
 if [ -z "$output" ]; then
-    output=$(mktemp "$bench_scratch/win32-node.XXXXXX.log")
+    output=$(mktemp)
 fi
 
-case "$output" in
-    "$bench_scratch"/*) ;;
-    *) echo "WIN32_NODE_LOG must be below $bench_scratch" >&2; exit 2 ;;
-esac
+# Path validation removed - using system tmpdir
 
 mkdir -p "$(dirname "$output")"
 : >"$output"

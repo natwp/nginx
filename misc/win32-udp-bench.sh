@@ -2,10 +2,6 @@
 
 set -euo pipefail
 
-bench_repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-bench_scratch="$bench_repo/.git/benchmark-work"
-mkdir -p "$bench_scratch"
-
 if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
     echo "usage: $0 nginx.exe [iocp|select|poll] [label] [udp-receives]" >&2
     exit 2
@@ -165,7 +161,7 @@ get_free_port() {
         | tr -d '\r'
 }
 
-prefix=$(mktemp -d "$bench_scratch/nginx-iocp-udp-bench.XXXXXX")
+prefix=$(mktemp -d)
 prefix_win=$(wslpath -m "$prefix")
 port=$(get_free_port)
 started=0
@@ -181,9 +177,7 @@ cleanup() {
     fi
 
     if [ "${KEEP_ARTIFACTS:-0}" != 1 ]; then
-        case "$prefix" in
-            "$bench_scratch"/nginx-iocp-udp-bench.*) rm -rf -- "$prefix" ;;
-        esac
+        rm -rf -- "$prefix"
     fi
 }
 

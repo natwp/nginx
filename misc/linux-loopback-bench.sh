@@ -2,10 +2,6 @@
 
 set -euo pipefail
 
-bench_repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-bench_scratch="$bench_repo/.git/benchmark-work"
-mkdir -p "$bench_scratch"
-
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
     echo "usage: $0 nginx [label]" >&2
     exit 2
@@ -146,7 +142,7 @@ wait_down() {
     return 1
 }
 
-prefix=$(mktemp -d "$bench_scratch/nginx-linux-bench.XXXXXX")
+prefix=$(mktemp -d)
 port=$(get_free_port)
 started=0
 
@@ -158,9 +154,7 @@ cleanup() {
     fi
 
     if [ "${KEEP_ARTIFACTS:-0}" != 1 ]; then
-        case "$prefix" in
-            "$bench_scratch"/nginx-linux-bench.*) rm -rf -- "$prefix" ;;
-        esac
+    rm -rf -- "$prefix"
     fi
 }
 

@@ -2,10 +2,6 @@
 
 set -euo pipefail
 
-bench_repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-bench_scratch="$bench_repo/.git/benchmark-work"
-mkdir -p "$bench_scratch"
-
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
     echo "usage: $0 nginx.exe [label]" >&2
     exit 2
@@ -14,7 +10,7 @@ fi
 binary=$(realpath "$1")
 label=${2:-$(basename "$(dirname "$binary")")}
 script_dir=$(cd "$(dirname "$0")" && pwd)
-results_root=${RESULTS_DIR:-$bench_scratch/nginx-oha-matrix-20260819}
+results_root=${RESULTS_DIR:-./nginx-oha-matrix}
 repeats=${REPEATS:-6}
 max_attempts=${MAX_ATTEMPTS:-2}
 resume=${RESUME:-0}
@@ -47,8 +43,8 @@ if [ "${#conditions[@]}" -lt 2 ]; then
 fi
 
 case "$results_root" in
-    "$bench_scratch"/*) ;;
-    *) echo "RESULTS_DIR must be below $bench_scratch" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "RESULTS_DIR must be an absolute path" >&2; exit 2 ;;
 esac
 
 case "$repeats" in
@@ -156,7 +152,7 @@ run_one() {
              "(connections=$connections clients=$clients, " \
              "attempt $attempt/$max_attempts)" >&2
 
-        if RESULTS_DIR="$attempt_dir" BENCH_SCRATCH_ROOT="$bench_scratch" \
+        if RESULTS_DIR="$attempt_dir" BENCH_SCRATCH_ROOT="${TMPDIR:-/tmp}" \
            MASTER_PROCESS=on DAEMON=off BENCH_DIRECT_QUIT=0 \
            BENCH_PATHS="$paths" WORKER_PROCESSES="$workers" \
            CONNECTIONS="$connections" CLIENT_PROCESSES="$clients" \

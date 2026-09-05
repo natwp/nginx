@@ -2,10 +2,6 @@
 
 set -euo pipefail
 
-bench_repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-bench_scratch="$bench_repo/.git/benchmark-work"
-mkdir -p "$bench_scratch"
-
 if [ "$#" -lt 2 ] || [ "$#" -gt 5 ]; then
     echo "usage: $0 candidate.exe control.exe [backend] [candidate-label] [control-label]" >&2
     exit 2
@@ -17,7 +13,7 @@ backend=${3:-iocp}
 candidate_label=${4:-candidate}
 control_label=${5:-control}
 script_dir=$(cd "$(dirname "$0")" && pwd)
-results_root=${RESULTS_DIR:-$bench_scratch/nginx-oha-compare-20260819}
+results_root=${RESULTS_DIR:-./nginx-oha-compare}
 repeats=${REPEATS:-6}
 max_attempts=${MAX_ATTEMPTS:-2}
 workers=${WORKER_PROCESSES:-1}
@@ -30,8 +26,8 @@ filter_node=${FILTER_NODE_BIN:-$(command -v node || true)}
 resume=${RESUME:-0}
 
 case "$results_root" in
-    "$bench_scratch"/*) ;;
-    *) echo "RESULTS_DIR must be below $bench_scratch" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "RESULTS_DIR must be an absolute path" >&2; exit 2 ;;
 esac
 
 case "$backend" in
@@ -101,7 +97,7 @@ run_one() {
         echo "comparison round $repeat/$repeats: $group " \
              "(attempt $attempt/$max_attempts)" >&2
 
-        if RESULTS_DIR="$attempt_dir" BENCH_SCRATCH_ROOT="$bench_scratch" \
+        if RESULTS_DIR="$attempt_dir" BENCH_SCRATCH_ROOT="${TMPDIR:-/tmp}" \
            MASTER_PROCESS=on DAEMON=off BENCH_DIRECT_QUIT=0 \
            BENCH_PATHS="$paths" WORKER_PROCESSES="$workers" \
            CONNECTIONS="$connections" CLIENT_PROCESSES="$clients" \

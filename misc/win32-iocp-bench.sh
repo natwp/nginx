@@ -2,10 +2,6 @@
 
 set -euo pipefail
 
-bench_repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-bench_scratch="$bench_repo/.git/benchmark-work"
-mkdir -p "$bench_scratch"
-
 if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
     echo "usage: $0 nginx.exe [iocp|select|poll] [on|off] [label]" >&2
     exit 2
@@ -20,7 +16,7 @@ node_bin=${NODE_BIN:-$(command -v node || true)}
 node_output_file=${NODE_OUTPUT_FILE:-0}
 aggregate_node_bin=${FILTER_NODE_BIN:-$(command -v node || true)}
 results_dir=${RESULTS_DIR:-$PWD/bench-results}
-scratch_root=${BENCH_SCRATCH_ROOT:-$bench_scratch}
+scratch_root=${BENCH_SCRATCH_ROOT:-${TMPDIR:-/tmp}}
 protocol=${BENCH_PROTOCOL:-http}
 connections=${CONNECTIONS:-32}
 client_processes=${CLIENT_PROCESSES:-1}
@@ -318,10 +314,7 @@ cleanup() {
     fi
 
     if [ "${KEEP_ARTIFACTS:-0}" != 1 ]; then
-        case "$prefix" in
-            "$bench_scratch"/nginx-iocp-bench.*)
-                rm -rf -- "$prefix" ;;
-        esac
+    rm -rf -- "$prefix"
     fi
 }
 

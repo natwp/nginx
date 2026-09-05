@@ -180,7 +180,7 @@ The repeatable current harness is committed as `902d45199`.  It records
 request rate, MiB/s, nginx CPU by role, optional TCP connection audits,
 in-memory upstream concurrency statistics, and unpaired rounds rather than
 silently treating missing samples as paired.  Successful runs remove only
-their validated `.git/benchmark-work/nginx-oha.XXXXXX` scratch directory from WSL.
+their validated scratch directory from WSL.
 
 ### Wepoll readiness reference
 
@@ -327,8 +327,7 @@ one client process; the scaled mode used 12 connections per worker and one
 client process per worker (four clients for the four-worker rows).  Rates are
 per-condition medians after the noise filter; CPU is the aggregate nginx
 worker/router utilization expressed as occupied logical cores.  The raw and
-filtered JSONL is retained under
-`benchmark-artifacts/native-oha-matrix/`.
+filtered JSONL is retained in the benchmark results directory.
 
 | Load model | Backend | Workers | Requests/s | MiB/s | nginx CPU cores |
 | --- | --- | ---: | ---: | ---: | ---: |

@@ -2,10 +2,6 @@
 
 set -euo pipefail
 
-bench_repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
-bench_scratch="$bench_repo/.git/benchmark-work"
-mkdir -p "$bench_scratch"
-
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
     echo "usage: $0 nginx.exe [iocp|select|poll|wepoll] [label]" >&2
     exit 2
@@ -17,8 +13,8 @@ label=${3:-$(basename "$(dirname "$binary")")-$backend-oha}
 script_dir=$(cd "$(dirname "$0")" && pwd)
 node_bin=${NODE_BIN:-$script_dir/win32-node22-wrapper.sh}
 oha_bin=${OHA_BIN:-$script_dir/../oha-windows-amd64-pgo.exe}
-scratch_root=${BENCH_SCRATCH_ROOT:-$bench_scratch}
-results_dir=${RESULTS_DIR:-$bench_scratch/nginx-oha-results-20260819}
+scratch_root=${BENCH_SCRATCH_ROOT:-${TMPDIR:-/tmp}}
+results_dir=${RESULTS_DIR:-./nginx-oha-results}
 paths=${BENCH_PATHS:-/empty.gif /64k.bin}
 connections=${CONNECTIONS:-32}
 client_processes=${CLIENT_PROCESSES:-1}
@@ -122,19 +118,19 @@ case "$direct_quit" in
 esac
 
 case "$scratch_root" in
-    "$bench_scratch"|"$bench_scratch"/*) ;;
-    *) echo "BENCH_SCRATCH_ROOT must be $bench_scratch or below it" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "BENCH_SCRATCH_ROOT must be an absolute path" >    *) echo "BENCH_SCRATCH_ROOT must be an absolute path" >&2; exit 2 ;;2; exit 2 ;;
 esac
 
 case "$results_dir" in
-    "$bench_scratch"|"$bench_scratch"/*) ;;
-    *) echo "RESULTS_DIR must be $bench_scratch or below it" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "RESULTS_DIR must be an absolute path" >    *) echo "RESULTS_DIR must be an absolute path" >&2; exit 2 ;;2; exit 2 ;;
 esac
 
 if [ -n "$gprof_dir" ]; then
     case "$gprof_dir" in
-        "$bench_scratch"/*) ;;
-        *) echo "NGX_GPROF_DIR must be below $bench_scratch" >&2; exit 2 ;;
+        /*) ;;
+        *) echo "NGX_GPROF_DIR must be an absolute path" >        *) echo "NGX_GPROF_DIR must be an absolute path" >&2; exit 2 ;;2; exit 2 ;;
     esac
 fi
 
