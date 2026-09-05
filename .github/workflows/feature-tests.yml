@@ -64,8 +64,7 @@ jobs:
           '    }' \
           '}' > iocp-test.conf
 
-        config_path=$(cygpath -w "$PWD/iocp-test.conf")
-        if ./objs/nginx.exe -t -c "$config_path"; then
+        if ./objs/nginx.exe -t -p ./ -c iocp-test.conf; then
           echo "✓ IOCP event method validated"
         else
           echo "✗ IOCP validation failed"
@@ -95,8 +94,7 @@ jobs:
           '    }' \
           '}' > select-test.conf
 
-        config_path=$(cygpath -w "$PWD/select-test.conf")
-        if ./objs/nginx.exe -t -c "$config_path"; then
+        if ./objs/nginx.exe -t -p ./ -c select-test.conf; then
           echo "✓ Select event method validated"
         else
           echo "✗ Select validation failed"
@@ -126,8 +124,7 @@ jobs:
           '    }' \
           '}' > poll-test.conf
 
-        config_path=$(cygpath -w "$PWD/poll-test.conf")
-        if ./objs/nginx.exe -t -c "$config_path"; then
+        if ./objs/nginx.exe -t -p ./ -c poll-test.conf; then
           echo "✓ Poll event method validated"
         else
           echo "✗ Poll validation failed"
@@ -157,8 +154,7 @@ jobs:
           '    }' \
           '}' > multi-worker-test.conf
 
-        config_path=$(cygpath -w "$PWD/multi-worker-test.conf")
-        if ./objs/nginx.exe -t -c "$config_path"; then
+        if ./objs/nginx.exe -t -p ./ -c multi-worker-test.conf; then
           echo "✓ Multi-worker configuration validated"
         else
           echo "✗ Multi-worker validation failed"
