@@ -1,0 +1,283 @@
+name: Load and Stress Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Test duration per scenario (e.g., 30s, 1m, 5m)'
+        required: false
+        default: '30s'
+      connections:
+        description: 'Number of concurrent connections'
+        required: false
+        default: '100'
+  schedule:
+    # Run weekly on Sunday at 2 AM UTC
+    - cron: '0 2 * * 0'
+
+jobs:
+  load-tests:
+    name: HTTP Load Tests
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+          mingw-w64-x86_64-pcre2
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-pkg-config
+
+    - name: Build optimized nginx
+      shell: msys2 {0}
+      run: |
+        ./auto/configure \
+          --with-cc=gcc \
+          --with-cc-opt="-O3 -march=x86-64" \
+          --with-pcre \
+          --with-http_ssl_module \
+          --with-http_v2_module \
+          --with-http_gzip_static_module \
+          --with-http_stub_status_module \
+          --with-stream \
+          --with-stream_ssl_module
+
+        make -j$(nproc)
+        ls -lh objs/nginx.exe
+
+    - name: Setup Node.js for load testing
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Install oha (HTTP load testing tool)
+      shell: pwsh
+      run: |
+        Write-Host "=== Installing oha load testing tool ===" -ForegroundColor Cyan
+        $ohaVersion = "v1.4.5"
+        $ohaUrl = "https://github.com/hatoo/oha/releases/download/$ohaVersion/oha-windows-amd64.zip"
+
+        Invoke-WebRequest -Uri $ohaUrl -OutFile oha.zip
+        Expand-Archive -Path oha.zip -DestinationPath . -Force
+
+        if (Test-Path ".\oha.exe") {
+          Write-Host "✓ oha installed successfully"
+          .\oha.exe --version
+        } else {
+          Write-Host "✗ oha installation failed"
+          exit 1
+        }
+
+    - name: Prepare test content
+      shell: pwsh
+      run: |
+        # Create test files of various sizes
+        New-Item -ItemType Directory -Force -Path html | Out-Null
+
+        # Small file (1KB)
+        "x" * 1024 | Out-File -Encoding ASCII -NoNewline html/1k.txt
+
+        # Medium file (64KB)
+        "y" * (64 * 1024) | Out-File -Encoding ASCII -NoNewline html/64k.txt
+
+        # Large file (1MB)
+        $content = "z" * (1024 * 1024)
+        [System.IO.File]::WriteAllText("html/1m.txt", $content)
+
+        Write-Host "✓ Test files created"
+        Get-ChildItem html/*.txt | ForEach-Object {
+          Write-Host "  $($_.Name): $([math]::Round($_.Length/1KB, 2)) KB"
+        }
+
+    - name: Create test configuration
+      shell: pwsh
+      run: |
+        $port = 8080
+
+        @"
+        worker_processes 4;
+        error_log logs/error.log warn;
+        pid logs/nginx.pid;
+
+        events {
+            use iocp;
+            worker_connections 1024;
+        }
+
+        http {
+            access_log off;
+            sendfile on;
+            tcp_nopush on;
+            keepalive_timeout 65;
+
+            server {
+                listen 127.0.0.1:$port;
+                server_name localhost;
+
+                location / {
+                    root html;
+                }
+
+                location /status {
+                    stub_status;
+                }
+            }
+        }
+"@ | Out-File -Encoding UTF8 conf/load-test.conf
+
+        Write-Host "✓ Load test configuration created"
+
+    - name: Run small file load test
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Small File (1KB) Load Test ===" -ForegroundColor Cyan
+
+        # Start nginx
+        New-Item -ItemType Directory -Force -Path logs | Out-Null
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Sleep -Seconds 3
+
+        # Run load test
+        $duration = "${{ github.event.inputs.duration || '30s' }}"
+        $connections = "${{ github.event.inputs.connections || '100' }}"
+
+        Write-Host "Duration: $duration, Connections: $connections"
+        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:8080/1k.txt
+
+        # Check status
+        $status = Invoke-WebRequest -Uri http://127.0.0.1:8080/status -UseBasicParsing
+        Write-Host ""
+        Write-Host "Nginx Status:" -ForegroundColor Yellow
+        Write-Host $status.Content
+
+        # Stop nginx
+        .\objs\nginx.exe -s quit
+        Start-Sleep -Seconds 2
+
+    - name: Run medium file load test
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Medium File (64KB) Load Test ===" -ForegroundColor Cyan
+
+        # Start nginx
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Sleep -Seconds 3
+
+        # Run load test
+        $duration = "${{ github.event.inputs.duration || '30s' }}"
+        $connections = "${{ github.event.inputs.connections || '100' }}"
+
+        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:8080/64k.txt
+
+        # Stop nginx
+        .\objs\nginx.exe -s quit
+        Start-Sleep -Seconds 2
+
+    - name: Run large file load test
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Large File (1MB) Load Test ===" -ForegroundColor Cyan
+
+        # Start nginx
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Sleep -Seconds 3
+
+        # Run load test with fewer connections for large files
+        $duration = "${{ github.event.inputs.duration || '30s' }}"
+        $connections = [math]::Max(50, [int]"${{ github.event.inputs.connections || '100' }}" / 2)
+
+        Write-Host "Using $connections connections for large file test"
+        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:8080/1m.txt
+
+        # Stop nginx
+        .\objs\nginx.exe -s quit
+        Start-Sleep -Seconds 2
+
+    - name: Run keepalive stress test
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Keepalive Stress Test ===" -ForegroundColor Cyan
+
+        # Start nginx
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Sleep -Seconds 3
+
+        # Run with HTTP/1.1 keepalive
+        $duration = "${{ github.event.inputs.duration || '30s' }}"
+        $connections = "${{ github.event.inputs.connections || '100' }}"
+
+        Write-Host "Testing with keepalive connections"
+        .\oha.exe -z $duration -c $connections --no-tui --http-version 1.1 http://127.0.0.1:8080/1k.txt
+
+        # Stop nginx
+        .\objs\nginx.exe -s quit
+        Start-Sleep -Seconds 2
+
+    - name: Run connection churn test
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Connection Churn Test ===" -ForegroundColor Cyan
+
+        # Start nginx
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","conf/load-test.conf" -NoNewWindow
+        Start-Sleep -Seconds 3
+
+        # Run with HTTP/1.0 (no keepalive)
+        $duration = "${{ github.event.inputs.duration || '30s' }}"
+        $connections = "${{ github.event.inputs.connections || '100' }}"
+
+        Write-Host "Testing connection churn (no keepalive)"
+        .\oha.exe -z $duration -c $connections --no-tui --http-version 1.0 --disable-keepalive http://127.0.0.1:8080/1k.txt
+
+        # Stop nginx
+        .\objs\nginx.exe -s quit
+        Start-Sleep -Seconds 2
+
+        Write-Host ""
+        Write-Host "✓ All load tests completed" -ForegroundColor Green
+
+    - name: Collect performance logs
+      if: always()
+      shell: pwsh
+      run: |
+        if (Test-Path logs/error.log) {
+          Write-Host ""
+          Write-Host "=== Error Log (last 50 lines) ===" -ForegroundColor Yellow
+          Get-Content logs/error.log -Tail 50
+        }
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: load-test-results
+        path: |
+          logs/*.log
+          conf/load-test.conf
+        retention-days: 14

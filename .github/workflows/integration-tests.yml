@@ -1,0 +1,410 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ master, 'fix/**', 'feature/**' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  lifecycle-tests:
+    name: Lifecycle and Multi-Worker Tests
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+          mingw-w64-x86_64-pcre2
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-pkg-config
+
+    - name: Build nginx
+      shell: msys2 {0}
+      run: |
+        ./auto/configure \
+          --with-cc=gcc \
+          --with-pcre \
+          --with-http_ssl_module \
+          --with-http_v2_module \
+          --with-stream \
+          --with-stream_ssl_module
+
+        make -j$(nproc)
+
+    - name: Test graceful shutdown
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Graceful Shutdown Test ===" -ForegroundColor Cyan
+
+        $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
+        New-Item -ItemType Directory -Path $prefix -Force | Out-Null
+        New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
+
+        @"
+        worker_processes 2;
+        error_log logs/error.log info;
+        pid logs/nginx.pid;
+        events {
+            worker_connections 512;
+        }
+        http {
+            server {
+                listen 127.0.0.1:0;
+                location / {
+                    return 200 "OK";
+                }
+            }
+        }
+"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+
+        try {
+          $prefixWin = $prefix -replace '\\', '/'
+
+          # Start nginx
+          Write-Host "Starting nginx..."
+          Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","$prefixWin/","-c","nginx.conf" -NoNewWindow
+          Start-Sleep -Seconds 3
+
+          # Check processes started
+          $processes = Get-Process nginx -ErrorAction SilentlyContinue
+          if ($processes.Count -ge 3) {
+            Write-Host "✓ Master + 2 workers started ($($processes.Count) processes)"
+          } else {
+            throw "Expected at least 3 nginx processes, found $($processes.Count)"
+          }
+
+          # Graceful shutdown
+          Write-Host "Sending graceful shutdown signal..."
+          .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -s quit
+
+          # Wait for processes to exit
+          $timeout = 10
+          $elapsed = 0
+          while ((Get-Process nginx -ErrorAction SilentlyContinue) -and ($elapsed -lt $timeout)) {
+            Start-Sleep -Seconds 1
+            $elapsed++
+          }
+
+          $remaining = Get-Process nginx -ErrorAction SilentlyContinue
+          if ($remaining) {
+            throw "Processes did not exit gracefully: $($remaining.Count) remaining"
+          }
+
+          Write-Host "✓ Graceful shutdown successful" -ForegroundColor Green
+
+        } finally {
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (Test-Path $prefix) {
+            Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
+          }
+        }
+
+    - name: Test reload configuration
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Configuration Reload Test ===" -ForegroundColor Cyan
+
+        $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
+        New-Item -ItemType Directory -Path $prefix -Force | Out-Null
+        New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
+
+        @"
+        worker_processes 2;
+        error_log logs/error.log info;
+        pid logs/nginx.pid;
+        events {
+            worker_connections 512;
+        }
+        http {
+            server {
+                listen 127.0.0.1:0;
+                location / {
+                    return 200 "Version 1";
+                }
+            }
+        }
+"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+
+        try {
+          $prefixWin = $prefix -replace '\\', '/'
+
+          # Start nginx
+          Write-Host "Starting nginx..."
+          Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","$prefixWin/","-c","nginx.conf" -NoNewWindow
+          Start-Sleep -Seconds 3
+
+          $beforeReload = Get-Process nginx -ErrorAction SilentlyContinue
+          Write-Host "Processes before reload: $($beforeReload.Count)"
+
+          # Modify configuration
+          Write-Host "Modifying configuration..."
+          @"
+        worker_processes 2;
+        error_log logs/error.log info;
+        pid logs/nginx.pid;
+        events {
+            worker_connections 512;
+        }
+        http {
+            server {
+                listen 127.0.0.1:0;
+                location / {
+                    return 200 "Version 2";
+                }
+            }
+        }
+"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+
+          # Reload configuration
+          Write-Host "Reloading configuration..."
+          .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -s reload
+          Start-Sleep -Seconds 3
+
+          $afterReload = Get-Process nginx -ErrorAction SilentlyContinue
+          Write-Host "Processes after reload: $($afterReload.Count)"
+
+          if ($afterReload.Count -ge 3) {
+            Write-Host "✓ Configuration reload successful" -ForegroundColor Green
+          } else {
+            throw "Expected at least 3 processes after reload, found $($afterReload.Count)"
+          }
+
+          # Cleanup
+          .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -s quit
+          Start-Sleep -Seconds 2
+
+        } finally {
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (Test-Path $prefix) {
+            Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
+          }
+        }
+
+    - name: Test multi-worker coordination
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Multi-Worker Coordination Test ===" -ForegroundColor Cyan
+
+        foreach ($workerCount in @(1, 2, 4)) {
+          Write-Host ""
+          Write-Host "Testing with $workerCount worker(s)..." -ForegroundColor Yellow
+
+          $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
+          New-Item -ItemType Directory -Path $prefix -Force | Out-Null
+          New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
+
+          @"
+        worker_processes $workerCount;
+        error_log logs/error.log info;
+        pid logs/nginx.pid;
+        events {
+            worker_connections 512;
+        }
+        http {
+            server {
+                listen 127.0.0.1:0;
+                location / {
+                    return 200 "Workers: $workerCount";
+                }
+            }
+        }
+"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+
+          try {
+            $prefixWin = $prefix -replace '\\', '/'
+
+            # Start nginx
+            Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","$prefixWin/","-c","nginx.conf" -NoNewWindow
+            Start-Sleep -Seconds 3
+
+            # Verify process count (1 master + N workers)
+            $processes = Get-Process nginx -ErrorAction SilentlyContinue
+            $expected = $workerCount + 1
+
+            if ($processes.Count -eq $expected) {
+              Write-Host "  ✓ Correct process count: $($processes.Count)"
+            } else {
+              throw "Expected $expected processes, found $($processes.Count)"
+            }
+
+            # Cleanup
+            .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -s quit
+            Start-Sleep -Seconds 2
+
+          } finally {
+            Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+            if (Test-Path $prefix) {
+              Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
+            }
+          }
+        }
+
+        Write-Host ""
+        Write-Host "✓ Multi-worker coordination tests passed" -ForegroundColor Green
+
+    - name: Test log rotation
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Log Rotation Test ===" -ForegroundColor Cyan
+
+        $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
+        New-Item -ItemType Directory -Path $prefix -Force | Out-Null
+        New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
+
+        @"
+        worker_processes 1;
+        error_log logs/error.log info;
+        pid logs/nginx.pid;
+        events {
+            worker_connections 512;
+        }
+        http {
+            server {
+                listen 127.0.0.1:0;
+                access_log logs/access.log;
+                location / {
+                    return 200 "OK";
+                }
+            }
+        }
+"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+
+        try {
+          $prefixWin = $prefix -replace '\\', '/'
+
+          # Start nginx
+          Write-Host "Starting nginx..."
+          Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","$prefixWin/","-c","nginx.conf" -NoNewWindow
+          Start-Sleep -Seconds 3
+
+          $errorLog = "$prefix\logs\error.log"
+
+          if (Test-Path $errorLog) {
+            $sizeBefore = (Get-Item $errorLog).Length
+            Write-Host "Error log size before rotation: $sizeBefore bytes"
+
+            # Rotate logs (reopen)
+            Write-Host "Sending reopen signal..."
+            .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -s reopen
+            Start-Sleep -Seconds 2
+
+            # Check if log file still exists and is writable
+            if (Test-Path $errorLog) {
+              Write-Host "✓ Log rotation successful" -ForegroundColor Green
+            } else {
+              throw "Error log disappeared after rotation"
+            }
+          } else {
+            throw "Error log not created"
+          }
+
+          # Cleanup
+          .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -s quit
+          Start-Sleep -Seconds 2
+
+        } finally {
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          if (Test-Path $prefix) {
+            Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
+          }
+        }
+
+    - name: Test event method switching
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host ""
+        Write-Host "=== Event Method Switching Test ===" -ForegroundColor Cyan
+
+        $methods = @('iocp', 'select', 'poll')
+
+        foreach ($method in $methods) {
+          Write-Host ""
+          Write-Host "Testing $method event method..." -ForegroundColor Yellow
+
+          $prefix = New-TemporaryFile | ForEach-Object { Remove-Item $_; $_.FullName }
+          New-Item -ItemType Directory -Path $prefix -Force | Out-Null
+          New-Item -ItemType Directory -Path "$prefix\logs" -Force | Out-Null
+
+          @"
+        worker_processes 2;
+        error_log logs/error.log info;
+        pid logs/nginx.pid;
+        events {
+            use $method;
+            worker_connections 512;
+        }
+        http {
+            server {
+                listen 127.0.0.1:0;
+                location / {
+                    return 200 "Method: $method";
+                }
+            }
+        }
+"@ | Out-File -Encoding UTF8 "$prefix\nginx.conf"
+
+          try {
+            $prefixWin = $prefix -replace '\\', '/'
+
+            # Start nginx
+            Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","$prefixWin/","-c","nginx.conf" -NoNewWindow
+            Start-Sleep -Seconds 3
+
+            # Check if it started successfully
+            $processes = Get-Process nginx -ErrorAction SilentlyContinue
+            if ($processes.Count -ge 3) {
+              Write-Host "  ✓ $method method works (3 processes running)"
+            } else {
+              throw "$method method failed to start properly"
+            }
+
+            # Cleanup
+            .\objs\nginx.exe -p "$prefixWin/" -c nginx.conf -s quit
+            Start-Sleep -Seconds 2
+
+          } finally {
+            Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+            if (Test-Path $prefix) {
+              Remove-Item -Recurse -Force $prefix -ErrorAction SilentlyContinue
+            }
+          }
+        }
+
+        Write-Host ""
+        Write-Host "✓ All event methods functional" -ForegroundColor Green
+
+    - name: Upload integration test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: integration-test-logs
+        path: |
+          logs/*.log
+        retention-days: 7

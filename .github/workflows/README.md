@@ -1,0 +1,252 @@
+# GitHub Actions CI/CD Workflows
+
+This directory contains all automated testing and release workflows for nginx-iocp.
+
+## Workflow Overview
+
+### Continuous Integration (Auto-Run on Push/PR)
+
+#### 1. **windows-build.yml** - Windows Build and Test
+- **Triggers**: Push to master, fix/*, feature/* branches; Pull requests
+- **Duration**: ~10 minutes
+- **Purpose**: Build verification with all major modules
+- **Modules tested**: HTTP SSL, HTTP/2, Stream SSL, gzip, stub_status
+- **Tests**: Binary validation, configuration tests
+
+#### 2. **smoke-tests.yml** - Quick Smoke Tests
+- **Triggers**: Push to master, fix/*, feature/* branches; Pull requests
+- **Duration**: ~15 minutes
+- **Purpose**: Fast validation of core functionality
+- **Coverage**:
+  - Binary execution and help output
+  - Configuration parsing
+  - Release candidate smoke tests (via `misc/win32-rc-test.ps1`)
+  - IOCP, select, poll backends
+  - Multi-worker lifecycle (start, reload, quit)
+  - HTTPS support (with OpenSSL)
+  - Gzip compression
+  - PCRE2 regex
+
+#### 3. **feature-tests.yml** - Module and Configuration Tests
+- **Triggers**: Push to master, fix/*, feature/* branches; Pull requests
+- **Duration**: ~30 minutes
+- **Purpose**: Validate different module combinations and configurations
+- **Test Matrix**:
+  - Core Modules (SSL, HTTP/2, realip)
+  - Content Modules (addition, sub, gunzip, gzip_static)
+  - Stream Modules (stream SSL, realip, ssl_preread)
+  - Extended Features (DAV, FLV, MP4, random_index, secure_link, slice, stub_status)
+- **Configuration Tests**:
+  - Event methods: IOCP, select, poll
+  - Worker counts: 1, 2, 4
+
+#### 4. **integration-tests.yml** - Lifecycle and Multi-Worker Tests
+- **Triggers**: Push to master, fix/*, feature/* branches; Pull requests
+- **Duration**: ~30 minutes
+- **Purpose**: Test complex lifecycle scenarios
+- **Coverage**:
+  - Graceful shutdown
+  - Configuration reload
+  - Multi-worker coordination (1, 2, 4 workers)
+  - Log rotation (reopen signal)
+  - Event method switching (IOCP, select, poll)
+
+#### 5. **code-quality.yml** - Code Quality Checks
+- **Triggers**: Push to master, fix/*, feature/* branches; Pull requests
+- **Duration**: ~5 minutes
+- **Purpose**: Static analysis and code quality
+- **Checks**: Formatting, style, potential issues
+
+### Manual/Scheduled Workflows
+
+#### 6. **load-tests.yml** - Load and Stress Tests
+- **Triggers**: Manual dispatch, Weekly (Sundays at 2 AM UTC)
+- **Duration**: ~60 minutes
+- **Purpose**: Stress testing under various loads
+- **Tests**:
+  - Small file (1KB) load test
+  - Medium file (64KB) load test
+  - Large file (1MB) load test
+  - Keepalive stress test
+  - Connection churn test
+- **Tool**: oha (HTTP load generator)
+- **Configurable**: Duration, connection count
+
+#### 7. **benchmarks-extended.yml** - Performance Benchmarks
+- **Triggers**: Manual dispatch, Monthly (1st at 3 AM UTC)
+- **Duration**: ~90 minutes
+- **Purpose**: Comprehensive performance measurement
+- **Test Suites**:
+  - **Quick**: 10s duration, 50 connections, 1 run
+  - **Standard**: 30s duration, 100 connections, 3 runs
+  - **Comprehensive**: 60s duration, 200 connections, 5 runs
+- **Backends Compared**: IOCP vs Select
+- **File Sizes**: 100B, 1KB, 4KB, 16KB, 64KB
+- **Additional**: UDP stream benchmarks
+- **Configurable**: Test suite, worker count
+
+#### 8. **release.yml** - Release Build
+- **Triggers**: Version tags (v*)
+- **Duration**: ~15 minutes
+- **Purpose**: Create optimized release builds
+- **Artifacts**: nginx.exe with full module set
+
+## Usage
+
+### Running Tests Locally
+
+Before pushing, you can validate changes locally:
+
+```bash
+# Build and run smoke tests
+# Run from the repository root
+./auto/configure --with-cc=gcc --with-pcre --with-http_ssl_module
+make
+pwsh misc/win32-rc-test.ps1
+```
+
+### Triggering Manual Workflows
+
+**Load Tests:**
+```
+GitHub UI → Actions → Load and Stress Tests → Run workflow
+  - duration: 30s (default), or 1m, 5m, etc.
+  - connections: 100 (default)
+```
+
+**Performance Benchmarks:**
+```
+GitHub UI → Actions → Performance Benchmarks (Extended) → Run workflow
+  - test_suite: quick / standard / comprehensive
+  - worker_count: 4 (default)
+```
+
+### Interpreting Results
+
+#### CI Workflows (Push/PR)
+All CI workflows must pass before merging:
+- ✅ Green check = all tests passed
+- ❌ Red X = failures need investigation
+- Check "Details" link for specific test failures
+
+#### Load Test Results
+Look for:
+- Request rate (req/s)
+- Error count (should be 0)
+- Response time percentiles
+- Server resource usage in logs
+
+#### Benchmark Results
+Compare IOCP vs Select performance:
+- Download artifacts from workflow run
+- Check `comparison.json` for improvement percentages
+- Positive % = IOCP faster than Select
+- Review per-file-size breakdowns
+
+## Artifacts
+
+Workflows upload test artifacts on completion:
+
+| Workflow | Artifact | Contents | Retention |
+|----------|----------|----------|-----------|
+| smoke-tests | smoke-test-logs | Error logs on failure | 7 days |
+| feature-tests | nginx-{module}-build | Built binaries | 3 days |
+| integration-tests | integration-test-logs | Lifecycle test logs | 7 days |
+| load-tests | load-test-results | Logs, configs | 14 days |
+| benchmarks-extended | benchmark-results-{suite} | JSON results, logs | 90 days |
+| benchmarks-extended | udp-benchmark-results | UDP test logs | 30 days |
+| release | nginx-iocp-{version} | Release binary | 90 days |
+
+## Test Coverage Summary
+
+```
+├── Build Verification
+│   └── windows-build.yml (10 min)
+│
+├── Functional Testing
+│   ├── smoke-tests.yml (15 min)          ← Quick validation
+│   ├── feature-tests.yml (30 min)        ← Module combinations
+│   └── integration-tests.yml (30 min)    ← Lifecycle scenarios
+│
+├── Performance Testing
+│   ├── load-tests.yml (60 min)           ← Stress testing
+│   └── benchmarks-extended.yml (90 min)  ← Performance measurement
+│
+├── Quality Assurance
+│   └── code-quality.yml (5 min)
+│
+└── Release
+    └── release.yml (15 min)
+```
+
+**Total CI Time per Push**: ~90 minutes (parallel execution)
+**Coverage**: Build, smoke, features, integration, quality = 5 workflows
+
+## Dependencies
+
+All workflows use:
+- **MSYS2**: MinGW-w64 GCC toolchain
+- **System Libraries**: PCRE2, OpenSSL, zlib (from MSYS2 packages)
+- **Testing Tools**:
+  - Node.js 22 (for benchmark scripts)
+  - oha v1.4.5 (HTTP load testing)
+  - PowerShell (test orchestration)
+
+## Maintenance
+
+### Adding New Tests
+
+1. Add test logic to appropriate workflow file
+2. Test manually via workflow_dispatch
+3. Adjust timeout if needed
+4. Update this README
+
+### Modifying Test Parameters
+
+Edit workflow YAML files directly:
+- Connection counts
+- Duration values
+- Worker process counts
+- Test matrices
+
+### Disabling Workflows
+
+Comment out trigger section or disable via GitHub UI:
+```yaml
+# on:
+#   push:
+#     branches: [ master ]
+```
+
+## Troubleshooting
+
+**Workflow hangs:**
+- Check timeout settings
+- Review last successful step in logs
+- Look for stuck nginx processes
+
+**Random failures:**
+- Check for port conflicts
+- Review CPU/memory in workflow logs
+- Consider increasing sleep delays
+
+**Build failures:**
+- Verify MSYS2 package availability
+- Check configure flags compatibility
+- Review compiler error messages
+
+**Test failures:**
+- Download test artifacts
+- Check error logs
+- Compare with previous successful runs
+
+## Performance Baselines
+
+See benchmark artifacts for current performance data. Typical results:
+
+- **IOCP vs Select**: 5-15% improvement for IOCP
+- **Multi-worker scaling**: Near-linear up to 4 workers
+- **Small files (1KB)**: 50,000+ req/s
+- **Large files (64KB)**: 10,000+ req/s
+
+All measurements on GitHub Actions Windows 2022 runners.

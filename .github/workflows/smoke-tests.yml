@@ -1,0 +1,111 @@
+name: Smoke Tests
+
+on:
+  push:
+    branches: [ master, 'fix/**', 'feature/**' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  smoke-tests:
+    name: Quick Smoke Tests
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+          mingw-w64-x86_64-pcre2
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-pkg-config
+
+    - name: Build nginx (optimized)
+      shell: msys2 {0}
+      run: |
+        ./auto/configure \
+          --with-cc=gcc \
+          --with-cpu-opt=generic \
+          --with-pcre \
+          --with-http_ssl_module \
+          --with-http_v2_module \
+          --with-http_gzip_static_module \
+          --with-stream \
+          --with-stream_ssl_module
+
+        make -j$(nproc)
+        ls -lh objs/nginx.exe
+
+    - name: Binary validation
+      shell: msys2 {0}
+      run: |
+        echo "=== Verify binary is executable ==="
+        ./objs/nginx.exe -v
+
+        echo ""
+        echo "=== Check compiled modules ==="
+        ./objs/nginx.exe -V 2>&1 | tr ' ' '\n' | grep -E '^--with'
+
+        echo ""
+        echo "=== Test help output ==="
+        if ./objs/nginx.exe -h 2>&1 | grep -q "Usage: nginx"; then
+          echo "✓ Help output works"
+        else
+          echo "✗ Help output failed"
+          exit 1
+        fi
+
+    - name: Configuration validation
+      shell: msys2 {0}
+      run: |
+        echo "=== Test configuration parsing ==="
+        mkdir -p logs
+
+        # Test with default config
+        if ./objs/nginx.exe -t -c conf/nginx.conf; then
+          echo "✓ Default config is valid"
+        else
+          echo "✗ Default config test failed"
+          exit 1
+        fi
+
+    - name: Run release candidate smoke tests
+      shell: pwsh
+      run: |
+        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
+
+        Write-Host "=== Running RC smoke tests ===" -ForegroundColor Cyan
+
+        # Find OpenSSL
+        $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+        if ($openssl) {
+          Write-Host "OpenSSL found: $($openssl.Source)"
+          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe -OpenSSLBinary $openssl.Source
+        } else {
+          Write-Host "OpenSSL not found - skipping HTTPS tests"
+          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe
+        }
+
+        Write-Host ""
+        Write-Host "✓ All smoke tests passed" -ForegroundColor Green
+
+    - name: Upload test logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: smoke-test-logs
+        path: |
+          objs/*.log
+          objs/logs/*.log
+        retention-days: 7
