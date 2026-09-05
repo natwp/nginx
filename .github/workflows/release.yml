@@ -1,22 +1,41 @@
 name: Release Build
 
+# Releases are produced exclusively by CI.  The build runs on a GitHub-hosted
+# runner and the resulting artifact is signed with a Sigstore build provenance
+# attestation, so consumers can verify the binary came from this workflow at a
+# specific commit and was not built or altered locally.
 on:
   push:
     tags:
       - 'v*'
-      - 'release-*'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag or commit to build (dry run; no release is published)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
 
 jobs:
   release:
-    name: Create Release Build
+    name: Build and Attest Release
     runs-on: windows-2022
-    
+    timeout-minutes: 60
+
+    permissions:
+      contents: write        # create the GitHub release
+      id-token: write        # Sigstore OIDC token for attestation
+      attestations: write    # record the provenance attestation
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v5
       with:
+        ref: ${{ github.event.inputs.ref || github.ref }}
         fetch-depth: 0
+        persist-credentials: false
 
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
@@ -38,7 +57,7 @@ jobs:
       run: |
         ./auto/configure \
           --with-cc=gcc \
-          --with-cc-opt="-O3 -flto -march=x86-64 -mtune=generic" \
+          --with-cc-opt="-O2 -march=x86-64 -mtune=generic" \
           --with-ld-opt="-Wl,-s" \
           --prefix=/nginx \
           --sbin-path=/nginx/nginx.exe \
@@ -46,6 +65,7 @@ jobs:
           --pid-path=/nginx/logs/nginx.pid \
           --error-log-path=/nginx/logs/error.log \
           --http-log-path=/nginx/logs/access.log \
+          --with-pcre \
           --with-http_ssl_module \
           --with-http_v2_module \
           --with-http_realip_module \
@@ -66,72 +86,207 @@ jobs:
           --with-stream_ssl_module \
           --with-stream_realip_module \
           --with-stream_ssl_preread_module
-        
+
         make -j$(nproc)
-        
-        # Verify binary
+
         ./objs/nginx.exe -V
 
-    - name: Run RC tests
+    - name: Verify release build is not a debug build
+      shell: msys2 {0}
+      run: |
+        # A --with-debug binary must never be shipped as a release.
+        if ./objs/nginx.exe -V 2>&1 | grep -q -- '--with-debug'; then
+          echo "release binary was configured with --with-debug"
+          exit 1
+        fi
+        echo "OK: release binary has no debug instrumentation"
+
+    - name: Verify tag matches source version
+      if: startsWith(github.ref, 'refs/tags/')
+      shell: msys2 {0}
+      run: |
+        # Guards against tagging a commit whose nginx.h says something else.
+        src_version=$(sed -n 's/^#define NGINX_VERSION *"\(.*\)"/\1/p' src/core/nginx.h)
+        tag="${GITHUB_REF#refs/tags/}"
+        tag_version="${tag#v}"
+        tag_version="${tag_version%%-*}"
+
+        echo "source version: $src_version"
+        echo "tag version:    $tag_version"
+
+        if [ "$src_version" != "$tag_version" ]; then
+          echo "tag $tag does not match NGINX_VERSION $src_version"
+          exit 1
+        fi
+        echo "OK: tag matches source version"
+
+    - name: Run release candidate tests
       shell: pwsh
       run: |
-        Set-ExecutionPolicy -Scope Process Bypass
         $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-        
+
         $openssl = Get-Command openssl -ErrorAction SilentlyContinue
         if ($openssl) {
+          Write-Host "Running RC matrix with TLS via $($openssl.Source)"
           .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe -OpenSSLBinary $openssl.Source
         } else {
+          Write-Host "openssl not found; running RC matrix without TLS"
           .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe
+        }
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "RC tests failed with code $LASTEXITCODE"
+          exit 1
         }
 
     - name: Prepare release package
       shell: msys2 {0}
       run: |
-        VERSION=$(./objs/nginx.exe -v 2>&1 | grep -oP 'nginx/\K[0-9.]+')
-        PACKAGE_NAME="nginx-iocp-${VERSION}-win64"
-        
-        mkdir -p ${PACKAGE_NAME}/{conf,logs,html,docs}
-        
-        # Copy binary
-        cp objs/nginx.exe ${PACKAGE_NAME}/
-        
-        # Copy configuration
-        cp -r conf/* ${PACKAGE_NAME}/conf/
-        
-        # Copy HTML
-        cp -r html/* ${PACKAGE_NAME}/html/
-        
-        # Copy documentation
-        cp LICENSE ${PACKAGE_NAME}/
-        cp README.md ${PACKAGE_NAME}/
-        cp docs/win32*.md ${PACKAGE_NAME}/docs/
-        
-        # Copy dependencies
-        ldd objs/nginx.exe | grep mingw64 | awk '{print $3}' | while read dll; do
-          cp "$dll" ${PACKAGE_NAME}/
-        done
-        
-        # Create zip
-        zip -r ${PACKAGE_NAME}.zip ${PACKAGE_NAME}
-        
-        echo "PACKAGE_NAME=${PACKAGE_NAME}" >> $GITHUB_ENV
-        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        set -eu
 
-    - name: Upload release artifact
+        version=$(sed -n 's/^#define NGINX_VERSION *"\(.*\)"/\1/p' src/core/nginx.h)
+        if [ -z "$version" ]; then
+          echo "could not determine NGINX_VERSION"
+          exit 1
+        fi
+        pkg="nginx-iocp-${version}-win64"
+
+        mkdir -p "$pkg/conf" "$pkg/logs" "$pkg/html" "$pkg/docs"
+
+        cp objs/nginx.exe "$pkg/"
+        cp -r conf/. "$pkg/conf/"
+
+        # The default docroot ships in docs/html, not html; nginx.conf's
+        # "root html" resolves relative to the install prefix.
+        cp -r docs/html/. "$pkg/html/"
+
+        cp LICENSE "$pkg/"
+        cp README.md "$pkg/"
+        cp docs/win32.md docs/win32-iocp-performance.md "$pkg/docs/"
+
+        # Bundle the MinGW runtime DLLs the binary actually links against.
+        # The `if` keeps a non-matching last iteration from tripping `set -e`.
+        ldd objs/nginx.exe | awk '/mingw64/ {print $3}' | sort -u | while read -r dll; do
+          if [ -f "$dll" ]; then
+            cp "$dll" "$pkg/"
+            echo "bundled $(basename "$dll")"
+          fi
+        done
+
+        # Fail loudly rather than shipping a package that cannot start.
+        for required in nginx.exe conf/nginx.conf conf/mime.types html/index.html LICENSE; do
+          if [ ! -f "$pkg/$required" ]; then
+            echo "package is missing $required"
+            exit 1
+          fi
+        done
+
+        zip -qr "$pkg.zip" "$pkg"
+        sha256sum "$pkg.zip" | tee "$pkg.zip.sha256"
+
+        echo "PACKAGE_NAME=$pkg" >> "$GITHUB_ENV"
+        echo "VERSION=$version" >> "$GITHUB_ENV"
+
+    - name: Smoke test the packaged binary
+      shell: pwsh
+      run: |
+        # Run the packaged tree exactly as a user would unzip and run it,
+        # so a broken package fails the release instead of shipping.
+        $pkg = "${{ env.PACKAGE_NAME }}"
+        Push-Location $pkg
+        try {
+          New-Item -ItemType Directory -Path logs -Force | Out-Null
+
+          $conf = @(
+            'worker_processes 1;',
+            'error_log logs/error.log notice;',
+            'pid logs/nginx.pid;',
+            'events { worker_connections 256; }',
+            'http {',
+            '    include mime.types;',
+            '    default_type application/octet-stream;',
+            '    server {',
+            '        listen 18100;',
+            '        location / { root html; index index.html; }',
+            '    }',
+            '}'
+          ) -join "`n"
+          $conf | Out-File -Encoding ASCII conf/release-smoke.conf
+
+          .\nginx.exe -t -p ./ -c conf/release-smoke.conf
+          if ($LASTEXITCODE -ne 0) { throw "packaged binary failed config test" }
+
+          Start-Process -FilePath ".\nginx.exe" `
+            -ArgumentList "-p","./","-c","conf/release-smoke.conf" -NoNewWindow
+
+          $ready = $false
+          foreach ($attempt in 1..30) {
+            Start-Sleep -Milliseconds 500
+            try {
+              $resp = Invoke-WebRequest -Uri http://127.0.0.1:18100/ `
+                -UseBasicParsing -TimeoutSec 2
+              if ($resp.StatusCode -eq 200) { $ready = $true; break }
+            } catch { }
+          }
+          if (-not $ready) {
+            if (Test-Path logs/error.log) { Get-Content logs/error.log }
+            throw "packaged nginx did not serve the default page"
+          }
+          Write-Host "OK: packaged nginx served the default page"
+
+          .\nginx.exe -p ./ -s quit -c conf/release-smoke.conf
+          $deadline = (Get-Date).AddSeconds(20)
+          while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+                 ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Milliseconds 500
+          }
+        } finally {
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item -Force conf/release-smoke.conf -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force logs -ErrorAction SilentlyContinue
+          Pop-Location
+        }
+
+        # Repackage so the zip never contains smoke-test leftovers.
+        Remove-Item -Force "$pkg.zip"
+        Compress-Archive -Path $pkg -DestinationPath "$pkg.zip"
+        (Get-FileHash "$pkg.zip" -Algorithm SHA256).Hash.ToLower() + "  $pkg.zip" |
+          Out-File -Encoding ASCII "$pkg.zip.sha256"
+        Get-Content "$pkg.zip.sha256"
+
+    - name: Generate build provenance attestation
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: ${{ env.PACKAGE_NAME }}.zip
+
+    - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
         name: ${{ env.PACKAGE_NAME }}
-        path: ${{ env.PACKAGE_NAME }}.zip
-        retention-days: 30
+        path: |
+          ${{ env.PACKAGE_NAME }}.zip
+          ${{ env.PACKAGE_NAME }}.zip.sha256
+        retention-days: 90
 
-    - name: Create GitHub Release
+    - name: Publish GitHub release
       if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
       with:
-        files: ${{ env.PACKAGE_NAME }}.zip
+        files: |
+          ${{ env.PACKAGE_NAME }}.zip
+          ${{ env.PACKAGE_NAME }}.zip.sha256
         draft: false
         prerelease: false
         generate_release_notes: true
+        body: |
+          nginx-iocp ${{ env.VERSION }} for Windows x64.
+
+          Built exclusively by GitHub Actions from `${{ github.sha }}`.
+          The archive carries a Sigstore build provenance attestation; verify it with:
+
+          ```
+          gh attestation verify ${{ env.PACKAGE_NAME }}.zip --repo ${{ github.repository }}
+          ```
+
+          SHA256 checksums are in `${{ env.PACKAGE_NAME }}.zip.sha256`.
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
