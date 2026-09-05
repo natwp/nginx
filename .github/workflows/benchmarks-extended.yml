@@ -64,20 +64,21 @@ jobs:
     - name: Install oha (HTTP benchmarking tool)
       shell: pwsh
       run: |
-        Write-Host "=== Installing oha benchmarking tool ===" -ForegroundColor Cyan
-        $ohaVersion = "v1.4.5"
-        $ohaUrl = "https://github.com/hatoo/oha/releases/download/$ohaVersion/oha-windows-amd64.zip"
+        Write-Host "=== Installing oha benchmarking tool ==="
 
-        Invoke-WebRequest -Uri $ohaUrl -OutFile oha.zip
-        Expand-Archive -Path oha.zip -DestinationPath . -Force
+        # oha publishes a bare .exe per platform, not an archive.
+        $ohaVersion = "v1.16.0"
+        $ohaUrl = "https://github.com/hatoo/oha/releases/download/$ohaVersion/oha-windows-amd64.exe"
 
-        if (Test-Path ".\oha.exe") {
-          Write-Host "✓ oha installed successfully"
-          .\oha.exe --version
-        } else {
-          Write-Host "✗ oha installation failed"
+        Invoke-WebRequest -Uri $ohaUrl -OutFile oha.exe
+
+        if (-not (Test-Path ".\oha.exe")) {
+          Write-Host "oha download failed"
           exit 1
         }
+
+        .\oha.exe --version
+        Write-Host "OK: oha $ohaVersion installed"
 
     - name: Setup benchmark environment
       shell: pwsh
@@ -126,7 +127,7 @@ jobs:
           '    keepalive_timeout  65;',
           '',
           '    server {',
-          '        listen       8080;',
+          '        listen       18091;',
           '        server_name  localhost;',
           '',
           '        location / {',
@@ -161,28 +162,59 @@ jobs:
         }
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","benchmark.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","benchmark.conf" -NoNewWindow
+        $ready = $false
+        foreach ($attempt in 1..30) {
+          Start-Sleep -Milliseconds 500
+          try {
+            Invoke-WebRequest -Uri http://127.0.0.1:18091/1k.bin `
+              -UseBasicParsing -TimeoutSec 2 | Out-Null
+            $ready = $true
+            break
+          } catch { }
+        }
+        if (-not $ready) {
+          Write-Host "nginx did not become ready on port 18091"
+          if (Test-Path logs/error.log) { Get-Content logs/error.log }
+          exit 1
+        }
 
         $results = @()
 
         foreach ($file in $files) {
           Write-Host ""
           Write-Host "Benchmarking $file..." -ForegroundColor Yellow
-          
-          $output = .\oha.exe -z 10s -c 100 --no-tui http://127.0.0.1:8080/$file 2>&1 | Out-String
-          
-          # Extract key metrics
-          if ($output -match 'Requests/sec:\s+([\d.]+)') {
-            $reqSec = $Matches[1]
-            Write-Host "  Requests/sec: $reqSec"
-            $results += "$file : $reqSec req/s"
+
+          # JSON output is parsed instead of scraping the human-readable
+          # summary, which is not a stable interface.
+          $output = .\oha.exe -z 10s -c 100 --no-tui `
+            --output-format json http://127.0.0.1:18091/$file 2>&1 | Out-String
+
+          $summary = ($output | ConvertFrom-Json).summary
+          if ($null -eq $summary.requestsPerSec) {
+            Write-Host "oha returned no requestsPerSec for $file"
+            Write-Host $output
+            exit 1
           }
+
+          $reqSec = [math]::Round($summary.requestsPerSec, 2)
+          Write-Host "  Requests/sec: $reqSec"
+          Write-Host "  Success rate: $($summary.successRate)"
+          $results += "$file : $reqSec req/s"
         }
 
         # Stop nginx
-        .\objs\nginx.exe -s quit
-        Start-Sleep -Seconds 2
+        .\objs\nginx.exe -p ./ -s quit -c benchmark.conf
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+               ((Get-Date) -lt $deadline)) {
+          Start-Sleep -Milliseconds 500
+        }
+        if (Get-Process nginx -ErrorAction SilentlyContinue) {
+          Write-Host "nginx did not exit after quit"
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 1
+        }
 
         Write-Host ""
         Write-Host "=== Benchmark Results ===" -ForegroundColor Green
@@ -222,7 +254,7 @@ jobs:
             '    keepalive_timeout  65;',
             '',
             '    server {',
-            '        listen       8080;',
+            '        listen       18091;',
             '        server_name  localhost;',
             '        location / {',
             '            root   html;',
@@ -234,19 +266,48 @@ jobs:
           $config | Out-File -Encoding UTF8 "benchmark.conf"
 
           # Start nginx
-          Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","benchmark.conf" -NoNewWindow
-          Start-Sleep -Seconds 3
-
-          $output = .\oha.exe -z 10s -c 100 --no-tui http://127.0.0.1:8080/$testFile 2>&1 | Out-String
-          
-          if ($output -match 'Requests/sec:\s+([\d.]+)') {
-            $reqSec = $Matches[1]
-            Write-Host "  $method: $reqSec req/s" -ForegroundColor Green
+          Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","benchmark.conf" -NoNewWindow
+          $ready = $false
+          foreach ($attempt in 1..30) {
+            Start-Sleep -Milliseconds 500
+            try {
+              Invoke-WebRequest -Uri http://127.0.0.1:18091/1k.bin `
+                -UseBasicParsing -TimeoutSec 2 | Out-Null
+              $ready = $true
+              break
+            } catch { }
+          }
+          if (-not $ready) {
+            Write-Host "nginx did not become ready on port 18091"
+            if (Test-Path logs/error.log) { Get-Content logs/error.log }
+            exit 1
           }
 
+          $output = .\oha.exe -z 10s -c 100 --no-tui `
+            --output-format json http://127.0.0.1:18091/$testFile 2>&1 | Out-String
+
+          $summary = ($output | ConvertFrom-Json).summary
+          if ($null -eq $summary.requestsPerSec) {
+            Write-Host "oha returned no requestsPerSec for $method"
+            Write-Host $output
+            exit 1
+          }
+
+          $reqSec = [math]::Round($summary.requestsPerSec, 2)
+          Write-Host "  $method`: $reqSec req/s" -ForegroundColor Green
+
           # Stop nginx
-          .\objs\nginx.exe -s quit
-          Start-Sleep -Seconds 2
+          .\objs\nginx.exe -p ./ -s quit -c benchmark.conf
+          $deadline = (Get-Date).AddSeconds(20)
+          while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+                 ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Milliseconds 500
+          }
+          if (Get-Process nginx -ErrorAction SilentlyContinue) {
+            Write-Host "nginx did not exit after quit"
+            Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+            exit 1
+          }
         }
 
     - name: Cleanup

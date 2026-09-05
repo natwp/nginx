@@ -59,18 +59,16 @@ jobs:
     - name: Install oha (HTTP load testing tool)
       shell: pwsh
       run: |
-        Write-Host "=== Installing oha load testing tool ===" -ForegroundColor Cyan
-        $ohaVersion = "v1.4.5"
-        $ohaUrl = "https://github.com/hatoo/oha/releases/download/$ohaVersion/oha-windows-amd64.zip"
+        # oha publishes a bare .exe per platform, not an archive.
+        $ohaVersion = "v1.16.0"
+        $ohaUrl = "https://github.com/hatoo/oha/releases/download/$ohaVersion/oha-windows-amd64.exe"
 
-        Invoke-WebRequest -Uri $ohaUrl -OutFile oha.zip
-        Expand-Archive -Path oha.zip -DestinationPath . -Force
+        Write-Host "Downloading oha $ohaVersion"
+        Invoke-WebRequest -Uri $ohaUrl -OutFile oha.exe
 
-        if (Test-Path ".\oha.exe") {
-          Write-Host "✓ oha installed successfully"
-          .\oha.exe --version
-        } else {
-          Write-Host "✗ oha installation failed"
+        .\oha.exe --version
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "oha exited with code $LASTEXITCODE"
           exit 1
         }
 
@@ -112,7 +110,7 @@ jobs:
           '    keepalive_timeout  65;',
           '',
           '    server {',
-          '        listen       8080;',
+          '        listen       18090;',
           '        server_name  localhost;',
           '',
           '        location / {',
@@ -134,18 +132,45 @@ jobs:
         Write-Host "=== Small File (1KB) Load Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","load-test.conf" -NoNewWindow
+        $ready = $false
+        foreach ($attempt in 1..30) {
+          Start-Sleep -Milliseconds 500
+          try {
+            Invoke-WebRequest -Uri http://127.0.0.1:18090/1k.txt `
+              -UseBasicParsing -TimeoutSec 2 | Out-Null
+            $ready = $true
+            break
+          } catch { }
+        }
+        if (-not $ready) {
+          Write-Host "nginx did not become ready on port 18090"
+          if (Test-Path logs/error.log) { Get-Content logs/error.log }
+          exit 1
+        }
 
         # Run load test
         $duration = "${{ github.event.inputs.duration || '30s' }}"
         $connections = "${{ github.event.inputs.connections || '100' }}"
 
-        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:8080/1k.txt
+        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:18090/1k.txt
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "oha exited with code $LASTEXITCODE"
+          exit 1
+        }
 
         # Stop nginx
-        .\objs\nginx.exe -s quit
-        Start-Sleep -Seconds 2
+        .\objs\nginx.exe -p ./ -s quit -c load-test.conf
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+               ((Get-Date) -lt $deadline)) {
+          Start-Sleep -Milliseconds 500
+        }
+        if (Get-Process nginx -ErrorAction SilentlyContinue) {
+          Write-Host "nginx did not exit after quit"
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 1
+        }
 
     - name: Run medium file load test
       shell: pwsh
@@ -156,18 +181,45 @@ jobs:
         Write-Host "=== Medium File (64KB) Load Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","load-test.conf" -NoNewWindow
+        $ready = $false
+        foreach ($attempt in 1..30) {
+          Start-Sleep -Milliseconds 500
+          try {
+            Invoke-WebRequest -Uri http://127.0.0.1:18090/1k.txt `
+              -UseBasicParsing -TimeoutSec 2 | Out-Null
+            $ready = $true
+            break
+          } catch { }
+        }
+        if (-not $ready) {
+          Write-Host "nginx did not become ready on port 18090"
+          if (Test-Path logs/error.log) { Get-Content logs/error.log }
+          exit 1
+        }
 
         # Run load test
         $duration = "${{ github.event.inputs.duration || '30s' }}"
         $connections = "${{ github.event.inputs.connections || '100' }}"
 
-        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:8080/64k.txt
+        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:18090/64k.txt
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "oha exited with code $LASTEXITCODE"
+          exit 1
+        }
 
         # Stop nginx
-        .\objs\nginx.exe -s quit
-        Start-Sleep -Seconds 2
+        .\objs\nginx.exe -p ./ -s quit -c load-test.conf
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+               ((Get-Date) -lt $deadline)) {
+          Start-Sleep -Milliseconds 500
+        }
+        if (Get-Process nginx -ErrorAction SilentlyContinue) {
+          Write-Host "nginx did not exit after quit"
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 1
+        }
 
     - name: Run large file load test
       shell: pwsh
@@ -178,19 +230,46 @@ jobs:
         Write-Host "=== Large File (1MB) Load Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","load-test.conf" -NoNewWindow
+        $ready = $false
+        foreach ($attempt in 1..30) {
+          Start-Sleep -Milliseconds 500
+          try {
+            Invoke-WebRequest -Uri http://127.0.0.1:18090/1k.txt `
+              -UseBasicParsing -TimeoutSec 2 | Out-Null
+            $ready = $true
+            break
+          } catch { }
+        }
+        if (-not $ready) {
+          Write-Host "nginx did not become ready on port 18090"
+          if (Test-Path logs/error.log) { Get-Content logs/error.log }
+          exit 1
+        }
 
         # Run load test with fewer connections for large files
         $duration = "${{ github.event.inputs.duration || '30s' }}"
         $connections = [math]::Max(50, [int]"${{ github.event.inputs.connections || '100' }}" / 2)
 
         Write-Host "Using $connections connections for large file test"
-        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:8080/1m.txt
+        .\oha.exe -z $duration -c $connections --no-tui http://127.0.0.1:18090/1m.txt
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "oha exited with code $LASTEXITCODE"
+          exit 1
+        }
 
         # Stop nginx
-        .\objs\nginx.exe -s quit
-        Start-Sleep -Seconds 2
+        .\objs\nginx.exe -p ./ -s quit -c load-test.conf
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+               ((Get-Date) -lt $deadline)) {
+          Start-Sleep -Milliseconds 500
+        }
+        if (Get-Process nginx -ErrorAction SilentlyContinue) {
+          Write-Host "nginx did not exit after quit"
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 1
+        }
 
     - name: Run keepalive stress test
       shell: pwsh
@@ -201,19 +280,46 @@ jobs:
         Write-Host "=== Keepalive Stress Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","load-test.conf" -NoNewWindow
+        $ready = $false
+        foreach ($attempt in 1..30) {
+          Start-Sleep -Milliseconds 500
+          try {
+            Invoke-WebRequest -Uri http://127.0.0.1:18090/1k.txt `
+              -UseBasicParsing -TimeoutSec 2 | Out-Null
+            $ready = $true
+            break
+          } catch { }
+        }
+        if (-not $ready) {
+          Write-Host "nginx did not become ready on port 18090"
+          if (Test-Path logs/error.log) { Get-Content logs/error.log }
+          exit 1
+        }
 
         # Run with HTTP/1.1 keepalive
         $duration = "${{ github.event.inputs.duration || '30s' }}"
         $connections = "${{ github.event.inputs.connections || '100' }}"
 
         Write-Host "Testing with keepalive connections"
-        .\oha.exe -z $duration -c $connections --no-tui --http-version 1.1 http://127.0.0.1:8080/1k.txt
+        .\oha.exe -z $duration -c $connections --no-tui --http-version 1.1 http://127.0.0.1:18090/1k.txt
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "oha exited with code $LASTEXITCODE"
+          exit 1
+        }
 
         # Stop nginx
-        .\objs\nginx.exe -s quit
-        Start-Sleep -Seconds 2
+        .\objs\nginx.exe -p ./ -s quit -c load-test.conf
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+               ((Get-Date) -lt $deadline)) {
+          Start-Sleep -Milliseconds 500
+        }
+        if (Get-Process nginx -ErrorAction SilentlyContinue) {
+          Write-Host "nginx did not exit after quit"
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 1
+        }
 
     - name: Run connection churn test
       shell: pwsh
@@ -224,19 +330,46 @@ jobs:
         Write-Host "=== Connection Churn Test ===" -ForegroundColor Cyan
 
         # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-c","load-test.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
+        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","load-test.conf" -NoNewWindow
+        $ready = $false
+        foreach ($attempt in 1..30) {
+          Start-Sleep -Milliseconds 500
+          try {
+            Invoke-WebRequest -Uri http://127.0.0.1:18090/1k.txt `
+              -UseBasicParsing -TimeoutSec 2 | Out-Null
+            $ready = $true
+            break
+          } catch { }
+        }
+        if (-not $ready) {
+          Write-Host "nginx did not become ready on port 18090"
+          if (Test-Path logs/error.log) { Get-Content logs/error.log }
+          exit 1
+        }
 
         # Run with HTTP/1.0 (no keepalive)
         $duration = "${{ github.event.inputs.duration || '30s' }}"
         $connections = "${{ github.event.inputs.connections || '100' }}"
 
         Write-Host "Testing connection churn (no keepalive)"
-        .\oha.exe -z $duration -c $connections --no-tui --http-version 1.0 --disable-keepalive http://127.0.0.1:8080/1k.txt
+        .\oha.exe -z $duration -c $connections --no-tui --http-version 1.0 --disable-keepalive http://127.0.0.1:18090/1k.txt
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "oha exited with code $LASTEXITCODE"
+          exit 1
+        }
 
         # Stop nginx
-        .\objs\nginx.exe -s quit
-        Start-Sleep -Seconds 2
+        .\objs\nginx.exe -p ./ -s quit -c load-test.conf
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+               ((Get-Date) -lt $deadline)) {
+          Start-Sleep -Milliseconds 500
+        }
+        if (Get-Process nginx -ErrorAction SilentlyContinue) {
+          Write-Host "nginx did not exit after quit"
+          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
+          exit 1
+        }
 
         Write-Host ""
         Write-Host "✓ All load tests completed" -ForegroundColor Green
