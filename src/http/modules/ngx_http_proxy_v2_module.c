@@ -446,6 +446,9 @@ ngx_http_proxy_v2_create_request(ngx_http_request_t *r)
     /* :authority header */
 
     host.len = 0;
+#if (NGX_SUPPRESS_WARN)
+    host.data = NULL;
+#endif
 
     if (plcf->host_value
         && ngx_http_complex_value(r, plcf->host_value, &host) != NGX_OK)
@@ -3689,6 +3692,12 @@ ngx_http_proxy_v2_parse_window_update(ngx_http_request_t *r,
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http proxy window update: %ui", ctx->window_update);
+
+    if (ctx->window_update == 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "upstream sent zero window update");
+        return NGX_ERROR;
+    }
 
     if (ctx->stream_id) {
 
