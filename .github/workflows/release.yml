@@ -55,16 +55,21 @@ jobs:
     - name: Build optimized release
       shell: msys2 {0}
       run: |
+        # Paths are relative with an empty prefix, matching upstream's win32
+        # recipe in misc/GNUmakefile. This keeps the package relocatable: every
+        # path resolves inside whatever directory the user unzips it into and
+        # passes via -p. Absolute paths such as /nginx/logs would resolve
+        # against the prefix and break the unzip-and-run flow.
         ./auto/configure \
           --with-cc=gcc \
-          --with-cc-opt="-O2 -march=x86-64 -mtune=generic" \
+          --with-cc-opt="-O2 -march=x86-64 -mtune=generic -DFD_SETSIZE=1024" \
           --with-ld-opt="-Wl,-s" \
-          --prefix=/nginx \
-          --sbin-path=/nginx/nginx.exe \
-          --conf-path=/nginx/conf/nginx.conf \
-          --pid-path=/nginx/logs/nginx.pid \
-          --error-log-path=/nginx/logs/error.log \
-          --http-log-path=/nginx/logs/access.log \
+          --prefix= \
+          --sbin-path=nginx.exe \
+          --conf-path=conf/nginx.conf \
+          --pid-path=logs/nginx.pid \
+          --error-log-path=logs/error.log \
+          --http-log-path=logs/access.log \
           --with-pcre \
           --with-http_ssl_module \
           --with-http_v2_module \
@@ -180,6 +185,13 @@ jobs:
           fi
         done
 
+        # nginx does not create a missing logs/ directory; without it the
+        # default configuration fails to open its log files on startup.
+        if [ ! -d "$pkg/logs" ]; then
+          echo "package is missing the logs directory"
+          exit 1
+        fi
+
         zip -qr "$pkg.zip" "$pkg"
         sha256sum "$pkg.zip" | tee "$pkg.zip.sha256"
 
@@ -242,7 +254,9 @@ jobs:
         } finally {
           Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
           Remove-Item -Force conf/release-smoke.conf -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force logs -ErrorAction SilentlyContinue
+          # Clear the log contents but keep the directory: nginx does not
+          # create a missing logs/ dir, so shipping without it breaks startup.
+          Remove-Item -Force logs/* -ErrorAction SilentlyContinue
           Pop-Location
         }
 
