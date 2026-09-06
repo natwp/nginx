@@ -13,7 +13,8 @@ param(
     [string] $Binary = (Join-Path $PSScriptRoot '..\objs\nginx.exe'),
     [string] $Root = (Join-Path $PSScriptRoot '..'),
     [string] $OpenSSLBinary = '',
-    [switch] $KeepArtifacts
+    [switch] $KeepArtifacts,
+    [switch] $Library
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,11 +103,17 @@ function Get-TestProcesses([string] $Prefix) {
     }
 }
 
-function Wait-Http([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
+function Wait-Http([int] $Port, [string] $Expected, [int] $TimeoutSec = 20,
+    [scriptblock] $ClientFactory = $null) {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     do {
+        $client = $null
         try {
-            $client = New-Object System.Net.WebClient
+            $client = if ($ClientFactory) {
+                & $ClientFactory
+            } else {
+                New-Object System.Net.WebClient
+            }
             $client.Proxy = $null
             $body = $client.DownloadString("http://127.0.0.1:$Port/")
             if ($body -eq $Expected) {
@@ -114,6 +121,8 @@ function Wait-Http([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
             }
         } catch {
             Start-Sleep -Milliseconds 200
+        } finally {
+            if ($client) { $client.Dispose() }
         }
     } while ((Get-Date) -lt $deadline)
     throw "HTTP backend on port $Port did not return '$Expected'"
@@ -200,6 +209,8 @@ function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 30) {
                 }
                 Write-Host "  HTTPS attempt failed: $msg" -ForegroundColor DarkYellow
                 Start-Sleep -Milliseconds 500
+            } finally {
+                if ($client) { $client.Dispose() }
             }
         } while ((Get-Date) -lt $deadline)
         Write-Host "  HTTPS connection timed out after $TimeoutSec seconds" -ForegroundColor Red
@@ -214,6 +225,73 @@ function Wait-Https([int] $Port, [string] $Expected, [int] $TimeoutSec = 30) {
     } finally {
         [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCallback
         [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
+    }
+}
+
+function Read-HttpHeaders([IO.TextReader] $Reader) {
+    $headers = @{}
+    for ($i = 0; $i -lt 100; $i++) {
+        $line = $Reader.ReadLine()
+        if ($null -eq $line) { throw 'HTTP response ended before headers' }
+        if ($line -eq '') { return $headers }
+        $fields = $line.Split(@(':'), 2)
+        Assert-True ($fields.Length -eq 2) "Invalid HTTP header: $line"
+        $headers[$fields[0]] = $fields[1].Trim()
+    }
+    throw 'Too many HTTP response headers'
+}
+
+function Test-ExpectContinue([int] $Port, [string] $Expected, [switch] $Tls) {
+    $tcp = New-Object -TypeName System.Net.Sockets.TcpClient
+    $ssl = $null
+    $reader = $null
+
+    try {
+        $tcp.ReceiveTimeout = 5000
+        $tcp.SendTimeout = 5000
+        $tcp.Connect([IPAddress]::Loopback, $Port)
+        $stream = $tcp.GetStream()
+        if ($Tls) {
+            $callback = [Net.Security.RemoteCertificateValidationCallback] {
+                param($sender, $certificate, $chain, $errors)
+                return $true
+            }
+            $ssl = [Net.Security.SslStream]::new($stream, $false, $callback)
+            $ssl.AuthenticateAsClient('localhost', $null,
+                [Security.Authentication.SslProtocols]::Tls12, $false)
+            $stream = $ssl
+        }
+        $reader = [IO.StreamReader]::new(
+            $stream, [Text.Encoding]::ASCII, $false, 4096, $true)
+
+        $body = 'expect-body'
+        $headers = "PUT /expect HTTP/1.1`r`nHost: localhost`r`n" +
+                   "Content-Length: $($body.Length)`r`n" +
+                   "Expect: 100-continue`r`nConnection: close`r`n`r`n"
+        $headerBytes = [Text.Encoding]::ASCII.GetBytes($headers)
+        $stream.Write($headerBytes, 0, $headerBytes.Length)
+        $stream.Flush()
+
+        $status = $reader.ReadLine()
+        Assert-True ($status -eq 'HTTP/1.1 100 Continue') `
+            "Expect request (TLS=$Tls) returned '$status' instead of 100 Continue"
+        [void] (Read-HttpHeaders $reader)
+
+        $bodyBytes = [Text.Encoding]::ASCII.GetBytes($body)
+        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+        $stream.Flush()
+
+        $status = $reader.ReadLine()
+        Assert-True ($status -eq 'HTTP/1.1 200 OK') `
+            "Expect request (TLS=$Tls) returned '$status' instead of 200 OK"
+        [void] (Read-HttpHeaders $reader)
+        $response = $reader.ReadToEnd()
+        Assert-True ($response -eq $Expected) `
+            "Expect response body mismatch: '$response'"
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($ssl) { $ssl.Dispose() }
+        if ($tcp) { $tcp.Close() }
     }
 }
 
@@ -284,17 +362,59 @@ function Test-Gzip([int] $Port, [string] $Expected, [int] $TimeoutSec = 20) {
     throw $message
 }
 
-function Invoke-Udp([int] $Port, [string] $Expected) {
-    $client = New-Object -TypeName System.Net.Sockets.UdpClient
-    $client.Client.ReceiveTimeout = 5000
-    $remote = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ([IPAddress]::Loopback, $Port)
-    $payload = [Text.Encoding]::ASCII.GetBytes('win32-rc')
-    [void] $client.Send($payload, $payload.Length, $remote)
-    $source = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ([IPAddress]::Any, 0)
-    $reply = $client.Receive([ref] $source)
-    $client.Close()
-    $text = [Text.Encoding]::ASCII.GetString($reply)
-    Assert-True ($text -eq $Expected) "UDP returned '$text', expected '$Expected'"
+function Invoke-Udp([int] $Port, [string] $Expected,
+    [System.Net.Sockets.UdpClient] $Client = $null) {
+    $owned = $false
+    if (-not $Client) {
+        $Client = New-Object -TypeName System.Net.Sockets.UdpClient
+        $owned = $true
+    }
+
+    try {
+        $Client.Client.ReceiveTimeout = 5000
+        $remote = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ([IPAddress]::Loopback, $Port)
+        $payload = [Text.Encoding]::ASCII.GetBytes('win32-rc')
+        [void] $Client.Send($payload, $payload.Length, $remote)
+        $source = New-Object -TypeName System.Net.IPEndPoint -ArgumentList ([IPAddress]::Any, 0)
+        $reply = $Client.Receive([ref] $source)
+        $text = [Text.Encoding]::ASCII.GetString($reply)
+        Assert-True ($text -eq $Expected) "UDP returned '$text', expected '$Expected'"
+    } finally {
+        if ($owned) { $Client.Close() }
+    }
+}
+
+function Start-PartialHttpRequest([int] $Port) {
+    $client = New-Object -TypeName System.Net.Sockets.TcpClient
+    $reader = $null
+    try {
+        $client.ReceiveTimeout = 5000
+        $client.SendTimeout = 5000
+        $client.Connect([IPAddress]::Loopback, $Port)
+        $stream = $client.GetStream()
+        $request = [Text.Encoding]::ASCII.GetBytes(
+            "GET /worker HTTP/1.1`r`nHost: localhost`r`n`r`n")
+        $stream.Write($request, 0, $request.Length)
+        $reader = [IO.StreamReader]::new(
+            $stream, [Text.Encoding]::ASCII, $false, 4096, $true)
+        Assert-True ($reader.ReadLine() -eq 'HTTP/1.1 200 OK') 'Worker probe failed'
+        $headers = Read-HttpHeaders $reader
+        $length = [int] $headers['Content-Length']
+        Assert-True ($length -gt 0 -and $length -le 16) 'Invalid worker ID length'
+        $chars = New-Object char[] $length
+        Assert-True ($reader.ReadBlock($chars, 0, $length) -eq $length) 'Missing worker ID'
+        $workerId = [int] (-join $chars)
+        $partial = [Text.Encoding]::ASCII.GetBytes(
+            "GET / HTTP/1.1`r`nHost: 127.0.0.1`r`n")
+        $stream.Write($partial, 0, $partial.Length)
+        $stream.Flush()
+        return @{Client = $client; WorkerId = $workerId}
+    } catch {
+        $client.Close()
+        throw
+    } finally {
+        if ($reader) { $reader.Dispose() }
+    }
 }
 
 function Stop-TestNginx([string] $Prefix, [string] $Config, [System.Diagnostics.Process] $Master) {
@@ -343,6 +463,7 @@ function Test-Backend([string] $Backend, [string] $BaseDir) {
     $pidFile = Join-Path $logs 'nginx.pid'
     $stderr = Join-Path $logs 'stderr.log'
     $body = "backend=$Backend"
+    $reloadedBody = "$body-reloaded"
     $udpBody = "udp=$Backend"
     $fileBody = ('file-aio-sendfile-' * 4096)
     $aioLocation = if ($Backend -eq 'iocp') {
@@ -403,6 +524,12 @@ $tlsConfig
         location = / {
             return 200 "$body";
         }
+        location = /expect {
+            return 200 "$reloadedBody";
+        }
+        location = /worker {
+            return 200 "`$pid";
+        }
         location = /sendfile.txt {
             root "$($html.Replace('\','/'))";
             sendfile on;
@@ -425,33 +552,64 @@ $streamConfig
     $startArgs = @('-e', 'stderr', '-p', $dir, '-c', $config)
     Write-Host "Starting nginx with: $($script:Binary) $($startArgs -join ' ')" -ForegroundColor Yellow
     $start = Start-Process -FilePath $script:Binary -WorkingDirectory $script:Root -ArgumentList $startArgs -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
+    $udpClient = $null
+    $partialClients = @{}
     try {
         Write-Host "Waiting for HTTP on port $httpPort..." -ForegroundColor Yellow
         Wait-Http $httpPort $body
         Write-Host "HTTP OK" -ForegroundColor Green
         if ($Backend -eq 'iocp') {
-            Invoke-Udp $udpPort $udpBody
+            $udpClient = New-Object -TypeName System.Net.Sockets.UdpClient
+            Invoke-Udp $udpPort $udpBody $udpClient
         }
 
         [void] (Wait-TestProcesses $dir 3)
-        [void] (Wait-Workers $dir $start.Id 2)
+        $oldWorkers = @(Wait-Workers $dir $start.Id 2)
+        for ($attempt = 0; $attempt -lt 32 -and $partialClients.Count -lt 2; $attempt++) {
+            $partial = Start-PartialHttpRequest $httpPort
+            if ($partialClients.ContainsKey($partial.WorkerId)) {
+                $partial.Client.Close()
+            } else {
+                $partialClients[$partial.WorkerId] = $partial.Client
+            }
+        }
+        foreach ($worker in $oldWorkers) {
+            Assert-True ($partialClients.ContainsKey([int] $worker.ProcessId)) `
+                "Could not hold old worker $($worker.ProcessId) open"
+        }
+
+        $reloaded = (Get-Content -Raw -LiteralPath $config).Replace(
+            "return 200 `"$body`";", "return 200 `"$reloadedBody`";")
+        Set-Content -LiteralPath $config -Value $reloaded -Encoding ASCII
         Invoke-Nginx @('-e', 'stderr', '-p', $dir, '-c', $config, '-s', 'reopen')
         Invoke-Nginx @('-e', 'stderr', '-p', $dir, '-c', $config, '-s', 'reload')
-        Wait-Http $httpPort $body
+        Wait-Http $httpPort $reloadedBody
+        if ($Backend -eq 'iocp') {
+            Invoke-Udp $udpPort $udpBody $udpClient
+        }
+        $liveIds = @(Get-TestProcesses $dir | ForEach-Object { $_.ProcessId })
+        foreach ($worker in $oldWorkers) {
+            Assert-True ($liveIds -contains $worker.ProcessId) `
+                "Old worker $($worker.ProcessId) exited while a request was held open"
+        }
 
+        foreach ($client in $partialClients.Values) { $client.Close() }
+        $partialClients.Clear()
         $workers = @(Wait-Workers $dir $start.Id 2)
         $killedId = $workers[0].ProcessId
         Stop-Process -Id $killedId -Force
-        Wait-Http $httpPort $body
+        Wait-Http $httpPort $reloadedBody
         [void] (Wait-Workers $dir $start.Id 2 $killedId)
 
+        Test-ExpectContinue $httpPort $reloadedBody
         if ($script:Tls) {
             Write-Host "Testing HTTPS on port $httpsPort..." -ForegroundColor Yellow
             if (Test-Path $stderr) {
                 Write-Host "Nginx stderr log before HTTPS test:" -ForegroundColor Magenta
                 Get-Content -LiteralPath $stderr | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" }
             }
-            Wait-Https $httpsPort $body
+            Wait-Https $httpsPort $reloadedBody
+            Test-ExpectContinue $httpsPort $reloadedBody -Tls
             Write-Host "HTTPS OK" -ForegroundColor Green
         }
 
@@ -465,6 +623,8 @@ $streamConfig
         $regex = Get-HttpBody $httpPort '/regex/pcre2-ok'
         Assert-True ($regex -eq 'pcre2-ok') "$Backend regex response mismatch"
     } finally {
+        foreach ($client in $partialClients.Values) { $client.Close() }
+        if ($udpClient) { $udpClient.Close() }
         Write-Host "Stopping nginx for backend $Backend..." -ForegroundColor Yellow
         Stop-TestNginx $dir $config $start
     }
@@ -482,6 +642,10 @@ $streamConfig
     }
     $tls = if ($script:Tls) { ', TLS' } else { '' }
     Write-Host "PASS $Backend ($network, PCRE2, gzip$tls, reopen, reload, respawn, quit)"
+}
+
+if ($Library) {
+    return
 }
 
 Assert-True (Test-Path $Binary) "nginx binary not found: $Binary"

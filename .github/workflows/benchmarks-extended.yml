@@ -30,6 +30,11 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v5
 
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
       with:
@@ -113,10 +118,11 @@ jobs:
         # Create benchmark configuration using array join
         $config = @(
           "worker_processes  $workers;",
-          'error_log  logs/error.log  warn;',
+          'error_log  logs/error.log  notice;',
           'pid        logs/nginx.pid;',
           '',
           'events {',
+          '    use iocp;',
           '    worker_connections  2048;',
           '}',
           '',
@@ -179,6 +185,13 @@ jobs:
           exit 1
         }
 
+        if (-not (Test-Path logs/error.log) -or
+            -not (Select-String -Path logs/error.log -Pattern 'using the "iocp" event method' -Quiet)) {
+          Write-Host "nginx did not start with the IOCP event method"
+          if (Test-Path logs/error.log) { Get-Content logs/error.log }
+          exit 1
+        }
+
         $results = @()
 
         foreach ($file in $files) {
@@ -188,7 +201,15 @@ jobs:
           # JSON output is parsed instead of scraping the human-readable
           # summary, which is not a stable interface.
           $output = .\oha.exe -z 10s -c 100 --no-tui `
+            --wait-ongoing-requests-after-deadline `
             --output-format json http://127.0.0.1:18091/$file 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "oha failed for $file" }
+
+          $outputPath = "logs/oha-$file.json"
+          [IO.File]::WriteAllText($outputPath, $output,
+            ([System.Text.UTF8Encoding]::new($false)))
+          node .\misc\validate-oha-summary.js $outputPath 200
+          if ($LASTEXITCODE -ne 0) { throw "Invalid oha result for $file" }
 
           $summary = ($output | ConvertFrom-Json).summary
           if ($null -eq $summary.requestsPerSec) {
@@ -239,7 +260,7 @@ jobs:
           $workers = "${{ github.event.inputs.worker_count || '4' }}"
           $config = @(
             "worker_processes  $workers;",
-            'error_log  logs/error.log  warn;',
+            'error_log  logs/error.log  notice;',
             'pid        logs/nginx.pid;',
             '',
             'events {',
@@ -284,9 +305,17 @@ jobs:
           }
 
           $output = .\oha.exe -z 10s -c 100 --no-tui `
+            --wait-ongoing-requests-after-deadline `
             --output-format json http://127.0.0.1:18091/$testFile 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "oha failed for $method" }
+
+          $outputPath = "logs/oha-$method.json"
+          [IO.File]::WriteAllText($outputPath, $output,
+            ([System.Text.UTF8Encoding]::new($false)))
+          node .\misc\validate-oha-summary.js $outputPath 200
 
           $summary = ($output | ConvertFrom-Json).summary
+          if ($LASTEXITCODE -ne 0) { throw "Invalid oha result for $method" }
           if ($null -eq $summary.requestsPerSec) {
             Write-Host "oha returned no requestsPerSec for $method"
             Write-Host $output
@@ -323,5 +352,6 @@ jobs:
         name: benchmark-results
         path: |
           logs/*.log
+          logs/oha-*.json
           benchmark.conf
         retention-days: 30

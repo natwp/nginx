@@ -825,3 +825,27 @@ default: its three-round empty-response filter retained only two runs after
 one noisy round.  The packages therefore keep their conservative one-worker
 configuration; operators can set `worker_processes auto;` or a fixed count
 after measuring their own client and CPU capacity.
+
+## September 2026 review: Winsock extension cache
+
+The provider-specific extension-pointer cache was evaluated on a Windows
+2022 GitHub runner in CI run 34128556854.
+The experiment is preserved on `ci/iocp-extension-cache` at `51159a969`.
+Both builds included the review fixes and differed only in the cache.
+They used the same optimized MinGW build, four workers, oha v1.16.0,
+two-second warm-ups and seven-second measurements. Each direction used
+six interleaved candidate/control pairs; the second direction reversed
+which build ran first. Keepalive used 48 connections and four clients;
+connection churn used eight connections and one client.
+
+| Workload | Forward retained/raw | Forward rate delta | Reverse retained/raw | Reverse rate delta |
+| --- | ---: | ---: | ---: | ---: |
+| Empty response, keepalive | 5/6 | +1.028% | 4/6 | +0.877% |
+| 64 KiB file, keepalive | 5/6 | -0.153% | 5/6 | -0.387% |
+| Empty response, connection churn | 6/6 | +0.510% | 6/6 | -0.087% |
+
+All 72 measured samples had zero errors and a success rate of 1. The cache
+did not achieve the required 2% churn improvement in either direction, so
+it was removed. No performance optimization was retained from this review.
+The CI artifact `iocp-performance-results` contains the raw measurements,
+paired summaries, nginx configurations and logs, and binary hashes.

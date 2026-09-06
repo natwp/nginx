@@ -123,18 +123,18 @@ esac
 
 case "$scratch_root" in
     /*) ;;
-    *) echo "BENCH_SCRATCH_ROOT must be an absolute path" >    *) echo "BENCH_SCRATCH_ROOT must be an absolute path" >&2; exit 2 ;;2; exit 2 ;;
+    *) echo "BENCH_SCRATCH_ROOT must be an absolute path" >&2; exit 2 ;;
 esac
 
 case "$results_dir" in
     /*) ;;
-    *) echo "RESULTS_DIR must be an absolute path" >    *) echo "RESULTS_DIR must be an absolute path" >&2; exit 2 ;;2; exit 2 ;;
+    *) echo "RESULTS_DIR must be an absolute path" >&2; exit 2 ;;
 esac
 
 if [ -n "$gprof_dir" ]; then
     case "$gprof_dir" in
         /*) ;;
-        *) echo "NGX_GPROF_DIR must be an absolute path" >        *) echo "NGX_GPROF_DIR must be an absolute path" >&2; exit 2 ;;2; exit 2 ;;
+        *) echo "NGX_GPROF_DIR must be an absolute path" >&2; exit 2 ;;
     esac
 fi
 

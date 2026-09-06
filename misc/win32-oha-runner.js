@@ -3,6 +3,7 @@
 const childProcess = require('child_process');
 const fs = require('fs');
 const processCpu = require('./win32-process-cpu');
+const {validateResult} = require('./validate-oha-summary');
 
 const [ohaPath, url, connectionsText, durationText, nginxPrefix,
   outputPath, backend, label, workload, clientProcessesText = '1',
@@ -211,6 +212,7 @@ async function main() {
     setTimeout(() => resolve(processCpu.snapshot(sampledPids)), probeDelay);
   });
   const results = await Promise.all(clients.map(client => client.done));
+  results.forEach(result => validateResult(result, 200));
   const cpuEnd = await cpuEndPromise;
   const tcpAudit = await connectionAuditPromise;
   const elapsed = (performance.now() - started) / 1000;

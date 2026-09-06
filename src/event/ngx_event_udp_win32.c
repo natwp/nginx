@@ -456,6 +456,12 @@ ngx_iocp_udp_dispatch(ngx_listening_t *ls, u_char *data, size_t size,
 
     lc = ls->connection;
 
+    if (lc == NULL || lc->fd == (ngx_socket_t) -1) {
+        ngx_log_debug0(NGX_LOG_DEBUG_EVENT, &ls->log, 0,
+                       "dropping UDP datagram for closed listener");
+        return NGX_OK;
+    }
+
 #if (NGX_DEBUG)
     ecf = ngx_event_get_conf(ngx_cycle->conf_ctx, ngx_event_core_module);
 #endif

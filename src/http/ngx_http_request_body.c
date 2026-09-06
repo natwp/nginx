@@ -1127,7 +1127,7 @@ ngx_http_test_expect(ngx_http_request_t *r)
                    "send 100 Continue");
 
 #if (NGX_HAVE_IOCP)
-    if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
+    if (r->connection->send == ngx_overlapped_wsasend) {
         n = ngx_wsasend(r->connection,
                         (u_char *) "HTTP/1.1 100 Continue" CRLF CRLF,
                         sizeof("HTTP/1.1 100 Continue" CRLF CRLF) - 1);

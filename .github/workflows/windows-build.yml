@@ -108,6 +108,8 @@ jobs:
         Set-ExecutionPolicy -Scope Process Bypass
         $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
 
+        .\misc\test-win32-rc-test.ps1
+
         # Find OpenSSL
         $openssl = Get-Command openssl -ErrorAction SilentlyContinue
         if ($openssl) {

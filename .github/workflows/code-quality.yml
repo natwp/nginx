@@ -15,6 +15,11 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v5
 
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
       with:
@@ -31,7 +36,49 @@ jobs:
     - name: Run configure to generate files
       shell: msys2 {0}
       run: |
-        ./auto/configure --with-cc=gcc --with-debug 2>&1 | tee configure.log || echo "Configure may have warnings"
+        ./misc/check-configure.sh configure.log \
+          ./auto/configure --with-cc=gcc --with-debug
+
+    - name: Test configure exit status handling
+      shell: msys2 {0}
+      run: ./misc/test-check-configure.sh
+
+    - name: Check shell scripts
+      shell: msys2 {0}
+      run: |
+        for script in misc/*.sh; do
+          bash -n "$script"
+        done
+
+        set +e
+        BENCH_SCRATCH_ROOT=relative RESULTS_DIR=/tmp/results \
+          misc/win32-oha-bench.sh /tmp/nginx.exe iocp >/tmp/oha.out 2>/tmp/oha.err
+        status=$?
+        set -e
+        test "$status" -eq 2
+        grep -Fq 'BENCH_SCRATCH_ROOT must be an absolute path' /tmp/oha.err
+
+        set +e
+        BENCH_SCRATCH_ROOT=/tmp RESULTS_DIR=relative \
+          misc/win32-oha-bench.sh /tmp/nginx.exe iocp >/tmp/oha.out 2>/tmp/oha.err
+        status=$?
+        set -e
+        test "$status" -eq 2
+        grep -Fq 'RESULTS_DIR must be an absolute path' /tmp/oha.err
+
+        set +e
+        BENCH_SCRATCH_ROOT=/tmp RESULTS_DIR=/tmp NGX_GPROF_DIR=relative \
+          misc/win32-oha-bench.sh /tmp/nginx.exe iocp >/tmp/oha.out 2>/tmp/oha.err
+        status=$?
+        set -e
+        test "$status" -eq 2
+        grep -Fq 'NGX_GPROF_DIR must be an absolute path' /tmp/oha.err
+
+    - name: Test oha result validation
+      shell: pwsh
+      run: |
+        node .\misc\test-validate-oha-summary.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Check for configuration warnings
       shell: msys2 {0}

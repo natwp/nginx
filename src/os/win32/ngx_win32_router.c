@@ -1833,6 +1833,10 @@ ngx_win32_router_dispatch_udp(ngx_win32_router_udp_recv_t *op, DWORD bytes,
         if (flow) {
             worker = ngx_win32_router_find_worker(flow->pid, flow->slot,
                                                    flow->generation);
+
+            if (worker && !worker->active && !op->op.listener->quic) {
+                worker = NULL;
+            }
         }
 
         if (worker == NULL && ngx_win32_router_new_flows) {
