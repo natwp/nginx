@@ -72,6 +72,10 @@ ngx_mail_pop3_init_session(ngx_mail_session_t *s, ngx_connection_t *c)
         return;
     }
 
+    if (c->read->ready) {
+        ngx_post_event(c->read, &ngx_posted_events);
+    }
+
     ngx_mail_send(c->write);
 }
 

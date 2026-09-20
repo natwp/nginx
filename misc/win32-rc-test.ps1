@@ -234,7 +234,7 @@ function Read-HttpHeaders([IO.TextReader] $Reader) {
         $line = $Reader.ReadLine()
         if ($null -eq $line) { throw 'HTTP response ended before headers' }
         if ($line -eq '') { return $headers }
-        $fields = $line.Split(@(':'), 2)
+        $fields = $line.Split([char[]] ':', 2)
         Assert-True ($fields.Length -eq 2) "Invalid HTTP header: $line"
         $headers[$fields[0]] = $fields[1].Trim()
     }

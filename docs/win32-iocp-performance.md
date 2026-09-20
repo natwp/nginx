@@ -849,3 +849,145 @@ did not achieve the required 2% churn improvement in either direction, so
 it was removed. No performance optimization was retained from this review.
 The CI artifact `iocp-performance-results` contains the raw measurements,
 paired summaries, nginx configurations and logs, and binary hashes.
+
+## September 19-20, 2026 scalar IOCP send experiment
+
+The scalar IOCP sender previously allocated an operation, copied the payload,
+and waited for a completion even when a nonblocking send could finish at once.
+The candidate extends the existing `NGX_IOCP_TRY_SEND` switch to this path.
+It tries `ngx_wsasend()` first and retains the copied overlapped operation
+after `WSAEWOULDBLOCK`. Completed and outstanding operations are handled
+before attempting a new send.
+
+A positive short send needs an explicit retry on `ngx_posted_next_events`.
+The synchronous sender leaves write readiness cleared, and moving the event
+to the next iteration restores readiness before retrying. A short successful
+send does not reliably arm `FD_WRITE`; a test build forcing 4 KiB writes
+exposed a stall after 8 KiB when the candidate relied on that notification.
+The final candidate passes that test with the explicit retry. Closing
+the connection removes its posted event through the normal close path.
+
+Both performance binaries include the same separate IMAP/POP3 initialization
+fix: post an already-ready read after setting its protocol handler, matching
+SMTP. The original IOCP control sent greetings but stalled on the first
+command. A first-command regression test failed four assertions before that
+fix. The RC harness also explicitly casts its HTTP header delimiter to
+`char[]` so Windows PowerShell 5 selects the intended `String.Split()` overload.
+
+### Measurement method
+
+The binaries use source base `c4e9c65fe`, MinGW GCC 16.2, `-O2`,
+`FD_SETSIZE=1024`, and `NGX_IOCP_DIRECT_SEND_MIN_SIZE=4096`. The control and
+candidate differ only in the scalar sender. All measurements run locally on
+the same four-core/eight-thread Windows workstation, with one IOCP worker
+and 32 persistent connections. The worker is pinned to the last physical
+core (mask `0xc0`); the master and generators use the other three (`0x3f`).
+
+`native-upgrade.c` provides two native Windows clients and two native echo
+upstreams. It exchanges 64-byte or 4-KiB messages after HTTP 101, checking
+every echoed byte and the message sequence. oha 1.16.0 does not implement
+post-upgrade message exchange, so the supplied `oha-windows-amd64-pgo.exe`
+instead checks HTTP/1.1 empty responses and 64-KiB static files. It uses two
+runtime threads, keepalive, `sendfile off`, and drains outstanding requests
+at the deadline. Every HTTP sample must have only 200 responses, zero errors,
+and the expected total body size. The empty response uses `return 200 ""`.
+
+Each sample starts only after reported Windows CPU use falls to 12% or less,
+then warms up for 1.5 seconds and measures for five seconds. Six pairs
+alternate control/candidate order; a second campaign reverses the starting
+order. Ratios outside `max(0.02, 2 * MAD)` of the median ratio are excluded,
+with at least three pairs required. For nonempty payloads, request-rate
+and bandwidth ratios are identical. All raw samples, including excluded pairs,
+are retained. Builds, functional tests, and benchmark jobs launched for this
+experiment ran sequentially.
+
+### Results and retention decision
+
+The final campaigns completed 102 measured samples with zero errors. The
+table reports the median paired throughput change after the stated filter;
+positive values favor the candidate. These are paired ratios, not ratios of
+the two independently calculated throughput medians.
+
+| Workload | Forward | Pairs retained | Reversed | Pairs retained |
+| --- | ---: | ---: | ---: | ---: |
+| Upgraded traffic, 64 bytes | +25.34% | 4/6 | +48.65% | 6/6 |
+| Upgraded traffic, 4 KiB | +24.09% | 4/6 | +18.52% | 4/6 |
+| oha, empty HTTP response | +0.09% | 4/6 | -28.22% | 4/6 |
+| oha, 64-KiB static response | -3.03% | 4/6 | +2.77% | 6/6 |
+
+The native generator's three direct samples per payload, using the same
+generator affinity without nginx, had medians of 283,037 exchanges/s for
+64-byte messages and 230,317 exchanges/s for 4-KiB messages. These are 3.68
+and 3.28 times the highest corresponding candidate campaign medians. This
+supports generator headroom for these workloads, although bypassing nginx
+also removes a network hop. Node.js is absent from these final measurements.
+Nginx CPU time per exchange also fell in all four native comparisons.
+
+The scalar optimization remains only in the experimental worktree. Its
+upgraded-traffic gains exceed 2% in both orders, but the HTTP comparisons do
+not establish the required absence of a regression greater than 2%. The
+source of the HTTP variation remains unresolved. Inspected chained-send
+and HTTP routines have matching disassembly after normalizing addresses.
+The independently validated IMAP/POP3 initialization and PowerShell
+compatibility fixes are retained in the main worktree.
+
+A follow-up empty-response oha check used the identical control binary for
+both labels, with the same parameters and six alternating pairs. Its filtered
+median was -0.26% (4/6 retained), while raw paired deltas ranged from -0.78%
+to +46.12%. All 12 samples had matching control hashes and zero errors. This
+demonstrates substantial sample variability; the failed HTTP comparison
+still prevents retaining the optimization. Results are in
+`artifacts/aa-summary.json` and `artifacts/oha-final-aa-empty/`. Reproduce the
+check from the experiment directory with an unused output name (the other
+parameters use the defaults above):
+
+```sh
+python3 run-native.py --name oha-aa-repeat --mode http --payloads 0 \
+    --isolate --same-binary control
+```
+
+These are local, one-worker measurements on one host. Substantial variation
+remained despite affinity and the pre-sample CPU gate, which cannot ensure
+the host stays idle throughout a sample. They do not establish a general
+performance gain or performance at higher worker/connection counts. Earlier
+smoke results, Node runs, and the first candidate's campaign are exploratory
+and are excluded from the retention decision.
+
+The forward oha campaign was interrupted during empty-response pair 6.
+Both sides of that incomplete pair are preserved under
+`artifacts/oha-final-forward/0/interrupted-8fllhhtq/` and were rerun together
+on September 20. Completed pairs were reused only after checking their
+parameters and binary/generator hashes. All other scheduled samples completed.
+
+### Correctness and artifacts
+
+The retained runtime combination, with the mail fixes and original scalar
+sender, passed three mail test files and 71 assertions on `nginx-control.exe`.
+Its log is `artifacts/retained-mail-regressions.log`.
+
+The experimental debug build passed eight functional test files and 193
+assertions covering mail greeting/first-command handling, SMTP/IMAP/POP3,
+plain and TLS upgrades,
+upgraded connection shutdown, and 8-MiB transfers with backpressure and
+cancellation. A separate test-only build forced 4-KiB scalar writes and passed
+all ten backpressure assertions, exercising 5266 positive short sends,
+5266 scheduled retries, and 88 would-block fallbacks with zero alerts.
+The forcing code is absent from the candidate source and normal builds.
+
+The candidate's native Windows RC matrix passed IOCP, select, and poll:
+HTTP, TLS, gzip, PCRE2, static files, reopen, reload, worker respawn, graceful quit,
+and an empty prefix. Its IOCP case additionally covers UDP and file AIO.
+These are local results; no hosted CI run is claimed for this change.
+
+The persistent experiment directory is `../nginx-perf-20260919`, alongside
+the nginx checkout. It contains `run-native.py`, `run-final-campaign.py`,
+`native-upgrade.c`, `native-topology.c`, `build-final.sh`,
+`build-partial.py`, and `summarize-final.py`. The campaign driver supports
+`--resume`, preserving completed pairs and archiving incomplete pairs before
+rerunning both variants. Raw results, configurations, logs, binary hashes,
+and test output are under `artifacts/`. `artifacts/final-summary.json`
+validates and summarizes the 102 final samples, including every raw pair
+delta, retained pair numbers, CPU measurements, and direct capacity samples.
+The sibling `../nginx-tests-iocp-20260919` contains `mail_initial_read.t` and
+`proxy_upgrade_backpressure.t`, plus portable CRLF reads in the existing
+plain/TLS upgrade tests; their complete patch is `artifacts/nginx-tests.patch`.
