@@ -79,6 +79,8 @@ jobs:
           --with-stream_ssl_module \
           --with-stream_realip_module \
           --with-stream_ssl_preread_module \
+          --with-mail \
+          --with-mail_ssl_module \
           $DEBUG_FLAG
         
         # Build
@@ -110,14 +112,19 @@ jobs:
 
         .\misc\test-win32-rc-test.ps1
 
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\misc\test-win32-rc-test.ps1
+        if ($LASTEXITCODE -ne 0) {
+          throw 'Windows PowerShell compatibility tests failed'
+        }
+
         # Find OpenSSL
         $openssl = Get-Command openssl -ErrorAction SilentlyContinue
         if ($openssl) {
           Write-Host "Found OpenSSL at: $($openssl.Source)"
-          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe -OpenSSLBinary $openssl.Source
+          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe -OpenSSLBinary $openssl.Source -TestMail
         } else {
           Write-Host "OpenSSL not found in PATH - HTTPS tests will be skipped"
-          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe
+          .\misc\win32-rc-test.ps1 -Binary .\objs\nginx.exe -TestMail
         }
 
     - name: Upload build artifacts

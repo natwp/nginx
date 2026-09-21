@@ -25,7 +25,7 @@ These workflows run on every push to master, fix/*, or feature/* branches:
 | **Smoke Tests** | 15 min | Quick validation of core functionality |
 | **Feature Tests** | 30 min | Module combinations and configurations |
 | **Integration Tests** | 30 min | Lifecycle and multi-worker scenarios |
-| **Windows Build** | 10 min | Build verification |
+| **Windows Build** | 10 min | Release/Debug builds and native RC matrix |
 | **Code Quality** | 5 min | Static analysis |
 
 **Total parallel CI time: ~90 minutes** (all run concurrently)
@@ -38,7 +38,15 @@ Trigger manually or run on schedule for deep validation:
 |----------|----------|----------|---------|
 | **Load Tests** | 60 min | Weekly (Sun 2 AM) | Stress testing with various loads |
 | **Benchmarks** | 90 min | Monthly (1st, 3 AM) | IOCP vs Select performance |
-| **Release** | 15 min | On version tags | Optimized release builds |
+| **Release** | 15 min | Version tags, fix/release-* branches, manual | Optimized release builds and package checks |
+
+The Windows build matrix enables mail and tests IMAP/POP3 greetings and
+first/subsequent commands on IOCP, select, and poll, both after startup and
+after worker replacement. The RC helper tests also run under Windows
+PowerShell 5 to verify header parsing and HTTP probe disposal.
+
+Release branch pushes and manual dispatch are dry runs. They build, test,
+package, and attest the candidate; only a version tag push publishes it.
 
 ## Test Coverage
 

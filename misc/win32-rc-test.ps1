@@ -5,7 +5,8 @@
 .DESCRIPTION
     Uses only loopback sockets and a unique temporary prefix. It exercises
     IOCP, select, and poll with two workers, then checks reload, reopen, worker
-    replacement, file paths, PCRE2, gzip, optional TLS, and stderr logging.
+    replacement, file paths, PCRE2, gzip, optional TLS and mail, and stderr
+    logging.
 #>
 
 [CmdletBinding()]
@@ -13,6 +14,7 @@ param(
     [string] $Binary = (Join-Path $PSScriptRoot '..\objs\nginx.exe'),
     [string] $Root = (Join-Path $PSScriptRoot '..'),
     [string] $OpenSSLBinary = '',
+    [switch] $TestMail,
     [switch] $KeepArtifacts,
     [switch] $Library
 )
@@ -384,6 +386,44 @@ function Invoke-Udp([int] $Port, [string] $Expected,
     }
 }
 
+function Test-MailFirstCommands([int] $Port, [string] $Protocol) {
+    $client = New-Object -TypeName System.Net.Sockets.TcpClient
+    $reader = $null
+    try {
+        $client.ReceiveTimeout = 5000
+        $client.SendTimeout = 5000
+        $client.Connect([IPAddress]::Loopback, $Port)
+        $stream = $client.GetStream()
+        $reader = [IO.StreamReader]::new(
+            $stream, [Text.Encoding]::ASCII, $false, 4096, $true)
+        $greeting = $reader.ReadLine()
+        $pattern = if ($Protocol -eq 'imap') { '^\* OK(?: |$)' } else { '^\+OK(?: |$)' }
+        Assert-True ($greeting -match $pattern) "$Protocol greeting failed: $greeting"
+
+        foreach ($number in 1..2) {
+            $command = if ($Protocol -eq 'imap') {
+                "a$number NOOP`r`n"
+            } else {
+                "NOOP`r`n"
+            }
+            $bytes = [Text.Encoding]::ASCII.GetBytes($command)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+            $reply = $reader.ReadLine()
+            $pattern = if ($Protocol -eq 'imap') {
+                "^a$number OK(?: |`$)"
+            } else {
+                '^\+OK(?: |$)'
+            }
+            Assert-True ($reply -match $pattern) "$Protocol command $number failed: $reply"
+        }
+        Write-Host "PASS $Protocol greeting and first/subsequent commands"
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        $client.Close()
+    }
+}
+
 function Start-PartialHttpRequest([int] $Port) {
     $client = New-Object -TypeName System.Net.Sockets.TcpClient
     $reader = $null
@@ -457,6 +497,8 @@ function Test-Backend([string] $Backend, [string] $BaseDir) {
     $httpPort = Get-FreeTcpPort
     $httpsPort = Get-FreeTcpPort
     $udpPort = Get-FreeUdpPort
+    $imapPort = if ($TestMail) { Get-FreeTcpPort } else { 0 }
+    $pop3Port = if ($TestMail) { Get-FreeTcpPort } else { 0 }
 
     Write-Host "Ports: HTTP=$httpPort, HTTPS=$httpsPort, UDP=$udpPort" -ForegroundColor Yellow
     $config = Join-Path $dir 'nginx.conf'
@@ -483,6 +525,23 @@ stream {
     server {
         listen 127.0.0.1:$udpPort udp;
         return "$udpBody";
+    }
+}
+"@
+    } else { '' }
+    $mailConfig = if ($TestMail) {
+@"
+mail {
+    server_name localhost;
+    auth_http http://127.0.0.1:$httpPort/auth;
+    timeout 10s;
+    server {
+        listen 127.0.0.1:$imapPort;
+        protocol imap;
+    }
+    server {
+        listen 127.0.0.1:$pop3Port;
+        protocol pop3;
     }
 }
 "@
@@ -545,6 +604,7 @@ $aioLocation
     }
 }
 $streamConfig
+$mailConfig
 "@
     Set-Content -LiteralPath $config -Value $conf -Encoding ASCII
     Invoke-Nginx @('-e', 'stderr', '-p', $dir, '-c', $config, '-t')
@@ -558,6 +618,10 @@ $streamConfig
         Write-Host "Waiting for HTTP on port $httpPort..." -ForegroundColor Yellow
         Wait-Http $httpPort $body
         Write-Host "HTTP OK" -ForegroundColor Green
+        if ($TestMail) {
+            Test-MailFirstCommands $imapPort 'imap'
+            Test-MailFirstCommands $pop3Port 'pop3'
+        }
         if ($Backend -eq 'iocp') {
             $udpClient = New-Object -TypeName System.Net.Sockets.UdpClient
             Invoke-Udp $udpPort $udpBody $udpClient
@@ -601,6 +665,11 @@ $streamConfig
         Wait-Http $httpPort $reloadedBody
         [void] (Wait-Workers $dir $start.Id 2 $killedId)
 
+        if ($TestMail) {
+            Test-MailFirstCommands $imapPort 'imap'
+            Test-MailFirstCommands $pop3Port 'pop3'
+        }
+
         Test-ExpectContinue $httpPort $reloadedBody
         if ($script:Tls) {
             Write-Host "Testing HTTPS on port $httpsPort..." -ForegroundColor Yellow
@@ -641,7 +710,8 @@ $streamConfig
         'HTTP, static file'
     }
     $tls = if ($script:Tls) { ', TLS' } else { '' }
-    Write-Host "PASS $Backend ($network, PCRE2, gzip$tls, reopen, reload, respawn, quit)"
+    $mail = if ($TestMail) { ', IMAP/POP3' } else { '' }
+    Write-Host "PASS $Backend ($network, PCRE2, gzip$tls$mail, reopen, reload, respawn, quit)"
 }
 
 if ($Library) {

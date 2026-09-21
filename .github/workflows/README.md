@@ -10,8 +10,10 @@ This directory contains all automated testing and release workflows for nginx-io
 - **Triggers**: Push to master, fix/*, feature/* branches; Pull requests
 - **Duration**: ~10 minutes
 - **Purpose**: Build verification with all major modules
-- **Modules tested**: HTTP SSL, HTTP/2, Stream SSL, gzip, stub_status
-- **Tests**: Binary validation, configuration tests
+- **Modules tested**: HTTP SSL, HTTP/2, Stream SSL, Mail SSL, gzip, stub_status
+- **Tests**: Release and Debug builds; IOCP/select/poll lifecycle and TLS;
+  IMAP/POP3 greetings and commands after startup and worker replacement;
+  HTTP header parsing under PowerShell 7 and Windows PowerShell 5
 
 #### 2. **smoke-tests.yml** - Quick Smoke Tests
 - **Triggers**: Push to master, fix/*, feature/* branches; Pull requests
@@ -86,10 +88,13 @@ This directory contains all automated testing and release workflows for nginx-io
 - **Configurable**: Test suite, worker count
 
 #### 8. **release.yml** - Release Build
-- **Triggers**: Version tags (v*)
+- **Triggers**: Version tags (v*), fix/release-* branches, manual dispatch
 - **Duration**: ~15 minutes
 - **Purpose**: Create optimized release builds
-- **Artifacts**: nginx.exe with full module set
+- **Artifacts**: Windows x64 package, SHA256 checksum, provenance attestation
+- **Publication**: Only version tag pushes publish a GitHub release. Branch
+  pushes and manual dispatch run the same build, RC, and package checks as
+  a dry run, without publishing.
 
 ## Usage
 
