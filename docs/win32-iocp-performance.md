@@ -4,6 +4,43 @@ This document records performance experiments used to decide whether an IOCP
 optimization remains in the tree.  It is intentionally limited to completed,
 repeatable measurements; unfinished experiments are marked pending.
 
+## Latest hosted CI snapshot (September 7, 2026)
+
+As of September 21, 2026, the latest completed Extended Performance Benchmarks
+run is 34131112940
+at `c4e9c65fe556da4ef575344df2dc2a59bf3efd08` (nginx 1.31.5). It predates the
+nginx 1.31.6 merge. The workflow selected the `quick` suite and four workers
+on a GitHub-hosted Windows 2022 runner. The MinGW build used
+`-O3 -march=x86-64 -mtune=generic`. Each oha 1.16.0 sample used 100 HTTP/1.1
+keepalive connections for ten seconds, draining outstanding requests after
+the deadline, with `sendfile on`, `tcp_nopush on`, and 2048 worker connections.
+
+| File size | IOCP req/s | Select req/s | Poll req/s |
+| --- | ---: | ---: | ---: |
+| 1 KiB | 9,929.82 | Not measured | Not measured |
+| 64 KiB | 10,025.21 | 10,925.87 | 11,030.81 |
+
+The four raw JSON results report success rate 1, only HTTP 200 responses,
+empty error distributions, and total response bytes matching the request
+counts and file sizes. IOCP's 64 KiB throughput was 8.24% below select and
+9.12% below poll, calculated from the unrounded request rates.
+
+Each case ran once, in the order IOCP 1 KiB, IOCP 64 KiB, select 64 KiB,
+and poll 64 KiB. There were no paired repetitions, reversed ordering, or
+host CPU gates. These measurements describe that shared-runner snapshot;
+they do not support a general 5-15% IOCP speedup over select/poll.
+
+The source is the run's `benchmark-results` artifact, ID `10022215166`.
+Its ZIP SHA256 was verified against GitHub's artifact metadata:
+`7f95105fdf861925a14897223bd1c1b040c8725179111bbe13ab7a9353ce8110`.
+The rates come from `logs/oha-1k.bin.json`, `logs/oha-64k.bin.json`,
+`logs/oha-select.json`, and `logs/oha-poll.json`; `benchmark.conf` records the
+final poll configuration. The workflow explicitly verifies IOCP selection
+before its samples and rejects HTTP errors in every sample.
+
+The September 19-20 scalar-send experiment below was performed locally.
+Its candidate failed the HTTP non-regression gate and was not retained.
+
 ## Method
 
 Measurements were collected on August 17–27, 2026, on a shared Windows

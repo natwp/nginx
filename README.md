@@ -1,6 +1,6 @@
 # nginx-iocp
 
-High-performance nginx for Windows with IOCP (I/O Completion Ports) event notification and multi-worker request dispatch.
+nginx for Windows with IOCP (I/O Completion Ports) event notification and multi-worker request dispatch.
 
 [![CI](https://github.com/natwp/nginx-iocp/actions/workflows/smoke-tests.yml/badge.svg)](https://github.com/natwp/nginx-iocp/actions)
 [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)](LICENSE)
@@ -12,7 +12,7 @@ This is a Windows port of nginx featuring:
 - **IOCP Event Backend**: Native Windows I/O Completion Ports for high-concurrency connections
 - **Multi-Worker Dispatch**: Router process distributes connections across worker processes
 - **Full Module Support**: HTTP/2, SSL/TLS, Stream, UDP routing, and standard nginx modules
-- **Performance**: 5-15% improvement over select/poll on typical workloads
+- **Measured Performance**: Workload-dependent results, with a [dated CI comparison](#performance) below
 
 Based on [nginx](https://github.com/nginx/nginx) with Windows-specific optimizations.
 
@@ -20,8 +20,7 @@ Based on [nginx](https://github.com/nginx/nginx) with Windows-specific optimizat
 
 ### IOCP Event Notification
 - Native Windows async I/O via completion ports
-- Scales efficiently to thousands of concurrent connections
-- Batch completion processing for reduced syscall overhead
+- Batch completion processing
 - Configurable thread pool for blocking operations
 
 ### Multi-Worker Architecture
@@ -67,11 +66,8 @@ make
 ### Run
 
 ```bash
-# Start nginx with IOCP backend (default)
+# Add "use iocp;" to the existing events block as shown below, then start nginx
 ./objs/nginx.exe
-
-# Or explicitly specify event method
-./objs/nginx.exe -g "events { use iocp; }"
 
 # Test
 curl http://localhost:80
@@ -103,14 +99,25 @@ See [nginx documentation](http://nginx.org/en/docs/) for complete configuration 
 
 ## Performance
 
-Typical results vs select/poll on GitHub Actions Windows 2022:
+The latest completed benchmark as of September 21, 2026 is
+CI run 34131112940,
+run on September 7 at `c4e9c65fe` (nginx 1.31.5). It used a GitHub Actions
+Windows 2022 runner, four workers, oha 1.16.0, 100 keepalive connections,
+`sendfile on`, and one ten-second sample per case.
 
-| File Size | IOCP req/s | Select req/s | Improvement |
-|-----------|------------|--------------|-------------|
-| 1KB       | 52,000     | 48,000       | +8.3%       |
-| 64KB      | 11,500     | 10,200       | +12.7%      |
+| File size | IOCP req/s | Select req/s | Poll req/s |
+|-----------|-----------:|-------------:|-----------:|
+| 1 KiB     | 9,929.82   | Not measured | Not measured |
+| 64 KiB    | 10,025.21  | 10,925.87    | 11,030.81  |
 
-See [docs/win32-iocp-performance.md](docs/win32-iocp-performance.md) for detailed benchmark data.
+All samples returned HTTP 200 with zero errors. In the 64 KiB case, IOCP was
+8.24% slower than select and 9.12% slower than poll. These single samples ran
+in a fixed order on a shared runner and do not establish a general performance
+advantage. Measure your workload on your target hardware. This CI snapshot
+predates the nginx 1.31.6 merge.
+
+See [docs/win32-iocp-performance.md](docs/win32-iocp-performance.md#latest-hosted-ci-snapshot-september-7-2026)
+for the artifact, measurement details, and separate local experiments.
 
 ## Testing
 
