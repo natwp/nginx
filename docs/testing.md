@@ -120,7 +120,14 @@ pwsh misc/win32-rc-test.ps1 -Binary ./objs/nginx.exe
 **Performance Benchmarks:**
 1. Go to https://github.com/natwp/nginx-iocp/actions/workflows/benchmarks-extended.yml
 2. Click "Run workflow"
-3. Select: test_suite (quick/standard/comprehensive), worker_count (1-4)
+3. Select `test_suite` (quick/standard/comprehensive) and the multi-worker
+   `worker_count` (2, 4, or 8; always compared with one worker).
+
+All suites cover 1 KiB/1 MiB static files with sendfile off/on, fast/delayed
+HTTP proxy responses, TLS off/on, and IOCP/select/poll. The default quick
+suite uses six two-second samples for every case, each after a one-second
+warm-up. See the [benchmark method](windows-ci-benchmarks.md) for the complete
+matrix, balanced ordering, and fixed noise policy.
 
 ## Interpreting Results
 
@@ -137,12 +144,17 @@ Look for in workflow logs:
 - **Resource usage**: CPU/memory from nginx logs
 
 ### Benchmark Results
-Download artifacts from completed runs:
-- `results/comparison.json`: Performance improvements
-- `results/iocp-results.json`: IOCP detailed metrics
-- `results/select-results.json`: Select detailed metrics
+Download `benchmark-results-static` and `benchmark-results-proxy` from a
+completed run. `summary.md` contains rates and paired comparisons;
+`summary.json` records retained counts, exclusions, and reasons for
+inconclusive results. `samples.jsonl`, `raw/`, and `manifest.json` preserve
+measurements and their build/runner context.
 
-Typical results show IOCP 5-15% faster than select.
+Only comparisons passing the sample-count, dispersion, and execution-order
+gates support a reported difference. An inconclusive result does not establish
+a winner. HTTP errors or wrong response sizes fail the job. See the
+[README performance snapshot](../README.md#performance) for completed CI
+evidence; backend performance depends on the workload and host.
 
 ## Test Artifacts
 

@@ -1,42 +1,52 @@
 name: Performance Benchmarks (Extended)
 
 on:
+  push:
+    branches: ['fix/benchmark-*']
+    paths:
+      - '.github/workflows/benchmarks-extended.yml'
+      - 'misc/benchmark-report.js'
+      - 'misc/test-benchmark-report.js'
+      - 'misc/win32-ci-benchmark.js'
+      - 'misc/win32-benchmark-helper.c'
+      - 'misc/validate-oha-summary.js'
   workflow_dispatch:
     inputs:
       test_suite:
-        description: 'Benchmark suite to run'
+        description: 'All cases: quick 2s x 6, standard 3s x 6, comprehensive 3s x 12'
         required: true
         type: choice
-        options:
-          - 'quick'
-          - 'standard'
-          - 'comprehensive'
-        default: 'standard'
+        options: ['quick', 'standard', 'comprehensive']
+        default: 'quick'
       worker_count:
-        description: 'Number of worker processes'
-        required: false
+        description: 'Multi-worker count (always compared with one worker)'
+        required: true
+        type: choice
+        options: ['2', '4', '8']
         default: '4'
   schedule:
-    # Run monthly on the 1st at 3 AM UTC
     - cron: '0 3 1 * *'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  benchmark-http:
-    name: HTTP Benchmark Suite
+  build:
+    name: Build and validate benchmark tools
     runs-on: windows-2022
-    timeout-minutes: 90
-
+    timeout-minutes: 20
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v5
+    - uses: actions/checkout@v5
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
+    - uses: actions/setup-node@v4
       with:
         node-version: 22
 
-    - name: Setup MSYS2
-      uses: msys2/setup-msys2@v2
+    - uses: msys2/setup-msys2@v2
       with:
         msystem: MINGW64
         update: true
@@ -47,311 +57,120 @@ jobs:
           mingw-w64-x86_64-pcre2
           mingw-w64-x86_64-zlib
           mingw-w64-x86_64-openssl
-          mingw-w64-x86_64-pkg-config
 
-    - name: Build optimized nginx
+    - name: Test coverage, validation, pairing, and filtering
+      shell: pwsh
+      run: |
+        node .\misc\test-benchmark-report.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node --check .\misc\win32-ci-benchmark.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Build optimized nginx and native helper
       shell: msys2 {0}
       run: |
+        set -eu
         ./auto/configure \
           --with-cc=gcc \
-          --with-cc-opt="-O3 -march=x86-64 -mtune=generic" \
+          --with-cc-opt="-O2 -march=x86-64 -mtune=generic -DFD_SETSIZE=1024" \
+          --prefix= \
+          --sbin-path=nginx.exe \
+          --conf-path=conf/nginx.conf \
+          --pid-path=logs/nginx.pid \
+          --error-log-path=logs/error.log \
+          --http-log-path=logs/access.log \
           --with-pcre \
           --with-http_ssl_module \
-          --with-http_v2_module \
-          --with-http_gzip_static_module \
-          --with-http_stub_status_module \
-          --with-stream \
-          --with-stream_ssl_module
-
+          --with-http_v2_module
         make -j$(nproc)
-        ls -lh objs/nginx.exe
+        mkdir -p benchmark-bin
+        gcc -O2 -Wall -Wextra -Werror misc/win32-benchmark-helper.c \
+          -o benchmark-bin/benchmark-helper.exe -lws2_32
+        cp objs/nginx.exe /mingw64/bin/openssl.exe benchmark-bin/
+        for program in objs/nginx.exe /mingw64/bin/openssl.exe; do
+          ldd "$program" | awk '/mingw64/ {print $3}' | sort -u | while read -r dll; do
+            if [ -f "$dll" ]; then cp "$dll" benchmark-bin/; fi
+          done
+        done
 
-    - name: Install oha (HTTP benchmarking tool)
+    - name: Install native HTTP load generator
       shell: pwsh
       run: |
-        Write-Host "=== Installing oha benchmarking tool ==="
+        Invoke-WebRequest -Uri https://github.com/hatoo/oha/releases/download/v1.16.0/oha-windows-amd64.exe `
+          -OutFile benchmark-bin/oha.exe
+        .\benchmark-bin\oha.exe --version
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-        # oha publishes a bare .exe per platform, not an archive.
-        $ohaVersion = "v1.16.0"
-        $ohaUrl = "https://github.com/hatoo/oha/releases/download/$ohaVersion/oha-windows-amd64.exe"
-
-        Invoke-WebRequest -Uri $ohaUrl -OutFile oha.exe
-
-        if (-not (Test-Path ".\oha.exe")) {
-          Write-Host "oha download failed"
-          exit 1
-        }
-
-        .\oha.exe --version
-        Write-Host "OK: oha $ohaVersion installed"
-
-    - name: Setup benchmark environment
+    - name: Exercise every case with short smoke samples
       shell: pwsh
       run: |
-        Write-Host "=== Setting up benchmark environment ===" -ForegroundColor Cyan
-
-        # Create test directory and files
-        New-Item -ItemType Directory -Path "html" -Force | Out-Null
-
-        # Create benchmark files
-        $sizes = @{
-          "1k.bin" = 1024
-          "4k.bin" = 4096
-          "16k.bin" = 16384
-          "64k.bin" = 65536
-          "256k.bin" = 262144
-          "1m.bin" = 1048576
+        foreach ($kind in @('static', 'proxy')) {
+          node .\misc\win32-ci-benchmark.js --smoke --kind $kind `
+            --binary .\benchmark-bin\nginx.exe --oha .\benchmark-bin\oha.exe `
+            --helper .\benchmark-bin\benchmark-helper.exe --openssl .\benchmark-bin\openssl.exe `
+            --output "smoke-results/$kind"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }
 
-        foreach ($file in $sizes.Keys) {
-          $bytes = [byte[]]::new($sizes[$file])
-          [System.IO.File]::WriteAllBytes("html\$file", $bytes)
-        }
-
-        Write-Host "✓ Created benchmark files"
-
-        # Create logs directory
-        New-Item -ItemType Directory -Path "logs" -Force | Out-Null
-
-        $workers = "${{ github.event.inputs.worker_count || '4' }}"
-
-        # Create benchmark configuration using array join
-        $config = @(
-          "worker_processes  $workers;",
-          'error_log  logs/error.log  notice;',
-          'pid        logs/nginx.pid;',
-          '',
-          'events {',
-          '    use iocp;',
-          '    worker_connections  2048;',
-          '}',
-          '',
-          'http {',
-          '    default_type  application/octet-stream;',
-          '    sendfile      on;',
-          '    tcp_nopush    on;',
-          '    keepalive_timeout  65;',
-          '',
-          '    server {',
-          '        listen       18091;',
-          '        server_name  localhost;',
-          '',
-          '        location / {',
-          '            root   html;',
-          '        }',
-          '',
-          '        location /status {',
-          '            stub_status;',
-          '        }',
-          '    }',
-          '}'
-        ) -join "`n"
-        
-        $config | Out-File -Encoding UTF8 "benchmark.conf"
-        Write-Host "✓ Created benchmark.conf with $workers workers"
-
-    - name: Run IOCP benchmark
-      shell: pwsh
-      run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-
-        Write-Host ""
-        Write-Host "=== IOCP Event Method Benchmark ===" -ForegroundColor Cyan
-
-        $suite = "${{ github.event.inputs.test_suite || 'standard' }}"
-        $files = @()
-        
-        switch ($suite) {
-          'quick' { $files = @('1k.bin', '64k.bin') }
-          'standard' { $files = @('1k.bin', '16k.bin', '64k.bin', '256k.bin') }
-          'comprehensive' { $files = @('1k.bin', '4k.bin', '16k.bin', '64k.bin', '256k.bin', '1m.bin') }
-        }
-
-        # Start nginx
-        Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","benchmark.conf" -NoNewWindow
-        $ready = $false
-        foreach ($attempt in 1..30) {
-          Start-Sleep -Milliseconds 500
-          try {
-            Invoke-WebRequest -Uri http://127.0.0.1:18091/1k.bin `
-              -UseBasicParsing -TimeoutSec 2 | Out-Null
-            $ready = $true
-            break
-          } catch { }
-        }
-        if (-not $ready) {
-          Write-Host "nginx did not become ready on port 18091"
-          if (Test-Path logs/error.log) { Get-Content logs/error.log }
-          exit 1
-        }
-
-        if (-not (Test-Path logs/error.log) -or
-            -not (Select-String -Path logs/error.log -Pattern 'using the "iocp" event method' -Quiet)) {
-          Write-Host "nginx did not start with the IOCP event method"
-          if (Test-Path logs/error.log) { Get-Content logs/error.log }
-          exit 1
-        }
-
-        $results = @()
-
-        foreach ($file in $files) {
-          Write-Host ""
-          Write-Host "Benchmarking $file..." -ForegroundColor Yellow
-
-          # JSON output is parsed instead of scraping the human-readable
-          # summary, which is not a stable interface.
-          $output = .\oha.exe -z 10s -c 100 --no-tui `
-            --wait-ongoing-requests-after-deadline `
-            --output-format json http://127.0.0.1:18091/$file 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0) { throw "oha failed for $file" }
-
-          $outputPath = "logs/oha-$file.json"
-          [IO.File]::WriteAllText($outputPath, $output,
-            ([System.Text.UTF8Encoding]::new($false)))
-          node .\misc\validate-oha-summary.js $outputPath 200
-          if ($LASTEXITCODE -ne 0) { throw "Invalid oha result for $file" }
-
-          $summary = ($output | ConvertFrom-Json).summary
-          if ($null -eq $summary.requestsPerSec) {
-            Write-Host "oha returned no requestsPerSec for $file"
-            Write-Host $output
-            exit 1
-          }
-
-          $reqSec = [math]::Round($summary.requestsPerSec, 2)
-          Write-Host "  Requests/sec: $reqSec"
-          Write-Host "  Success rate: $($summary.successRate)"
-          $results += "$file : $reqSec req/s"
-        }
-
-        # Stop nginx
-        .\objs\nginx.exe -p ./ -s quit -c benchmark.conf
-        $deadline = (Get-Date).AddSeconds(20)
-        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
-               ((Get-Date) -lt $deadline)) {
-          Start-Sleep -Milliseconds 500
-        }
-        if (Get-Process nginx -ErrorAction SilentlyContinue) {
-          Write-Host "nginx did not exit after quit"
-          Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
-          exit 1
-        }
-
-        Write-Host ""
-        Write-Host "=== Benchmark Results ===" -ForegroundColor Green
-        $results | ForEach-Object { Write-Host "  $_" }
-
-    - name: Benchmark comparison (select vs IOCP)
-      shell: pwsh
-      run: |
-        $env:PATH = "C:\msys64\mingw64\bin;$env:PATH"
-
-        Write-Host ""
-        Write-Host "=== Event Method Comparison ===" -ForegroundColor Cyan
-
-        $methods = @('select', 'poll')
-        $testFile = '64k.bin'
-
-        foreach ($method in $methods) {
-          Write-Host ""
-          Write-Host "Testing $method..." -ForegroundColor Yellow
-
-          # Update config for this method
-          $workers = "${{ github.event.inputs.worker_count || '4' }}"
-          $config = @(
-            "worker_processes  $workers;",
-            'error_log  logs/error.log  notice;',
-            'pid        logs/nginx.pid;',
-            '',
-            'events {',
-            "    use $method;",
-            '    worker_connections  2048;',
-            '}',
-            '',
-            'http {',
-            '    default_type  application/octet-stream;',
-            '    sendfile      on;',
-            '    tcp_nopush    on;',
-            '    keepalive_timeout  65;',
-            '',
-            '    server {',
-            '        listen       18091;',
-            '        server_name  localhost;',
-            '        location / {',
-            '            root   html;',
-            '        }',
-            '    }',
-            '}'
-          ) -join "`n"
-          
-          $config | Out-File -Encoding UTF8 "benchmark.conf"
-
-          # Start nginx
-          Start-Process -FilePath ".\objs\nginx.exe" -ArgumentList "-p","./","-c","benchmark.conf" -NoNewWindow
-          $ready = $false
-          foreach ($attempt in 1..30) {
-            Start-Sleep -Milliseconds 500
-            try {
-              Invoke-WebRequest -Uri http://127.0.0.1:18091/1k.bin `
-                -UseBasicParsing -TimeoutSec 2 | Out-Null
-              $ready = $true
-              break
-            } catch { }
-          }
-          if (-not $ready) {
-            Write-Host "nginx did not become ready on port 18091"
-            if (Test-Path logs/error.log) { Get-Content logs/error.log }
-            exit 1
-          }
-
-          $output = .\oha.exe -z 10s -c 100 --no-tui `
-            --wait-ongoing-requests-after-deadline `
-            --output-format json http://127.0.0.1:18091/$testFile 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0) { throw "oha failed for $method" }
-
-          $outputPath = "logs/oha-$method.json"
-          [IO.File]::WriteAllText($outputPath, $output,
-            ([System.Text.UTF8Encoding]::new($false)))
-          node .\misc\validate-oha-summary.js $outputPath 200
-
-          $summary = ($output | ConvertFrom-Json).summary
-          if ($LASTEXITCODE -ne 0) { throw "Invalid oha result for $method" }
-          if ($null -eq $summary.requestsPerSec) {
-            Write-Host "oha returned no requestsPerSec for $method"
-            Write-Host $output
-            exit 1
-          }
-
-          $reqSec = [math]::Round($summary.requestsPerSec, 2)
-          Write-Host "  $method`: $reqSec req/s" -ForegroundColor Green
-
-          # Stop nginx
-          .\objs\nginx.exe -p ./ -s quit -c benchmark.conf
-          $deadline = (Get-Date).AddSeconds(20)
-          while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
-                 ((Get-Date) -lt $deadline)) {
-            Start-Sleep -Milliseconds 500
-          }
-          if (Get-Process nginx -ErrorAction SilentlyContinue) {
-            Write-Host "nginx did not exit after quit"
-            Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
-            exit 1
-          }
-        }
-
-    - name: Cleanup
-      if: always()
-      shell: pwsh
-      run: |
-        Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force
-
-    - name: Upload benchmark results
-      if: always()
-      uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v4
       with:
-        name: benchmark-results
-        path: |
-          logs/*.log
-          logs/oha-*.json
-          benchmark.conf
-        retention-days: 30
+        name: benchmark-binaries
+        path: benchmark-bin/
+        retention-days: 7
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: benchmark-smoke-results
+        path: smoke-results/
+        retention-days: 14
+
+  benchmark:
+    name: Repeated ${{ matrix.kind }} comparisons
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [static, proxy]
+    env:
+      BENCH_SUITE: ${{ github.event.inputs.test_suite || 'quick' }}
+      BENCH_WORKERS: ${{ github.event.inputs.worker_count || '4' }}
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: benchmark-binaries
+        path: benchmark-bin
+
+    - name: Run every comparison with short repeated samples
+      shell: pwsh
+      run: |
+        node .\misc\win32-ci-benchmark.js --kind '${{ matrix.kind }}' `
+          --suite "$env:BENCH_SUITE" --multi-workers "$env:BENCH_WORKERS" `
+          --binary .\benchmark-bin\nginx.exe --oha .\benchmark-bin\oha.exe `
+          --helper .\benchmark-bin\benchmark-helper.exe --openssl .\benchmark-bin\openssl.exe `
+          --output 'benchmark-results/${{ matrix.kind }}'
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Publish measurement summary
+      if: always()
+      shell: pwsh
+      run: |
+        $summary = 'benchmark-results/${{ matrix.kind }}/summary.md'
+        if (Test-Path $summary) {
+          Get-Content -Raw $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+        }
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: benchmark-results-${{ matrix.kind }}
+        path: benchmark-results/${{ matrix.kind }}/
+        retention-days: 90

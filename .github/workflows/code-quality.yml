@@ -80,6 +80,14 @@ jobs:
         node .\misc\test-validate-oha-summary.js
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    - name: Test benchmark statistics and coverage
+      shell: pwsh
+      run: |
+        node .\misc\test-benchmark-report.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node --check .\misc\win32-ci-benchmark.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     - name: Check for configuration warnings
       shell: msys2 {0}
       run: |

@@ -75,17 +75,20 @@ This directory contains all automated testing and release workflows for nginx-io
 - **Configurable**: Duration, connection count
 
 #### 7. **benchmarks-extended.yml** - Performance Benchmarks
-- **Triggers**: Manual dispatch, Monthly (1st at 3 AM UTC)
-- **Duration**: ~90 minutes
-- **Purpose**: Comprehensive performance measurement
+- **Triggers**: Manual dispatch, monthly (1st at 3 AM UTC), benchmark changes
+  on `fix/benchmark-*` branches
+- **Execution**: Build/smoke job, then separate static and proxy measurement jobs
+- **Purpose**: Repeated comparisons with a fixed noise filter and raw evidence
 - **Test Suites**:
-  - **Quick**: 10s duration, 50 connections, 1 run
-  - **Standard**: 30s duration, 100 connections, 3 runs
-  - **Comprehensive**: 60s duration, 200 connections, 5 runs
-- **Backends Compared**: IOCP vs Select
-- **File Sizes**: 100B, 1KB, 4KB, 16KB, 64KB
-- **Additional**: UDP stream benchmarks
-- **Configurable**: Test suite, worker count
+  - **Quick**: 2s samples, 6 rounds (default)
+  - **Standard**: 3s samples, 6 rounds
+  - **Comprehensive**: 3s samples, 12 rounds
+- **Every Case**: 1s warm-up, 32 keepalive connections, balanced run order
+- **Backends Compared**: IOCP, select, poll
+- **Matrix**: 1 KiB/1 MiB, sendfile off/on, fast/delayed HTTP proxy, TLS off/on,
+  one/multiple workers; all suites cover all 96 cases
+- **Configurable**: Test suite, multi-worker count (2/4/8, default 4)
+- **Method and limitations**: [Windows CI benchmarks](../../docs/windows-ci-benchmarks.md)
 
 #### 8. **release.yml** - Release Build
 - **Triggers**: Version tags (v*), fix/release-* branches, manual dispatch
@@ -144,9 +147,10 @@ Look for:
 #### Benchmark Results
 Compare IOCP vs Select performance:
 - Download artifacts from workflow run
-- Check `comparison.json` for improvement percentages
-- Positive % = IOCP faster than Select
-- Review per-file-size breakdowns
+- Read `summary.md` for filtered rates and paired comparisons
+- Positive changes favor the named candidate over its matched control
+- Check retained counts and `summary.json` for inconclusive reasons
+- Keep raw samples and the manifest when citing results
 
 ## Artifacts
 
@@ -158,8 +162,9 @@ Workflows upload test artifacts on completion:
 | feature-tests | nginx-{module}-build | Built binaries | 3 days |
 | integration-tests | integration-test-logs | Lifecycle test logs | 7 days |
 | load-tests | load-test-results | Logs, configs | 14 days |
-| benchmarks-extended | benchmark-results-{suite} | JSON results, logs | 90 days |
-| benchmarks-extended | udp-benchmark-results | UDP test logs | 30 days |
+| benchmarks-extended | benchmark-results-{static,proxy} | Raw/filtered results, manifest, configs, logs | 90 days |
+| benchmarks-extended | benchmark-smoke-results | All-case correctness smoke results | 14 days |
+| benchmarks-extended | benchmark-binaries | nginx, native helper, OpenSSL, oha | 7 days |
 | release | nginx-iocp-{version} | Release binary | 90 days |
 
 ## Test Coverage Summary
@@ -175,7 +180,7 @@ Workflows upload test artifacts on completion:
 │
 ├── Performance Testing
 │   ├── load-tests.yml (60 min)           ← Stress testing
-│   └── benchmarks-extended.yml (90 min)  ← Performance measurement
+│   └── benchmarks-extended.yml          ← Build, then parallel static/proxy jobs
 │
 ├── Quality Assurance
 │   └── code-quality.yml (5 min)
