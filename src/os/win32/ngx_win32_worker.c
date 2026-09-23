@@ -1776,6 +1776,10 @@ ngx_win32_accept_mutex_trylock(ngx_cycle_t *cycle)
 {
     u_long  rc;
 
+    if (ngx_win32_accept_mutex == NULL) {
+        return 1;
+    }
+
     rc = WaitForSingleObject(ngx_win32_accept_mutex, 0);
 
     if (rc == WAIT_OBJECT_0 || rc == WAIT_ABANDONED) {

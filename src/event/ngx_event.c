@@ -553,8 +553,8 @@ ngx_event_module_init(ngx_cycle_t *cycle)
         {
             ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                           "accept_mutex is off for the \"%s\" event method "
-                          "with multiple Windows workers; every worker will "
-                          "accept concurrently",
+                          "with multiple Windows workers; workers will "
+                          "wait for events independently",
                           ecf->name);
         }
     }
@@ -701,26 +701,18 @@ ngx_event_process_init(ngx_cycle_t *cycle)
 #if (NGX_WIN32)
 
     /*
-     * A non-IOCP method has no router to own the listening sockets, so
-     * multiple workers accept from the same socket directly.  Serializing
-     * them with a named mutex was previously unconditional here, which
-     * silently overrode the directive; "accept_mutex" is now honored.
-     * Letting every worker accept concurrently measured about 30% more
-     * throughput for four select workers, at the cost of accept contention
-     * that has not been characterized under connection churn.  Note that
-     * the directive itself defaults to off, so a multi-worker select or
-     * poll configuration accepts concurrently unless it opts in.
+     * Concurrent Winsock accept() calls on a shared listener can block even
+     * in nonblocking mode.  With accept_mutex off, the named mutex protects
+     * only the accept() call, leaving event waits independent.  A single
+     * worker also needs this protection while generations overlap on reload.
      */
 
-    if (ccf->master && ccf->worker_processes > 1
-        && ecf->use != ngx_iocp_module.ctx_index
-        && ecf->accept_mutex)
-    {
+    if (ccf->master && ecf->use != ngx_iocp_module.ctx_index) {
         if (ngx_win32_accept_mutex_init(cycle) != NGX_OK) {
             return NGX_ERROR;
         }
 
-        ngx_use_accept_mutex = 1;
+        ngx_use_accept_mutex = (ccf->worker_processes > 1 && ecf->accept_mutex);
         ngx_accept_mutex_held = 0;
         ngx_accept_mutex_delay = ecf->accept_mutex_delay;
 
@@ -990,6 +982,19 @@ ngx_event_process_init(ngx_cycle_t *cycle)
                               "the \"%s\" event method cannot initialize "
                               "datagram listener %V on Windows",
                               ecf->name, &ls[i].addr_text);
+                return NGX_ERROR;
+            }
+
+            /*
+             * Set the nonblocking mode on each imported listening socket.
+             * Another worker may accept the connection before this worker
+             * processes its readiness event.
+             */
+
+            if (ngx_nonblocking(c->fd) == -1) {
+                ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
+                              ngx_nonblocking_n " %V failed",
+                              &ls[i].addr_text);
                 return NGX_ERROR;
             }
 

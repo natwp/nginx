@@ -36,8 +36,8 @@ output path, so enabling this directive does not imply zero-copy TLS transfer.
 Each sample uses native oha 1.16.0 with 32 keepalive connections and two client
 threads. The quick suite records 576 measurements plus a warm-up for each.
 The static and proxy jobs run concurrently, on separate runners. The build job
-first exercises all cases with short smoke samples; smoke results are never
-eligible for performance claims.
+first exercises all cases with short smoke samples at the same connection
+count; smoke results are never eligible for performance claims.
 
 ## Order, validation, and noise filtering
 

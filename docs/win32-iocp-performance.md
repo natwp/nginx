@@ -216,6 +216,20 @@ The unmeasured case is connection churn, where accept contention would be
 highest.  This workstation cannot benchmark it for the reason given above,
 so the change is accepted on steady-state and reload evidence only.
 
+**September 23 correction:** short bursts alternating between two listeners
+reproduced workers stuck inside Winsock `accept()`, leaving their established
+connections unserved. A standalone shared-socket reproducer confirmed that
+concurrent `accept()` calls can block even after setting nonblocking mode.
+The earlier soak did not establish safety for this case.
+
+The fix keeps imported fallback listeners nonblocking and serializes only
+the `accept()` call when `accept_mutex off` is configured. Workers still wait
+for events independently; `accept_mutex on` retains its wider serialization.
+The native RC test now covers established connections while bursts arrive on
+two listeners, and benchmark smoke uses the normal 32 connections. Historical
+measurements above predate this guard; use the current
+[CI matrix](windows-ci-benchmarks.md) for comparisons.
+
 ### `sendfile on` uses TransmitPackets exclusively
 
 An instrumented build counted the branches of

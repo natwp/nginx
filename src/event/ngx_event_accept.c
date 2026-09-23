@@ -62,7 +62,21 @@ ngx_event_accept(ngx_event_t *ev)
     do {
         socklen = sizeof(ngx_sockaddr_t);
 
-#if (NGX_HAVE_ACCEPT4)
+#if (NGX_WIN32)
+        if (!ngx_use_accept_mutex
+            && ngx_win32_accept_mutex_trylock((ngx_cycle_t *) ngx_cycle) != 1)
+        {
+            return;
+        }
+
+        s = accept(lc->fd, &sa.sockaddr, &socklen);
+        err = ngx_socket_errno;
+
+        if (!ngx_use_accept_mutex) {
+            ngx_win32_accept_mutex_unlock();
+        }
+
+#elif (NGX_HAVE_ACCEPT4)
         if (use_accept4) {
             s = accept4(lc->fd, &sa.sockaddr, &socklen, SOCK_NONBLOCK);
         } else {
@@ -73,7 +87,9 @@ ngx_event_accept(ngx_event_t *ev)
 #endif
 
         if (s == (ngx_socket_t) -1) {
+#if !(NGX_WIN32)
             err = ngx_socket_errno;
+#endif
 
             if (err == NGX_EAGAIN) {
                 ngx_log_debug0(NGX_LOG_DEBUG_EVENT, ev->log, err,

@@ -41,7 +41,6 @@ function options(argv) {
   result.repeats = result.smoke ? 1 : result.suite === 'comprehensive' ? 12 : 6;
   result.sampleSeconds = result.smoke ? 0.2 : result.suite === 'quick' ? 2 : 3;
   result.warmupSeconds = result.smoke ? 0.1 : 1;
-  if (result.smoke) result.connections = 2;
   return result;
 }
 

@@ -5,8 +5,8 @@
 .DESCRIPTION
     Uses only loopback sockets and a unique temporary prefix. It exercises
     IOCP, select, and poll with two workers, then checks reload, reopen, worker
-    replacement, file paths, PCRE2, gzip, optional TLS and mail, and stderr
-    logging.
+    replacement, idle listeners, file paths, PCRE2, gzip, optional TLS and
+    mail, and stderr logging.
 #>
 
 [CmdletBinding()]
@@ -457,6 +457,68 @@ function Start-PartialHttpRequest([int] $Port) {
     }
 }
 
+function Test-IdleListeners([int] $FirstPort, [int] $SecondPort) {
+    $connections = @()
+    try {
+        # Alternate connection bursts between listeners, keeping earlier
+        # connections open. Stale accept events must not block the workers
+        # responsible for those established connections.
+        $request = [Text.Encoding]::ASCII.GetBytes(
+            "GET /worker HTTP/1.1`r`nHost: localhost`r`nConnection: keep-alive`r`n`r`n")
+        for ($round = 0; $round -lt 4; $round++) {
+            $port = if ($round % 2) { $SecondPort } else { $FirstPort }
+            $added = @()
+            for ($i = 0; $i -lt 8; $i++) {
+                $client = New-Object -TypeName System.Net.Sockets.TcpClient
+                $client.ReceiveTimeout = 5000
+                $client.SendTimeout = 5000
+                $entry = @{Client = $client; Pending = $null; Reader = $null}
+                $connections += $entry
+                $added += $entry
+                $entry.Pending = $client.BeginConnect([IPAddress]::Loopback,
+                    $port, $null, $null)
+            }
+            foreach ($entry in $added) {
+                Assert-True ($entry.Pending.AsyncWaitHandle.WaitOne(5000)) `
+                    'Listener connection timed out'
+                $entry.Client.EndConnect($entry.Pending)
+                $entry.Stream = $entry.Client.GetStream()
+                $entry.Reader = [IO.StreamReader]::new(
+                    $entry.Stream, [Text.Encoding]::ASCII, $false, 4096, $true)
+            }
+            Start-Sleep -Milliseconds 100
+            foreach ($entry in $connections) {
+                $entry.Stream.Write($request, 0, $request.Length)
+            }
+            foreach ($entry in $connections) {
+                Assert-True ($entry.Reader.ReadLine() -eq 'HTTP/1.1 200 OK') `
+                    'Idle listener blocked an established connection'
+                $headers = Read-HttpHeaders $entry.Reader
+                $length = [int] $headers['Content-Length']
+                Assert-True ($length -gt 0 -and $length -le 16) `
+                    'Invalid worker response length'
+                $chars = New-Object char[] $length
+                Assert-True ($entry.Reader.ReadBlock($chars, 0, $length) -eq $length) `
+                    'Incomplete worker response'
+                $workerId = -join $chars
+                Assert-True ($workerId -match '^\d+$') 'Invalid worker ID'
+                if ($entry.ContainsKey('WorkerId')) {
+                    Assert-True ($workerId -eq $entry.WorkerId) `
+                        'Keepalive connection changed worker'
+                }
+                $entry.WorkerId = $workerId
+            }
+        }
+        Write-Host 'PASS established connections with two idle listeners'
+    } finally {
+        foreach ($entry in $connections) {
+            if ($entry.Reader) { $entry.Reader.Dispose() }
+            $entry.Client.Close()
+            if ($entry.Pending) { $entry.Pending.AsyncWaitHandle.Close() }
+        }
+    }
+}
+
 function Stop-TestNginx([string] $Prefix, [string] $Config, [System.Diagnostics.Process] $Master) {
     try {
         & $script:Binary '-e' 'stderr' '-p' $Prefix '-c' $Config '-s' 'quit' 2>&1 | Out-Null
@@ -495,6 +557,7 @@ function Test-Backend([string] $Backend, [string] $BaseDir) {
     New-Item -ItemType Directory -Force -Path $logs, $html | Out-Null
 
     $httpPort = Get-FreeTcpPort
+    $secondHttpPort = Get-FreeTcpPort
     $httpsPort = Get-FreeTcpPort
     $udpPort = Get-FreeUdpPort
     $imapPort = if ($TestMail) { Get-FreeTcpPort } else { 0 }
@@ -579,6 +642,7 @@ http {
     gzip_types text/plain;
     server {
         listen 127.0.0.1:$httpPort;
+        listen 127.0.0.1:$secondHttpPort;
 $tlsConfig
         location = / {
             return 200 "$body";
@@ -629,6 +693,7 @@ $mailConfig
 
         [void] (Wait-TestProcesses $dir 3)
         $oldWorkers = @(Wait-Workers $dir $start.Id 2)
+        Test-IdleListeners $httpPort $secondHttpPort
         for ($attempt = 0; $attempt -lt 32 -and $partialClients.Count -lt 2; $attempt++) {
             $partial = Start-PartialHttpRequest $httpPort
             if ($partialClients.ContainsKey($partial.WorkerId)) {
