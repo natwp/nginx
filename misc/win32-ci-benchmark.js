@@ -44,21 +44,25 @@ function options(argv) {
   return result;
 }
 
-function execute(file, args, timeout = 20000, cwd) {
+function execute(file, args, timeout = 20000, cwd, watcher) {
   return new Promise((resolve, reject) => {
     const child = childProcess.spawn(file, args, {
       cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe']
     });
     const stdout = [], stderr = [];
+    const usage = watcher && child.pid
+      ? execute(watcher, ['watch', String(child.pid)], timeout + 5000)
+        .catch(error => ({code: -1, stderr: error.message}))
+      : Promise.resolve(null);
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout);
     child.stdout.on('data', chunk => stdout.push(chunk));
     child.stderr.on('data', chunk => stderr.push(chunk));
     child.once('error', error => { clearTimeout(timer); reject(error); });
-    child.once('close', code => {
+    child.once('close', async code => {
       clearTimeout(timer);
       resolve({code, timedOut, stdout: Buffer.concat(stdout).toString(),
-        stderr: Buffer.concat(stderr).toString()});
+        stderr: Buffer.concat(stderr).toString(), usage: await usage});
     });
   });
 }
@@ -210,7 +214,8 @@ async function startUpstream(settings) {
 
 async function startNginx(settings, condition, round, upstreamPort) {
   const prefix = path.join(settings.output, 'prefixes',
-    `r${round + 1}-${condition.backend}-w${condition.workers}`);
+    `r${round + 1}-${condition.backend}-w${condition.workers}`
+      + (settings.instance ? `-${settings.instance}` : ''));
   fs.mkdirSync(path.join(prefix, 'logs'), {recursive: true});
   const ports = [await freePort(), await freePort()];
   assert(ports[0] !== ports[1]);
@@ -290,12 +295,25 @@ async function load(settings, url, seconds, file, bytes) {
     '--worker-threads', '2', '--http-version', '1.1', '--ipv4',
     '--wait-ongoing-requests-after-deadline', '--no-tui',
     '--disable-compression', '--output-format', 'json',
-    '--insecure', '-t', '5s', url
-  ], Math.max(15000, (seconds + 10) * 1000));
+    '--insecure', '-t', '5s',
+    ...(settings.rate ? ['-q', String(settings.rate), '--latency-correction'] : []),
+    url
+  ], Math.max(15000, (seconds + 10) * 1000), undefined,
+  settings.measureClient ? settings.helper : undefined);
   fs.writeFileSync(file, result.stdout);
   fs.writeFileSync(file + '.stderr', result.stderr);
   assert(result.code === 0 && !result.timedOut, `oha failed: ${file}: ${result.stderr}`);
-  return report.validateSample(JSON.parse(result.stdout), bytes);
+  const sample = report.validateSample(JSON.parse(result.stdout), bytes);
+  if (settings.measureClient) {
+    assert(result.usage && result.usage.code === 0 && !result.usage.timedOut,
+      `missing client CPU/affinity measurement: ${file}`);
+    const usage = JSON.parse(result.usage.stdout);
+    assert(usage.seconds > 0 && usage.cpuSeconds >= 0);
+    assert(usage.affinity === settings.clientAffinity, 'client affinity changed');
+    writeJson(file + '.usage.json', usage);
+    sample.clientCpuCores = usage.cpuSeconds / usage.seconds;
+  }
+  return sample;
 }
 
 async function run(settings) {
@@ -402,4 +420,6 @@ if (require.main === module) {
   });
 }
 
-module.exports = {options, configuration, run};
+module.exports = {options, configuration, run, execute, checked, request,
+  snapshot, hostCpu, processCpu, idleCpu, startUpstream, startNginx,
+  stopNginx, load};

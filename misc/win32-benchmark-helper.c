@@ -30,6 +30,7 @@ ngx_bench_snapshot(int argc, char **argv)
     int       i, comma;
     DWORD     pid;
     HANDLE    process;
+    DWORD_PTR affinity, system;
     FILETIME  idle, kernel, user, created, exited;
 
     if (!GetSystemTimes(&idle, &kernel, &user)) {
@@ -45,7 +46,7 @@ ngx_bench_snapshot(int argc, char **argv)
 
     for (i = 2; i < argc; i++) {
         pid = (DWORD) strtoul(argv[i], NULL, 10);
-        process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        process = OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
                               FALSE, pid);
 
         if (process == NULL) {
@@ -53,13 +54,16 @@ ngx_bench_snapshot(int argc, char **argv)
         }
 
         if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT
-            && GetProcessTimes(process, &created, &exited, &kernel, &user))
+            && GetProcessTimes(process, &created, &exited, &kernel, &user)
+            && GetProcessAffinityMask(process, &affinity, &system))
         {
-            printf("%s\"%lu\":{\"ticks\":%llu,\"created\":\"%lx-%lx\"}",
+            printf("%s\"%lu\":{\"ticks\":%llu,\"created\":\"%lx-%lx\","
+                   "\"affinity\":\"0x%llx\"}",
                    comma ? "," : "", (unsigned long) pid,
                    ngx_bench_ticks(kernel) + ngx_bench_ticks(user),
                    (unsigned long) created.dwHighDateTime,
-                   (unsigned long) created.dwLowDateTime);
+                   (unsigned long) created.dwLowDateTime,
+                   (unsigned long long) affinity);
             comma = 1;
         }
 
@@ -101,6 +105,78 @@ ngx_bench_terminate(char *pid_text, char *expected)
         {
             rc = 0;
         }
+    }
+
+    CloseHandle(process);
+    return rc;
+}
+
+
+static int
+ngx_bench_affinity(char *pid_text, char *mask_text, char *expected)
+{
+    int        rc;
+    char       identity[32], *end;
+    HANDLE     process;
+    DWORD_PTR  mask, actual, system;
+    FILETIME   created, exited, kernel, user;
+
+    mask = (DWORD_PTR) strtoull(mask_text, &end, 0);
+    if (*end || mask == 0) {
+        return 2;
+    }
+
+    process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+                          FALSE, (DWORD) strtoul(pid_text, NULL, 10));
+    if (process == NULL) {
+        return 1;
+    }
+
+    rc = 1;
+    if (GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+        sprintf(identity, "%lx-%lx", (unsigned long) created.dwHighDateTime,
+                (unsigned long) created.dwLowDateTime);
+        if (strcmp(identity, expected) == 0
+            && GetProcessAffinityMask(process, &actual, &system)
+            && (mask & system) == mask
+            && SetProcessAffinityMask(process, mask)
+            && GetProcessAffinityMask(process, &actual, &system)
+            && actual == mask)
+        {
+            rc = 0;
+        }
+    }
+
+    CloseHandle(process);
+    return rc;
+}
+
+
+static int
+ngx_bench_watch(char *pid_text)
+{
+    int        rc;
+    HANDLE     process;
+    DWORD_PTR  affinity, system;
+    FILETIME   created, exited, kernel, user;
+
+    process = OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE,
+                          (DWORD) strtoul(pid_text, NULL, 10));
+    if (process == NULL) {
+        return 1;
+    }
+
+    rc = 1;
+    if (GetProcessAffinityMask(process, &affinity, &system)
+        && WaitForSingleObject(process, 60000) == WAIT_OBJECT_0
+        && GetProcessTimes(process, &created, &exited, &kernel, &user))
+    {
+        printf("{\"affinity\":\"0x%llx\",\"cpuSeconds\":%.7f,"
+               "\"seconds\":%.7f}\n", (unsigned long long) affinity,
+               (ngx_bench_ticks(kernel) + ngx_bench_ticks(user)) / 10000000.0,
+               (ngx_bench_ticks(exited) - ngx_bench_ticks(created))
+               / 10000000.0);
+        rc = 0;
     }
 
     CloseHandle(process);
@@ -221,10 +297,20 @@ main(int argc, char **argv)
         return ngx_bench_terminate(argv[2], argv[3]);
     }
 
+    if (argc == 5 && strcmp(argv[1], "affinity") == 0) {
+        return ngx_bench_affinity(argv[2], argv[3], argv[4]);
+    }
+
+    if (argc == 3 && strcmp(argv[1], "watch") == 0) {
+        return ngx_bench_watch(argv[2]);
+    }
+
     if (argc != 4 || strcmp(argv[1], "serve") != 0) {
         fprintf(stderr, "usage: helper.exe serve port delay-ms\n"
                 "       helper.exe snapshot [pid ...]\n"
-                "       helper.exe terminate pid creation-id\n");
+                "       helper.exe terminate pid creation-id\n"
+                "       helper.exe affinity pid mask creation-id\n"
+                "       helper.exe watch pid\n");
         return 2;
     }
 

@@ -307,4 +307,5 @@ if (require.main === module) {
 }
 
 module.exports = {backends, sizes, policy, cases, caseId, conditionOrder,
-  workloadOrder, median, validateSample, filterLogs, summarize, table, main};
+  workloadOrder, median, validateSample, filterLogs, sampleExclusion,
+  summarize, table, main};

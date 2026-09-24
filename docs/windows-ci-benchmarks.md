@@ -7,6 +7,9 @@ within a workload family use the same runner. The latest completed measurements
 are summarized in the [README](../README.md#performance). The
 [September 23, 2026 report](windows-ci-benchmarks-2026-09-23.md) records all
 96 rates, 208 paired comparisons, filter outcomes, and artifact hashes.
+The [IOCP optimization protocol](windows-iocp-optimization.md) adds identical
+baseline controls, explicit CPU budgets, and client/upstream headroom checks
+for evaluating code changes.
 
 ## Coverage and duration
 

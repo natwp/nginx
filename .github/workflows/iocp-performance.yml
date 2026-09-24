@@ -1,0 +1,205 @@
+name: IOCP Performance Trial
+
+on:
+  push:
+    branches: ['fix/iocp-perf-*']
+    paths:
+      - 'src/**'
+      - 'auto/**'
+      - 'misc/*benchmark*'
+      - 'misc/*iocp*'
+      - '.github/workflows/iocp-performance.yml'
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Baseline revision, built with the same toolchain as the candidate'
+        type: string
+        default: 'adacad63a61a458521fd19c4ce28ab507c8ac1f7'
+      repeats:
+        description: 'Balanced rounds, each with all six arm permutations'
+        type: choice
+        options: ['6', '12']
+        default: '6'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iocp-performance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build baseline and candidate with one toolchain
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ inputs.baseline || 'adacad63a61a458521fd19c4ce28ab507c8ac1f7' }}
+        path: baseline-src
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Validate comparison and noise gates
+      shell: pwsh
+      run: |
+        node .\misc\test-benchmark-report.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node .\misc\test-iocp-performance-report.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node --check .\misc\win32-iocp-compare.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          base-devel
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+          mingw-w64-x86_64-pcre2
+          mingw-w64-x86_64-zlib
+          mingw-w64-x86_64-openssl
+
+    - name: Build both optimized executables and native measurement helper
+      shell: msys2 {0}
+      run: |
+        set -euo pipefail
+        benchmark_bin="$PWD/benchmark-bin"
+        mkdir -p "$benchmark_bin/baseline" "$benchmark_bin/candidate"
+        build_one() {
+          (
+            cd "$1"
+            ./auto/configure \
+              --with-cc=gcc \
+              --with-cc-opt="-O2 -march=x86-64 -mtune=generic -DFD_SETSIZE=1024" \
+              --prefix= \
+              --sbin-path=nginx.exe \
+              --conf-path=conf/nginx.conf \
+              --pid-path=logs/nginx.pid \
+              --error-log-path=logs/error.log \
+              --http-log-path=logs/access.log \
+              --with-pcre \
+              --with-http_ssl_module \
+              --with-http_v2_module
+            make -j$(nproc)
+            cp objs/nginx.exe "$benchmark_bin/$2/nginx.exe"
+          )
+        }
+        build_one baseline-src baseline
+        build_one . candidate
+        gcc -O2 -Wall -Wextra -Werror misc/win32-benchmark-helper.c \
+          -o "$benchmark_bin/benchmark-helper.exe" -lws2_32
+        cp /mingw64/bin/openssl.exe "$benchmark_bin/"
+        for program in "$benchmark_bin/baseline/nginx.exe" \
+                       "$benchmark_bin/candidate/nginx.exe" /mingw64/bin/openssl.exe; do
+          ldd "$program" | awk '/mingw64/ {print $3}' | sort -u | while read -r dll; do
+            if [ -f "$dll" ]; then cp "$dll" "$benchmark_bin/"; fi
+          done
+        done
+        cp "$benchmark_bin/"*.dll "$benchmark_bin/baseline/"
+        cp "$benchmark_bin/"*.dll "$benchmark_bin/candidate/"
+        gcc --version > "$benchmark_bin/compiler.txt"
+        pacman -Q > "$benchmark_bin/packages.txt"
+
+    - name: Record source provenance and install pinned client
+      shell: pwsh
+      run: |
+        $candidate = git rev-parse HEAD
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $baseline = git -C baseline-src rev-parse HEAD
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        @{ candidate = $candidate; baseline = $baseline } | ConvertTo-Json |
+          Set-Content -Encoding utf8 benchmark-bin/provenance.json
+        Invoke-WebRequest -Uri https://github.com/hatoo/oha/releases/download/v1.16.0/oha-windows-amd64.exe `
+          -OutFile benchmark-bin/oha.exe
+        .\benchmark-bin\oha.exe --version
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: iocp-trial-binaries
+        path: benchmark-bin/
+        retention-days: 14
+
+  measure:
+    name: ${{ matrix.kind }} / ${{ matrix.profile }} CPU budgets
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [static, proxy]
+        profile: [isolated, shared]
+    env:
+      TRIAL_REPEATS: ${{ inputs.repeats || '6' }}
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: iocp-trial-binaries
+        path: benchmark-bin
+
+    - name: Interleave identical controls and candidate
+      shell: pwsh
+      run: |
+        node .\misc\win32-iocp-compare.js --kind '${{ matrix.kind }}' --profile '${{ matrix.profile }}' `
+          --repeats "$env:TRIAL_REPEATS" `
+          --baseline .\benchmark-bin\baseline\nginx.exe --candidate .\benchmark-bin\candidate\nginx.exe `
+          --oha .\benchmark-bin\oha.exe --helper .\benchmark-bin\benchmark-helper.exe `
+          --openssl .\benchmark-bin\openssl.exe --provenance .\benchmark-bin\provenance.json `
+          --output trial-results
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Publish measurements and limitations
+      if: always()
+      shell: pwsh
+      run: |
+        if (Test-Path trial-results/summary.md) {
+          Get-Content -Raw trial-results/summary.md |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+        }
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: iocp-results-${{ matrix.kind }}-${{ matrix.profile }}
+        path: trial-results/
+        retention-days: 90
+
+  gate:
+    name: Require measured improvement and no regressions
+    needs: measure
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: iocp-results-*
+        path: trial-results
+
+    - name: Recompute all reports and apply retention gate
+      run: |
+        node misc/iocp-performance-report.js --gate \
+          trial-results/iocp-results-static-isolated \
+          trial-results/iocp-results-static-shared \
+          trial-results/iocp-results-proxy-isolated \
+          trial-results/iocp-results-proxy-shared
