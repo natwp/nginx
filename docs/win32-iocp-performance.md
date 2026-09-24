@@ -4,11 +4,33 @@ This document records performance experiments used to decide whether an IOCP
 optimization remains in the tree.  It is intentionally limited to completed,
 repeatable measurements; unfinished experiments are marked pending.
 
-## Latest hosted CI snapshot (September 7, 2026)
+## Latest hosted CI matrix (September 23, 2026)
 
-As of September 21, 2026, the latest completed Extended Performance Benchmarks
-run is 34131112940
-at `c4e9c65fe556da4ef575344df2dc2a59bf3efd08` (nginx 1.31.5). It predates the
+The [completed report](windows-ci-benchmarks-2026-09-23.md) and
+[README tables](../README.md#performance) supersede the earlier snapshot below.
+CI run 35859988384
+measured `42b2436f0e9dab23d4b182faf0894f2c48a7f057` (nginx 1.31.6 with the
+shared-listener accept guard). It covers IOCP/select/poll, one/four workers,
+1 KiB/1 MiB responses, HTTP/TLS, static sendfile off/on, and fast/20 ms delayed
+proxy responses. Each of the 96 cases has six two-second measurements with
+one-second warm-ups and balanced execution order.
+
+All 576 measurements and 576 warm-ups passed response validation. The fixed noise
+policy found 92 stable rates and 189 stable paired comparisons out of 208;
+the report retains the inconclusive results. IOCP's relative performance
+depends on response size, transport, and worker count. These hosted results
+do not establish a universal advantage or validate historical local claims.
+
+See the [CI methodology](windows-ci-benchmarks.md) for workload definitions,
+filter gates, and reproduction instructions. The historical snapshot and
+local experiments below retain their original source revisions and methods.
+
+<a id="latest-hosted-ci-snapshot-september-7-2026"></a>
+
+## Historical hosted CI snapshot (September 7, 2026)
+
+CI run 34131112940
+measured `c4e9c65fe556da4ef575344df2dc2a59bf3efd08` (nginx 1.31.5). It predates the
 nginx 1.31.6 merge. The workflow selected the `quick` suite and four workers
 on a GitHub-hosted Windows 2022 runner. The MinGW build used
 `-O3 -march=x86-64 -mtune=generic`. Each oha 1.16.0 sample used 100 HTTP/1.1
@@ -41,7 +63,9 @@ before its samples and rejects HTTP errors in every sample.
 The September 19-20 scalar-send experiment below was performed locally.
 Its candidate failed the HTTP non-regression gate and was not retained.
 
-## Method
+<a id="method"></a>
+
+## Historical local measurement method
 
 Measurements were collected on August 17–27, 2026, on a shared Windows
 workstation with the benchmark driver running from WSL.  Candidate and control
