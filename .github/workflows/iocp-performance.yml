@@ -16,7 +16,7 @@ on:
         type: string
         default: 'adacad63a61a458521fd19c4ce28ab507c8ac1f7'
       repeats:
-        description: 'Balanced rounds, each with all six arm permutations'
+        description: 'Rounds, covering all six arm permutations every six rounds'
         type: choice
         options: ['6', '12']
         default: '6'

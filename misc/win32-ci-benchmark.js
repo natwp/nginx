@@ -302,6 +302,10 @@ async function load(settings, url, seconds, file, bytes) {
   settings.measureClient ? settings.helper : undefined);
   fs.writeFileSync(file, result.stdout);
   fs.writeFileSync(file + '.stderr', result.stderr);
+  if (settings.measureClient) {
+    // Preserve client counters even when response validation fails.
+    writeJson(file + '.client.json', result.usage);
+  }
   assert(result.code === 0 && !result.timedOut, `oha failed: ${file}: ${result.stderr}`);
   const sample = report.validateSample(JSON.parse(result.stdout), bytes);
   if (settings.measureClient) {

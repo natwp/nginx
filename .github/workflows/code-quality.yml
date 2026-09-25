@@ -85,7 +85,11 @@ jobs:
       run: |
         node .\misc\test-benchmark-report.js
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node .\misc\test-iocp-performance-report.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         node --check .\misc\win32-ci-benchmark.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node --check .\misc\win32-iocp-compare.js
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Check for configuration warnings
