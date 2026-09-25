@@ -1429,6 +1429,16 @@ ngx_iocp_process_entry(ngx_cycle_t *cycle, OVERLAPPED_ENTRY *entry,
     } else if (op->type == NGX_IOCP_OP_WRITE_NOTIFY) {
         /* posted by the thread-pool wait callback */
 
+    } else if (owner->socket && owner->connection
+               && owner->connection->type == SOCK_STREAM
+               && op->overlapped.Internal == 0)
+    {
+        /*
+         * Successful stream completions already carry their byte count.
+         * Only failures and message-oriented receives need a result query
+         * for the Winsock error or output flags.
+         */
+
     } else if (owner->socket) {
         bytes = op->bytes;
         op_flags = op->flags;
