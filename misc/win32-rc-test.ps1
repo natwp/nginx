@@ -823,6 +823,8 @@ events {
 http {
     access_log stderr;
     default_type text/plain;
+    # Exercise keepalive after its separately allocated header buffer is freed.
+    client_header_buffer_size 8k;
     gzip on;
     gzip_min_length 1;
     gzip_types text/plain;

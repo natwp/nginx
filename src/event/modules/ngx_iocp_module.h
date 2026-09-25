@@ -100,6 +100,7 @@ ngx_int_t ngx_iocp_associate(ngx_iocp_owner_t *owner);
 void ngx_iocp_load_extensions(ngx_iocp_owner_t *owner);
 ngx_int_t ngx_iocp_add_connection(ngx_connection_t *c);
 ngx_int_t ngx_iocp_post_read(ngx_event_t *rev);
+ngx_int_t ngx_iocp_post_read_buffer(ngx_event_t *rev, size_t size);
 ngx_int_t ngx_iocp_post_write(ngx_event_t *wev);
 void ngx_iocp_close_connection(ngx_connection_t *c);
 void ngx_iocp_close_owner(ngx_iocp_owner_t *owner);

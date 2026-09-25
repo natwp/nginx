@@ -50,7 +50,9 @@ static ngx_int_t ngx_iocp_process_events(ngx_cycle_t *cycle,
     ngx_msec_t timer, ngx_uint_t flags);
 static ngx_int_t ngx_iocp_process_entry(ngx_cycle_t *cycle,
     OVERLAPPED_ENTRY *entry, ngx_uint_t flags);
+static ngx_int_t ngx_iocp_post_read_internal(ngx_event_t *rev, size_t size);
 static void ngx_iocp_read_notify_complete(ngx_iocp_op_t *op);
+static void ngx_iocp_read_notify_cleanup(ngx_iocp_op_t *base);
 static void CALLBACK ngx_iocp_write_notify_callback(
     PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WAIT wait,
     TP_WAIT_RESULT result);
@@ -485,6 +487,21 @@ ngx_iocp_add_connection(ngx_connection_t *c)
 ngx_int_t
 ngx_iocp_post_read(ngx_event_t *rev)
 {
+    return ngx_iocp_post_read_internal(rev, 0);
+}
+
+
+ngx_int_t
+ngx_iocp_post_read_buffer(ngx_event_t *rev, size_t size)
+{
+    return ngx_iocp_post_read_internal(rev,
+                                      ngx_min(size, NGX_IOCP_READ_LIMIT));
+}
+
+
+static ngx_int_t
+ngx_iocp_post_read_internal(ngx_event_t *rev, size_t size)
+{
     int                         rc;
     ngx_err_t                   err;
     ngx_pool_t                 *pool;
@@ -514,6 +531,9 @@ ngx_iocp_post_read(ngx_event_t *rev)
     /*
      * A zero-byte receive is a readiness notification for stream sockets.
      * It does not consume data, which is required by SSL and MSG_PEEK users.
+     * A consumer that has selected its next receive buffer size can request
+     * data instead.  Its owned buffer remains valid even if the HTTP idle
+     * buffer is released while the receive is pending.
      * Datagram handlers post a real receive so zero-length datagrams retain
      * their normal semantics.
      */
@@ -531,7 +551,8 @@ ngx_iocp_post_read(ngx_event_t *rev)
     op = (ngx_iocp_read_notify_op_t *)
          ngx_iocp_op_create(sizeof(ngx_iocp_read_notify_op_t), c->iocp, rev,
                             pool, NGX_IOCP_OP_READ_NOTIFY,
-                            ngx_iocp_read_notify_complete, NULL);
+                            ngx_iocp_read_notify_complete,
+                            size ? ngx_iocp_read_notify_cleanup : NULL);
     if (op == NULL) {
         rev->error = 1;
         return NGX_ERROR;
@@ -539,9 +560,21 @@ ngx_iocp_post_read(ngx_event_t *rev)
 
     op->wsabuf.buf = (char *) &ngx_iocp_zero_byte;
     op->wsabuf.len = 0;
+
+    if (size) {
+        op->wsabuf.buf = (char *) ngx_alloc(size, c->log);
+        if (op->wsabuf.buf == NULL) {
+            ngx_iocp_op_abort(&op->op);
+            rev->error = 1;
+            return NGX_ERROR;
+        }
+
+        op->wsabuf.len = (ULONG) size;
+    }
+
     op->op.flags = 0;
     op->op.bytes = 0;
-    op->op.expected = 0;
+    op->op.expected = op->wsabuf.len;
 
     rc = WSARecv(c->fd, &op->wsabuf, 1, &op->op.bytes, &op->op.flags,
                  &op->op.overlapped, NULL);
@@ -563,7 +596,7 @@ ngx_iocp_post_read(ngx_event_t *rev)
     rev->ready = 1;
     rev->error = 1;
     ngx_iocp_op_abort(&op->op);
-    (void) ngx_connection_error(c, err, "zero-byte WSARecv() failed");
+    (void) ngx_connection_error(c, err, "IOCP read submission failed");
 
     return NGX_ERROR;
 }
@@ -818,9 +851,30 @@ ngx_iocp_write_notify_cancel(ngx_iocp_write_notify_op_t *op)
 static void
 ngx_iocp_read_notify_complete(ngx_iocp_op_t *op)
 {
-    ngx_event_t  *rev;
+    ngx_event_t                *rev;
+    ngx_iocp_read_notify_op_t  *read;
 
     rev = op->event;
+
+    if (op->expected) {
+        read = (ngx_iocp_read_notify_op_t *) op;
+
+        if (op->error == 0 && op->bytes) {
+            if (rev->iocp_buffer) {
+                op->error = WSAEINVAL;
+
+            } else {
+                rev->iocp_buffer = (u_char *) read->wsabuf.buf;
+                rev->iocp_buffer_size = op->bytes;
+                rev->iocp_buffer_pos = 0;
+                rev->iocp_direct_recv = 0;
+                read->wsabuf.buf = NULL;
+            }
+        }
+
+        ngx_iocp_event_complete(op);
+        return;
+    }
 
     rev->iocp_op = NULL;
     rev->iocp_error = op->error;
@@ -836,6 +890,19 @@ ngx_iocp_read_notify_complete(ngx_iocp_op_t *op)
 
     if (rev->handler) {
         rev->handler(rev);
+    }
+}
+
+
+static void
+ngx_iocp_read_notify_cleanup(ngx_iocp_op_t *base)
+{
+    ngx_iocp_read_notify_op_t  *op;
+
+    op = (ngx_iocp_read_notify_op_t *) base;
+
+    if (op->wsabuf.len && op->wsabuf.buf) {
+        ngx_free(op->wsabuf.buf);
     }
 }
 
