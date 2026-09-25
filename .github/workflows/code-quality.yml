@@ -91,6 +91,10 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         node --check .\misc\win32-iocp-compare.js
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node --check .\misc\win32-iocp-profile.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node .\misc\test-win32-gprof.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Check for configuration warnings
       shell: msys2 {0}

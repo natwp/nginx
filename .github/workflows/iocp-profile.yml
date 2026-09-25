@@ -52,12 +52,15 @@ jobs:
         done
         gcc --version > benchmark-bin/compiler.txt
         pacman -Q > benchmark-bin/packages.txt
+        nm --defined-only -n benchmark-bin/nginx.exe > benchmark-bin/nginx.symbols
     - name: Install pinned client
       shell: pwsh
       run: |
         Invoke-WebRequest -Uri https://github.com/hatoo/oha/releases/download/v1.16.0/oha-windows-amd64.exe `
           -OutFile benchmark-bin/oha.exe
         node --check .\misc\win32-iocp-profile.js
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        node .\misc\test-win32-gprof.js
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Collect profiles without making throughput claims
       shell: pwsh
@@ -70,9 +73,12 @@ jobs:
       run: |
         set -euo pipefail
         shopt -s nullglob
+        node misc/win32-gprof.js benchmark-bin/nginx.symbols profile-results
         for profile in profile-results/*/gprof/*/gmon.out; do
-          gprof benchmark-bin/nginx.exe "$profile" > "$profile.txt"
+          gprof -b -S benchmark-bin/nginx.symbols benchmark-bin/nginx.exe \
+            "$profile.linked" > "$profile.txt"
         done
+        node misc/win32-gprof.js --verify profile-results
     - uses: actions/upload-artifact@v4
       if: always()
       with:
@@ -82,4 +88,5 @@ jobs:
           benchmark-bin/nginx.exe
           benchmark-bin/compiler.txt
           benchmark-bin/packages.txt
+          benchmark-bin/nginx.symbols
         retention-days: 90
