@@ -96,6 +96,24 @@ static char *ngx_openssl_engine(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void ngx_openssl_exit(ngx_cycle_t *cycle);
 
 
+#if (NGX_HAVE_IOCP && OPENSSL_VERSION_NUMBER >= 0x10100000L \
+     && !defined LIBRESSL_VERSION_NUMBER && !defined OPENSSL_IS_BORINGSSL)
+
+#define NGX_SSL_IOCP_BIO  1
+
+static ngx_int_t ngx_ssl_iocp_set_bio(SSL *ssl, ngx_connection_t *c);
+static int ngx_ssl_iocp_bio_create(BIO *bio);
+static int ngx_ssl_iocp_bio_destroy(BIO *bio);
+static int ngx_ssl_iocp_bio_read(BIO *bio, char *buf, int size);
+static int ngx_ssl_iocp_bio_write(BIO *bio, const char *buf, int size);
+static long ngx_ssl_iocp_bio_ctrl(BIO *bio, int cmd, long num, void *ptr);
+static void ngx_ssl_iocp_bio_done(void);
+
+static BIO_METHOD  *ngx_ssl_iocp_bio_method;
+
+#endif
+
+
 static ngx_command_t  ngx_openssl_commands[] = {
 
     { ngx_string("ssl_engine"),
@@ -2136,6 +2154,17 @@ ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c, ngx_uint_t flags)
         return NGX_ERROR;
     }
 
+#if (NGX_SSL_IOCP_BIO)
+    if ((ngx_event_flags & NGX_USE_IOCP_EVENT)
+        && ngx_ssl_iocp_set_bio(sc->connection, c) != NGX_OK)
+    {
+        ngx_ssl_error(NGX_LOG_ALERT, c->log, 0,
+                      "could not create IOCP receive BIO");
+        SSL_free(sc->connection);
+        return NGX_ERROR;
+    }
+#endif
+
     if (flags & NGX_SSL_CLIENT) {
         SSL_set_connect_state(sc->connection);
 
@@ -2156,6 +2185,159 @@ ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c, ngx_uint_t flags)
 
     return NGX_OK;
 }
+
+
+#if (NGX_SSL_IOCP_BIO)
+
+static ngx_int_t
+ngx_ssl_iocp_set_bio(SSL *ssl, ngx_connection_t *c)
+{
+    int          type;
+    BIO         *bio, *socket;
+    BIO_METHOD  *method;
+
+    if (ngx_ssl_iocp_bio_method == NULL) {
+        type = BIO_get_new_index();
+        if (type == -1) {
+            return NGX_ERROR;
+        }
+
+        method = BIO_meth_new(type | BIO_TYPE_FILTER, "nginx IOCP receive");
+        if (method == NULL) {
+            return NGX_ERROR;
+        }
+
+        if (BIO_meth_set_create(method, ngx_ssl_iocp_bio_create) == 0
+            || BIO_meth_set_destroy(method, ngx_ssl_iocp_bio_destroy) == 0
+            || BIO_meth_set_read(method, ngx_ssl_iocp_bio_read) == 0
+            || BIO_meth_set_write(method, ngx_ssl_iocp_bio_write) == 0
+            || BIO_meth_set_ctrl(method, ngx_ssl_iocp_bio_ctrl) == 0
+            || OPENSSL_atexit(ngx_ssl_iocp_bio_done) == 0)
+        {
+            BIO_meth_free(method);
+            return NGX_ERROR;
+        }
+
+        /* The method outlives every connection and its pending receives. */
+        ngx_ssl_iocp_bio_method = method;
+    }
+
+    bio = BIO_new(ngx_ssl_iocp_bio_method);
+    if (bio == NULL) {
+        return NGX_ERROR;
+    }
+
+    BIO_set_data(bio, c);
+
+    socket = SSL_get_rbio(ssl);
+    if (BIO_up_ref(socket) == 0) {
+        BIO_free(bio);
+        return NGX_ERROR;
+    }
+
+    BIO_push(bio, socket);
+    SSL_set_bio(ssl, bio, bio);
+
+    return NGX_OK;
+}
+
+
+static int
+ngx_ssl_iocp_bio_create(BIO *bio)
+{
+    BIO_set_init(bio, 1);
+    BIO_set_data(bio, NULL);
+
+    return 1;
+}
+
+
+static int
+ngx_ssl_iocp_bio_destroy(BIO *bio)
+{
+    BIO_set_data(bio, NULL);
+    BIO_set_init(bio, 0);
+
+    return 1;
+}
+
+
+static int
+ngx_ssl_iocp_bio_read(BIO *bio, char *buf, int size)
+{
+    ssize_t            n;
+    ngx_event_t       *rev;
+    ngx_connection_t  *c;
+
+    BIO_clear_retry_flags(bio);
+
+    if (size <= 0) {
+        return 0;
+    }
+
+    c = BIO_get_data(bio);
+    rev = c->read;
+
+    if (rev->complete || rev->iocp_buffer || rev->iocp_error) {
+        n = ngx_overlapped_wsarecv(c, (u_char *) buf, (size_t) size);
+
+    } else if (rev->iocp_op) {
+        n = NGX_AGAIN;
+
+    } else {
+        n = ngx_wsarecv(c, (u_char *) buf, (size_t) size);
+    }
+
+    if (n == NGX_AGAIN) {
+        /*
+         * OpenSSL can free its record buffer before cancellation completes.
+         * Post into an independently owned buffer, even when rev->iocp_pool
+         * refers to the request pool.  Copy completed bytes on the retry.
+         */
+        if (ngx_iocp_post_read_buffer(rev, (size_t) size) != NGX_OK) {
+            return -1;
+        }
+
+        BIO_set_retry_read(bio);
+        return -1;
+    }
+
+    return (n == NGX_ERROR) ? -1 : (int) n;
+}
+
+
+static int
+ngx_ssl_iocp_bio_write(BIO *bio, const char *buf, int size)
+{
+    int  n;
+
+    BIO_clear_retry_flags(bio);
+    n = BIO_write(BIO_next(bio), buf, size);
+    BIO_copy_next_retry(bio);
+
+    return n;
+}
+
+
+static long
+ngx_ssl_iocp_bio_ctrl(BIO *bio, int cmd, long num, void *ptr)
+{
+    if (cmd == BIO_CTRL_DUP) {
+        return 0;
+    }
+
+    return BIO_ctrl(BIO_next(bio), cmd, num, ptr);
+}
+
+
+static void
+ngx_ssl_iocp_bio_done(void)
+{
+    BIO_meth_free(ngx_ssl_iocp_bio_method);
+    ngx_ssl_iocp_bio_method = NULL;
+}
+
+#endif
 
 
 ngx_ssl_session_t *

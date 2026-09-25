@@ -474,6 +474,85 @@ function Test-ReadNotifications([int] $Port, [switch] $Tls) {
     }
 }
 
+function Test-TlsHandshakeReset([int] $Port) {
+    # A TLS record header and a partial ClientHello leave an encrypted
+    # receive pending when SSL and connection state are destroyed.
+    $partial = [byte[]] (0x16, 0x03, 0x01, 0x00, 0x40,
+                         0x01, 0x00, 0x00, 0x3c, 0x03, 0x03)
+    for ($round = 0; $round -lt 8; $round++) {
+        $tcp = [Net.Sockets.TcpClient]::new()
+        try {
+            $tcp.Connect([IPAddress]::Loopback, $Port)
+            $stream = $tcp.GetStream()
+            $stream.Write($partial, 0, 5)
+            $stream.Flush()
+            Start-Sleep -Milliseconds 10
+            $stream.Write($partial, 5, $partial.Length - 5)
+            $stream.Flush()
+            Start-Sleep -Milliseconds 20
+            $tcp.Client.LingerState = [Net.Sockets.LingerOption]::new($true, 0)
+        } finally {
+            $tcp.Dispose()
+        }
+    }
+    Write-Host 'PASS reset during fragmented TLS handshakes'
+}
+
+function Test-TlsBufferedReads([int] $Port) {
+    $client = Open-TlsTestClient $Port
+    $reader = $null
+    try {
+        $reader = [IO.StreamReader]::new(
+            $client.Stream, [Text.Encoding]::ASCII, $false, 4096, $true)
+        for ($round = 0; $round -lt 3; $round++) {
+            $expected = ('body' + $round + '-') * 512
+            $body = [Text.Encoding]::ASCII.GetBytes($expected)
+            $headers = [Text.Encoding]::ASCII.GetBytes(
+                "POST /tls-upload HTTP/1.1`r`nHost: localhost`r`n" +
+                "Content-Length: $($body.Length)`r`n`r`n")
+            $client.Stream.Write($headers, 0, $headers.Length)
+            $client.Stream.Flush()
+            Start-Sleep -Milliseconds 20
+            for ($offset = 0; $offset -lt $body.Length; $offset += 251) {
+                $length = [Math]::Min(251, $body.Length - $offset)
+                $client.Stream.Write($body, $offset, $length)
+                $client.Stream.Flush()
+                Start-Sleep -Milliseconds 1
+            }
+            Assert-True ($reader.ReadLine() -eq 'HTTP/1.1 200 OK') `
+                'TLS upload or TLS upstream failed'
+            $responseHeaders = Read-HttpHeaders $reader
+            Assert-True ([int] $responseHeaders['Content-Length'] -eq $expected.Length) `
+                'TLS upload response length changed'
+            $response = [char[]]::new($expected.Length)
+            Assert-True ($reader.ReadBlock($response, 0, $response.Length) -eq $response.Length) `
+                'TLS upload response was truncated'
+            Assert-True ((-join $response) -eq $expected) `
+                'TLS upload or TLS upstream changed the body'
+        }
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        $client.Stream.Dispose()
+        $client.Tcp.Dispose()
+    }
+
+    $client = Open-TlsTestClient $Port
+    try {
+        $partial = [Text.Encoding]::ASCII.GetBytes(
+            "POST /tls-upload HTTP/1.1`r`nHost: localhost`r`n" +
+            "Content-Length: 16384`r`n`r`npartial-body")
+        $client.Stream.Write($partial, 0, $partial.Length)
+        $client.Stream.Flush()
+        Start-Sleep -Milliseconds 30
+        $client.Tcp.Client.LingerState = [Net.Sockets.LingerOption]::new($true, 0)
+        $client.Tcp.Dispose()
+    } finally {
+        $client.Stream.Dispose()
+        $client.Tcp.Dispose()
+    }
+    Write-Host 'PASS fragmented TLS uploads, TLS upstream, and pending body reset'
+}
+
 function Get-HttpBody([int] $Port, [string] $Path, [int] $TimeoutSec = 20) {
     # Retry transient connection failures.  A single reset on a loopback
     # request should not fail the run, and these fetches happen right after a
@@ -791,6 +870,13 @@ mail {
         listen 127.0.0.1:$httpsPort ssl sndbuf=16k;
         ssl_certificate "$($script:Tls.Cert.Replace('\','/'))";
         ssl_certificate_key "$($script:Tls.Key.Replace('\','/'))";
+        location = /tls-upload {
+            proxy_pass https://127.0.0.1:$httpsPort/tls-echo;
+            proxy_set_header X-RC-Body `$request_body;
+        }
+        location = /tls-echo {
+            return 200 "`$http_x_rc_body";
+        }
 "@
     } else { '' }
     foreach ($file in @('aio.txt', 'gzip.txt', 'sendfile.txt')) {
@@ -942,8 +1028,16 @@ $mailConfig
                 Get-Content -LiteralPath $stderr | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" }
             }
             Wait-Https $httpsPort $reloadedBody
+            $beforeTlsReads = @(Wait-Workers $dir $start.Id 2)
             Test-ExpectContinue $httpsPort $reloadedBody -Tls
             Test-ReadNotifications $httpsPort -Tls
+            Test-TlsHandshakeReset $httpsPort
+            Test-TlsBufferedReads $httpsPort
+            Wait-Https $httpsPort $reloadedBody
+            $afterTlsReads = @(Wait-Workers $dir $start.Id 2)
+            Assert-True ((($beforeTlsReads.ProcessId | Sort-Object) -join ',') -eq `
+                         (($afterTlsReads.ProcessId | Sort-Object) -join ',')) `
+                'TLS read cancellation unexpectedly replaced a worker'
             $beforeBackpressure = @(Wait-Workers $dir $start.Id 2)
             Test-TlsBackpressure $httpsPort $tlsBody {
                 param([int] $BlockedWorker)
