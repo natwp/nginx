@@ -67,18 +67,28 @@ jobs:
       run: |
         node .\misc\win32-iocp-profile.js
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - name: Normalize worker and router profile addresses
+      if: always()
+      shell: pwsh
+      run: |
+        node .\misc\win32-gprof.js benchmark-bin/nginx.symbols profile-results
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Decode worker and router profiles
       if: always()
       shell: msys2 {0}
       run: |
         set -euo pipefail
         shopt -s nullglob
-        node misc/win32-gprof.js benchmark-bin/nginx.symbols profile-results
         for profile in profile-results/*/gprof/*/gmon.out; do
           gprof -b -S benchmark-bin/nginx.symbols benchmark-bin/nginx.exe \
             "$profile.linked" > "$profile.txt"
         done
-        node misc/win32-gprof.js --verify profile-results
+    - name: Verify decoded worker and router calls
+      if: always()
+      shell: pwsh
+      run: |
+        node .\misc\win32-gprof.js --verify profile-results
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - uses: actions/upload-artifact@v4
       if: always()
       with:
