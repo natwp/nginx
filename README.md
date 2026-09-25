@@ -188,6 +188,11 @@ See the [dated results and artifact hashes](docs/windows-ci-benchmarks-2026-09-2
 [method and noise policy](docs/windows-ci-benchmarks.md), and
 [historical experiments](docs/win32-iocp-performance.md).
 
+The [September 24–25 optimization trials](docs/windows-iocp-trials-2026-09-25.md)
+added identical baseline controls and CPU headroom checks. Neither candidate
+met the retention gate; no runtime optimization or new backend ranking is
+claimed from those trials.
+
 ## Testing
 
 Comprehensive test suite covering:

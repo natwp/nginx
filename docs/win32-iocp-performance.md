@@ -4,6 +4,16 @@ This document records performance experiments used to decide whether an IOCP
 optimization remains in the tree.  It is intentionally limited to completed,
 repeatable measurements; unfinished experiments are marked pending.
 
+## Hosted candidate trials (September 24–25, 2026)
+
+The [candidate report](windows-iocp-trials-2026-09-25.md) evaluates independent
+write-resource and retired-read notification caches against the same source
+baseline. Both passed Windows correctness CI. Neither met the predeclared
+performance gate, so neither runtime change is retained. The new comparison
+workflow checks identical A/A controls, CPU affinity, and client/upstream
+headroom; failed and inconclusive cases remain visible. These trials do not
+replace the complete backend comparison below or establish a new speed ranking.
+
 ## Latest hosted CI matrix (September 23, 2026)
 
 The [completed report](windows-ci-benchmarks-2026-09-23.md) and

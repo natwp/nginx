@@ -9,7 +9,9 @@ are summarized in the [README](../README.md#performance). The
 96 rates, 208 paired comparisons, filter outcomes, and artifact hashes.
 The [IOCP optimization protocol](windows-iocp-optimization.md) adds identical
 baseline controls, explicit CPU budgets, and client/upstream headroom checks
-for evaluating code changes.
+for evaluating code changes. The [September 24–25 candidate trials](windows-iocp-trials-2026-09-25.md)
+record the resulting measurements and limits; neither runtime candidate was
+retained.
 
 ## Coverage and duration
 

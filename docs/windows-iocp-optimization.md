@@ -7,6 +7,10 @@ does not make allocation, copying, completion processing, TLS, or scheduling
 free. IOCP's maturity alone cannot establish which implementation is faster.
 Changes need correctness coverage and measurements against the previous binary.
 
+The [September 24–25 trials](windows-iocp-trials-2026-09-25.md) evaluated two
+independent notification candidates. Both passed correctness CI; neither met
+the performance retention requirements. Neither runtime change is retained.
+
 The [published matrix](windows-ci-benchmarks-2026-09-23.md) is a starting point.
 It used one four-vCPU Windows runner per workload family, with nginx, oha, and
 the proxy upstream sharing those CPUs. Its four-worker results include that
@@ -126,7 +130,7 @@ the workload:
 node misc/iocp-performance-report.js path/to/extracted/artifact
 ```
 
-## First candidate: persistent TLS write notifications
+## Evaluated write-notification candidate
 
 OpenSSL's socket BIO sends directly through Winsock. When it returns
 `SSL_ERROR_WANT_WRITE`, the IOCP bridge waits for FD_WRITE and posts a completion.
@@ -142,7 +146,29 @@ and clears recorded events. Retiring an operation drains callbacks before its
 memory is released; cleanup of an old operation cannot disarm a newer one
 posted by its completion handler. Connection finalization releases the cache.
 
-The correctness test deliberately blocks multi-MiB TLS responses, reuses one
+The retained correctness test blocks multi-MiB TLS responses, reuses one
 keepalive connection, validates complete binary bodies, reloads with a response
-in flight, and resets a blocked connection. Performance benefit remains an
-experimental hypothesis until the CI retention gate passes.
+in flight, and resets a blocked connection. The trial did not establish the
+isolated-profile improvement and complete non-regression evidence needed by
+the retention gate. The resource cache is absent from the implementation.
+
+## Evaluated read-notification candidate
+
+The read-readiness bridge posts a zero-byte `WSARecv`, then calls the normal
+consumer when its completion arrives. The candidate retained at most one
+fully retired operation per connection, holding no pool references while idle.
+Only retirement made an operation reusable; a handler could arm a different
+operation before the old one finished. Successful zero-byte reads also used
+the status in the completed
+[`OVERLAPPED`](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-overlapped)
+instead of querying Winsock again, while preserving the existing error path.
+
+The retained correctness tests exercise fragmented requests, ordered pipelines
+with distinct response bodies, keepalive reuse, and reset with a read pending,
+over plaintext and TLS. This independent candidate also failed to meet the
+performance retention requirements and is absent from the implementation.
+
+The dated report preserves complete profiles and failed attempts separately.
+Client saturation and noisy A/A controls stay inconclusive. The available
+four-CPU hosted runners remain useful for finding correctness failures and
+detecting substantial changes, but cannot resolve every throughput comparison.
