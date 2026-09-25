@@ -32,6 +32,7 @@ jobs:
     - name: Build nginx
       shell: msys2 {0}
       run: |
+        set -euo pipefail
         ./auto/configure \
           --with-cc=gcc \
           --with-cc-opt="-O2" \
@@ -47,6 +48,11 @@ jobs:
           echo "✗ Build failed - nginx.exe not found"
           exit 1
         fi
+
+        # Native PowerShell steps need the same DLLs as the build shell.
+        ldd objs/nginx.exe | awk '/mingw64/ {print $3}' | sort -u | while read -r dll; do
+          cp "$dll" objs/
+        done
 
     - name: Test version output
       shell: msys2 {0}
@@ -127,42 +133,74 @@ jobs:
         # detached; otherwise the step blocks until the job timeout.
         Write-Host "=== Test basic startup and shutdown ==="
 
-        Start-Process -FilePath ".\objs\nginx.exe" `
-          -ArgumentList "-p","./","-c","startup-test.conf" -NoNewWindow
-        Start-Sleep -Seconds 3
+        $master = Start-Process -FilePath ".\objs\nginx.exe" `
+          -ArgumentList "-p","./","-c","startup-test.conf" -NoNewWindow `
+          -RedirectStandardOutput logs/startup.stdout.log `
+          -RedirectStandardError logs/startup.stderr.log -PassThru
 
-        $processes = @(Get-Process nginx -ErrorAction SilentlyContinue)
-        if ($processes.Count -lt 2) {
-          Write-Host "nginx failed to start (found $($processes.Count) processes)"
-          if (Test-Path logs/error.log) {
-            Write-Host "=== Error log ==="
-            Get-Content logs/error.log
+        try {
+          $deadline = (Get-Date).AddSeconds(30)
+          $ready = $false
+          $lastError = 'No response received'
+
+          do {
+            $master.Refresh()
+            if ($master.HasExited) {
+              throw "nginx exited during startup with code $($master.ExitCode)"
+            }
+
+            $processes = @(Get-Process nginx -ErrorAction SilentlyContinue)
+            if ($processes.Count -ge 2) {
+              $response = $null
+              try {
+                $response = Invoke-WebRequest -Uri http://127.0.0.1:18080/ `
+                  -UseBasicParsing -TimeoutSec 2
+              } catch {
+                $lastError = $_.Exception.Message
+              }
+              if ($null -ne $response) {
+                if ($response.StatusCode -ne 200 -or
+                    $response.Content.Trim() -ne 'Hello from nginx') {
+                  throw "nginx responded with unexpected content: $($response.Content)"
+                }
+                $ready = $true
+                break
+              }
+            }
+            Start-Sleep -Milliseconds 200
+          } while ((Get-Date) -lt $deadline)
+
+          if (-not $ready) {
+            throw "nginx startup timed out ($($processes.Count) processes): $lastError"
           }
-          exit 1
-        }
-        Write-Host "OK: master + worker started ($($processes.Count) processes)"
-
-        $body = (Invoke-WebRequest -Uri http://127.0.0.1:18080/ -UseBasicParsing).Content
-        if ($body -match 'Hello') {
+          Write-Host "OK: master + worker started ($($processes.Count) processes)"
           Write-Host "OK: nginx served the test page"
-        } else {
-          Write-Host "nginx responded with unexpected body: $body"
-          exit 1
-        }
 
-        .\objs\nginx.exe -p ./ -s quit -c startup-test.conf
+          .\objs\nginx.exe -p ./ -s quit -c startup-test.conf
+          if ($LASTEXITCODE -ne 0) { throw "nginx quit failed: $LASTEXITCODE" }
 
-        $deadline = (Get-Date).AddSeconds(15)
-        while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
-               ((Get-Date) -lt $deadline)) {
-          Start-Sleep -Seconds 1
-        }
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Get-Process nginx -ErrorAction SilentlyContinue) -and
+                 ((Get-Date) -lt $deadline)) {
+            Start-Sleep -Milliseconds 200
+          }
 
-        if (Get-Process nginx -ErrorAction SilentlyContinue) {
-          Write-Host "nginx did not exit after quit"
-          exit 1
+          if (Get-Process nginx -ErrorAction SilentlyContinue) {
+            throw 'nginx did not exit after quit'
+          }
+          Write-Host "OK: nginx stopped gracefully"
+        } catch {
+          foreach ($file in @('logs/error.log', 'logs/startup.stderr.log',
+                              'logs/startup.stdout.log')) {
+            if (Test-Path $file) {
+              Write-Host "=== $file ==="
+              Get-Content $file
+            }
+          }
+          throw
+        } finally {
+          $master.Dispose()
         }
-        Write-Host "OK: nginx stopped gracefully"
 
     - name: Cleanup
       if: always()
