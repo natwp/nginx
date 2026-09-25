@@ -297,6 +297,183 @@ function Test-ExpectContinue([int] $Port, [string] $Expected, [switch] $Tls) {
     }
 }
 
+function Open-TlsTestClient([int] $Port) {
+    $tcp = [Net.Sockets.TcpClient]::new()
+    try {
+        $tcp.ReceiveBufferSize = 16384
+        $tcp.ReceiveTimeout = 10000
+        $tcp.SendTimeout = 10000
+        $tcp.Connect([IPAddress]::Loopback, $Port)
+        $callback = [Net.Security.RemoteCertificateValidationCallback] {
+            param($sender, $certificate, $chain, $errors)
+            return $true
+        }
+        $ssl = [Net.Security.SslStream]::new($tcp.GetStream(), $false, $callback)
+        $ssl.ReadTimeout = 10000
+        $ssl.WriteTimeout = 10000
+        $ssl.AuthenticateAsClient('localhost', $null,
+            [Security.Authentication.SslProtocols]::Tls12, $false)
+        return @{ Tcp = $tcp; Stream = $ssl }
+    } catch {
+        $tcp.Dispose()
+        throw
+    }
+}
+
+function Start-TlsFileResponse($Client, [int] $Length) {
+    $request = [Text.Encoding]::ASCII.GetBytes(
+        "GET /backpressure.bin HTTP/1.1`r`nHost: localhost`r`n`r`n")
+    $Client.Stream.Write($request, 0, $request.Length)
+    $Client.Stream.Flush()
+
+    # Read only headers: StreamReader can consume binary body bytes which
+    # the subsequent raw reads would otherwise lose.
+    $bytes = [Collections.Generic.List[byte]]::new()
+    do {
+        $value = $Client.Stream.ReadByte()
+        Assert-True ($value -ge 0) 'TLS response ended before headers'
+        $bytes.Add([byte] $value)
+        $n = $bytes.Count
+        Assert-True ($n -le 16384) 'TLS response headers exceed the test limit'
+    } until ($n -ge 4 -and $bytes[$n - 4] -eq 13 -and $bytes[$n - 3] -eq 10 `
+        -and $bytes[$n - 2] -eq 13 -and $bytes[$n - 1] -eq 10)
+
+    $headers = [Text.Encoding]::ASCII.GetString($bytes.ToArray())
+    Assert-True ($headers.StartsWith("HTTP/1.1 200 OK`r`n")) 'TLS file status is not 200'
+    Assert-True ($headers -match "(?im)^Content-Length: $Length\r$") `
+        'TLS file length is incorrect'
+    Assert-True ($headers -notmatch '(?im)^Transfer-Encoding:') `
+        'TLS file unexpectedly uses transfer encoding'
+    Assert-True ($headers -match '(?im)^X-RC-Worker: (\d+)\r$') `
+        'TLS response is missing its worker identity'
+    return [int] $Matches[1]
+}
+
+function Test-TlsBackpressure([int] $Port, [byte[]] $Expected,
+    [scriptblock] $WhileBlocked) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $expectedHash = [Convert]::ToBase64String($sha.ComputeHash($Expected))
+    $client = $null
+    try {
+        $client = Open-TlsTestClient $Port
+        $firstWorker = 0
+        for ($request = 0; $request -lt 3; $request++) {
+            $worker = Start-TlsFileResponse $client $Expected.Length
+            if ($request -eq 0) { $firstWorker = $worker }
+            Assert-True ($worker -eq $firstWorker) 'TLS keepalive changed workers'
+            Start-Sleep -Milliseconds 150
+            if ($request -eq 2) { & $WhileBlocked $worker }
+
+            $response = [byte[]]::new($Expected.Length)
+            $received = 0
+            $nextPause = 262144
+            while ($received -lt $response.Length) {
+                $count = $client.Stream.Read($response, $received,
+                    [Math]::Min(65536, $response.Length - $received))
+                Assert-True ($count -gt 0) 'TLS file body was truncated'
+                $received += $count
+                if ($received -ge $nextPause) {
+                    Start-Sleep -Milliseconds 10
+                    $nextPause += 262144
+                }
+            }
+            $actualHash = [Convert]::ToBase64String($sha.ComputeHash($response))
+            Assert-True ($actualHash -eq $expectedHash) 'TLS file body was corrupted'
+        }
+        $client.Stream.Dispose()
+        $client.Tcp.Dispose()
+        $client = Open-TlsTestClient $Port
+        [void] (Start-TlsFileResponse $client $Expected.Length)
+        Start-Sleep -Milliseconds 150
+        # Reset with the server still blocked. No TLS close-notify is sent.
+        $client.Tcp.Client.LingerState = [Net.Sockets.LingerOption]::new($true, 0)
+        $client.Tcp.Dispose()
+    } finally {
+        if ($client) {
+            try { $client.Stream.Dispose() } finally { $client.Tcp.Dispose() }
+        }
+        $sha.Dispose()
+    }
+}
+
+function Test-ReadNotifications([int] $Port, [switch] $Tls) {
+    $client = $null
+    $reader = $null
+    try {
+        if ($Tls) {
+            $client = Open-TlsTestClient $Port
+        } else {
+            $tcp = [Net.Sockets.TcpClient]::new()
+            $client = @{ Tcp = $tcp; Stream = $null }
+            $tcp.ReceiveTimeout = 5000
+            $tcp.SendTimeout = 5000
+            $tcp.Connect([IPAddress]::Loopback, $Port)
+            $client.Stream = $tcp.GetStream()
+        }
+        $reader = [IO.StreamReader]::new(
+            $client.Stream, [Text.Encoding]::ASCII, $false, 4096, $true)
+        $workerId = $null
+        for ($round = 0; $round -lt 16; $round++) {
+            # Alternate fragmented requests with pipelines on one connection.
+            # Both paths can rearm a read from inside its completion handler.
+            $count = if ($round % 2) { 4 } else { 1 }
+            $requests = ''
+            for ($index = 0; $index -lt $count; $index++) {
+                $requests += "GET /read-notify?value=r$round-i$index HTTP/1.1`r`n" +
+                    "Host: localhost`r`n`r`n"
+            }
+            $bytes = [Text.Encoding]::ASCII.GetBytes($requests)
+            if ($count -eq 1) {
+                $client.Stream.Write($bytes, 0, $bytes.Length - 2)
+                $client.Stream.Flush()
+                Start-Sleep -Milliseconds 10
+                $client.Stream.Write($bytes, $bytes.Length - 2, 2)
+            } else {
+                $client.Stream.Write($bytes, 0, $bytes.Length)
+            }
+            $client.Stream.Flush()
+            for ($index = 0; $index -lt $count; $index++) {
+                Assert-True ($reader.ReadLine() -eq 'HTTP/1.1 200 OK') `
+                    'Read notification lost an HTTP response'
+                $headers = Read-HttpHeaders $reader
+                $expected = "r$round-i$index"
+                Assert-True ([int] $headers['Content-Length'] -eq $expected.Length) `
+                    'Read notification changed the response length'
+                $chars = [char[]]::new($expected.Length)
+                Assert-True ($reader.ReadBlock($chars, 0, $chars.Length) -eq $chars.Length) `
+                    'Read notification truncated a response'
+                Assert-True ((-join $chars) -eq $expected) `
+                    'Read notification reordered or duplicated response data'
+                $identity = $headers['X-RC-Worker']
+                Assert-True ($identity -match '^\d+$') 'Missing read test worker identity'
+                if ($workerId) {
+                    Assert-True ($identity -eq $workerId) 'Read test changed workers'
+                }
+                $workerId = $identity
+            }
+            Start-Sleep -Milliseconds 10
+        }
+        # Leave a fragmented request pending, then reset the connection to
+        # exercise cancellation after repeated operation reuse.
+        $partial = [Text.Encoding]::ASCII.GetBytes('GET /read-notify?value=unfinished')
+        $client.Stream.Write($partial, 0, $partial.Length)
+        $client.Stream.Flush()
+        Start-Sleep -Milliseconds 20
+        $client.Tcp.Client.LingerState = [Net.Sockets.LingerOption]::new($true, 0)
+        $client.Tcp.Dispose()
+        Write-Host "PASS fragmented/pipelined requests and pending read reset (TLS=$Tls)"
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($client) {
+            try {
+                if ($client.Stream) { $client.Stream.Dispose() }
+            } finally {
+                $client.Tcp.Dispose()
+            }
+        }
+    }
+}
+
 function Get-HttpBody([int] $Port, [string] $Path, [int] $TimeoutSec = 20) {
     # Retry transient connection failures.  A single reset on a loopback
     # request should not fail the run, and these fetches happen right after a
@@ -611,7 +788,7 @@ mail {
     } else { '' }
     $tlsConfig = if ($script:Tls) {
 @"
-        listen 127.0.0.1:$httpsPort ssl;
+        listen 127.0.0.1:$httpsPort ssl sndbuf=16k;
         ssl_certificate "$($script:Tls.Cert.Replace('\','/'))";
         ssl_certificate_key "$($script:Tls.Key.Replace('\','/'))";
 "@
@@ -619,6 +796,15 @@ mail {
     foreach ($file in @('aio.txt', 'gzip.txt', 'sendfile.txt')) {
         Set-Content -LiteralPath (Join-Path $html $file) -Value $fileBody `
             -NoNewline -Encoding ASCII
+    }
+    $tlsBody = $null
+    if ($script:Tls) {
+        $tlsBody = [byte[]]::new(4 * 1024 * 1024)
+        $block = [byte[]] (0..255)
+        for ($offset = 0; $offset -lt $tlsBody.Length; $offset += $block.Length) {
+            [Array]::Copy($block, 0, $tlsBody, $offset, $block.Length)
+        }
+        [IO.File]::WriteAllBytes((Join-Path $html 'backpressure.bin'), $tlsBody)
     }
 
     $conf = @"
@@ -660,6 +846,16 @@ $tlsConfig
         }
         location = /gzip.txt {
             root "$($html.Replace('\','/'))";
+        }
+        location = /backpressure.bin {
+            root "$($html.Replace('\','/'))";
+            gzip off;
+            sendfile off;
+            add_header X-RC-Worker "`$pid";
+        }
+        location = /read-notify {
+            add_header X-RC-Worker "`$pid";
+            return 200 "`$arg_value";
         }
 $aioLocation
         location ~ ^/regex/(.*)$ {
@@ -736,6 +932,7 @@ $mailConfig
         }
 
         Test-ExpectContinue $httpPort $reloadedBody
+        Test-ReadNotifications $httpPort
         if ($script:Tls) {
             Write-Host "Testing HTTPS on port $httpsPort..." -ForegroundColor Yellow
             if (Test-Path $stderr) {
@@ -744,6 +941,22 @@ $mailConfig
             }
             Wait-Https $httpsPort $reloadedBody
             Test-ExpectContinue $httpsPort $reloadedBody -Tls
+            Test-ReadNotifications $httpsPort -Tls
+            $beforeBackpressure = @(Wait-Workers $dir $start.Id 2)
+            Test-TlsBackpressure $httpsPort $tlsBody {
+                param([int] $BlockedWorker)
+                Invoke-Nginx @('-e', 'stderr', '-p', $dir, '-c', $config, '-s', 'reload')
+                Wait-Http $httpPort $reloadedBody
+                $liveIds = @(Get-TestProcesses $dir | ForEach-Object { $_.ProcessId })
+                Assert-True ($liveIds -contains $BlockedWorker) `
+                    'Reload lost the worker with a blocked TLS response'
+            }
+            $afterBackpressure = @(Wait-Workers $dir $start.Id 2)
+            foreach ($old in $beforeBackpressure) {
+                Assert-True ($afterBackpressure.ProcessId -notcontains $old.ProcessId) `
+                    'TLS backpressure left an old worker alive after reload'
+            }
+            Wait-Https $httpsPort $reloadedBody
             Write-Host "HTTPS OK" -ForegroundColor Green
         }
 
