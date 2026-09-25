@@ -908,6 +908,7 @@ events {
 
 http {
     access_log stderr;
+    log_format rc_tls_bytes '`$status `$body_bytes_sent';
     default_type text/plain;
     # Exercise keepalive after its separately allocated header buffer is freed.
     client_header_buffer_size 8k;
@@ -937,6 +938,7 @@ $tlsConfig
         }
         location = /backpressure.bin {
             root "$($html.Replace('\','/'))";
+            access_log "$($dir.Replace('\','/'))/tls-bytes.log" rc_tls_bytes;
             gzip off;
             sendfile off;
             add_header X-RC-Worker "`$pid";
@@ -1052,6 +1054,16 @@ $mailConfig
                 Assert-True ($afterBackpressure.ProcessId -notcontains $old.ProcessId) `
                     'TLS backpressure left an old worker alive after reload'
             }
+            $tlsCounts = @(Get-Content -LiteralPath (Join-Path $dir 'tls-bytes.log') |
+                ForEach-Object {
+                    Assert-True ($_ -match '^\d+ (\d+)$') 'Invalid TLS byte accounting log'
+                    [long] $Matches[1]
+                })
+            Assert-True (@($tlsCounts | Where-Object { $_ -eq $tlsBody.Length }).Count -ge 3) `
+                'TLS backpressure did not account for three complete plaintext bodies'
+            Assert-True (@($tlsCounts | Where-Object { $_ -gt $tlsBody.Length }).Count -eq 0) `
+                'TLS byte accounting included encrypted transport overhead'
+            Write-Host 'PASS plaintext byte accounting after blocked TLS writes'
             Wait-Https $httpsPort $reloadedBody
             Write-Host "HTTPS OK" -ForegroundColor Green
         }

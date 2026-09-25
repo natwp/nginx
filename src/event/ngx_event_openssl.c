@@ -2159,7 +2159,7 @@ ngx_ssl_create_connection(ngx_ssl_t *ssl, ngx_connection_t *c, ngx_uint_t flags)
         && ngx_ssl_iocp_set_bio(sc->connection, c) != NGX_OK)
     {
         ngx_ssl_error(NGX_LOG_ALERT, c->log, 0,
-                      "could not create IOCP receive BIO");
+                      "could not create IOCP socket BIO");
         SSL_free(sc->connection);
         return NGX_ERROR;
     }
@@ -2202,7 +2202,7 @@ ngx_ssl_iocp_set_bio(SSL *ssl, ngx_connection_t *c)
             return NGX_ERROR;
         }
 
-        method = BIO_meth_new(type | BIO_TYPE_FILTER, "nginx IOCP receive");
+        method = BIO_meth_new(type | BIO_TYPE_FILTER, "nginx IOCP socket");
         if (method == NULL) {
             return NGX_ERROR;
         }
@@ -2309,13 +2309,44 @@ ngx_ssl_iocp_bio_read(BIO *bio, char *buf, int size)
 static int
 ngx_ssl_iocp_bio_write(BIO *bio, const char *buf, int size)
 {
-    int  n;
+    ssize_t            n;
+    ngx_event_t       *wev;
+    ngx_connection_t  *c;
 
     BIO_clear_retry_flags(bio);
-    n = BIO_write(BIO_next(bio), buf, size);
-    BIO_copy_next_retry(bio);
 
-    return n;
+    if (size <= 0) {
+        return 0;
+    }
+
+    c = BIO_get_data(bio);
+    wev = c->write;
+
+    if (!wev->complete && !wev->iocp_op && !wev->iocp_error) {
+        n = BIO_write(BIO_next(bio), buf, size);
+
+        if (n >= 0 || !BIO_should_write(BIO_next(bio))) {
+            BIO_copy_next_retry(bio);
+            return (int) n;
+        }
+
+        /* Queue the ciphertext itself after the socket stops accepting it. */
+        wev->ready = 1;
+    }
+
+    n = ngx_overlapped_wsasend(c, (u_char *) buf, (size_t) size);
+
+    if (n == NGX_AGAIN) {
+        BIO_set_retry_write(bio);
+        return -1;
+    }
+
+    if (n > 0) {
+        /* ngx_ssl_write() accounts plaintext, not the ciphertext below it. */
+        c->sent -= n;
+    }
+
+    return (n == NGX_ERROR) ? -1 : (int) n;
 }
 
 
