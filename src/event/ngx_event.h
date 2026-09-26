@@ -98,6 +98,7 @@ struct ngx_event_s {
     u_char          *iocp_buffer;
     size_t           iocp_buffer_size;
     size_t           iocp_buffer_pos;
+    size_t           iocp_buffer_capacity;
     ngx_chain_t      *iocp_chain;
     size_t           iocp_bytes;
     ngx_err_t        iocp_error;

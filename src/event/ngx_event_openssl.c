@@ -2285,16 +2285,27 @@ ngx_ssl_iocp_bio_read(BIO *bio, char *buf, int size)
         n = NGX_AGAIN;
 
     } else {
-        n = ngx_wsarecv(c, (u_char *) buf, (size_t) size);
+        n = BIO_read(BIO_next(bio), buf, size);
+
+        if (n >= 0 || !BIO_should_read(BIO_next(bio))) {
+            BIO_copy_next_retry(bio);
+            return (int) n;
+        }
+
+        n = NGX_AGAIN;
     }
 
     if (n == NGX_AGAIN) {
+        rev->ready = 0;
+
         /*
          * OpenSSL can free its record buffer before cancellation completes.
          * Post into an independently owned buffer, even when rev->iocp_pool
          * refers to the request pool.  Copy completed bytes on the retry.
          */
-        if (ngx_iocp_post_read_buffer(rev, (size_t) size) != NGX_OK) {
+        if (ngx_iocp_post_read_buffer(rev, ngx_max((size_t) size, 1024))
+            != NGX_OK)
+        {
             return -1;
         }
 

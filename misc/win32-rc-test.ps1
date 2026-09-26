@@ -417,10 +417,11 @@ function Test-ReadNotifications([int] $Port, [switch] $Tls) {
             # Alternate fragmented requests with pipelines on one connection.
             # Both paths can rearm a read from inside its completion handler.
             $count = if ($round % 2) { 4 } else { 1 }
+            $padding = 'p' * $(if ($round % 4 -eq 0) { 6144 } else { 17 })
             $requests = ''
             for ($index = 0; $index -lt $count; $index++) {
                 $requests += "GET /read-notify?value=r$round-i$index HTTP/1.1`r`n" +
-                    "Host: localhost`r`n`r`n"
+                    "Host: localhost`r`nX-Read-Padding: $padding`r`n`r`n"
             }
             $bytes = [Text.Encoding]::ASCII.GetBytes($requests)
             if ($count -eq 1) {
@@ -504,8 +505,9 @@ function Test-TlsBufferedReads([int] $Port) {
     try {
         $reader = [IO.StreamReader]::new(
             $client.Stream, [Text.Encoding]::ASCII, $false, 4096, $true)
-        for ($round = 0; $round -lt 3; $round++) {
-            $expected = ('body' + $round + '-') * 512
+        $lengths = @(512, 8192, 1, 1536)
+        for ($round = 0; $round -lt $lengths.Length; $round++) {
+            $expected = ('body' + $round + '-') * $lengths[$round]
             $body = [Text.Encoding]::ASCII.GetBytes($expected)
             $headers = [Text.Encoding]::ASCII.GetBytes(
                 "POST /tls-upload HTTP/1.1`r`nHost: localhost`r`n" +
@@ -870,7 +872,9 @@ mail {
         listen 127.0.0.1:$httpsPort ssl sndbuf=16k;
         ssl_certificate "$($script:Tls.Cert.Replace('\','/'))";
         ssl_certificate_key "$($script:Tls.Key.Replace('\','/'))";
+        large_client_header_buffers 4 64k;
         location = /tls-upload {
+            client_body_buffer_size 64k;
             proxy_pass https://127.0.0.1:$httpsPort/tls-echo;
             proxy_set_header X-RC-Body `$request_body;
         }
