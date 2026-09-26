@@ -984,6 +984,7 @@ $mailConfig
         [void] (Wait-TestProcesses $dir 3)
         $oldWorkers = @(Wait-Workers $dir $start.Id 2)
         Test-IdleListeners $httpPort $secondHttpPort
+        Test-ReadNotifications $httpPort
         for ($attempt = 0; $attempt -lt 32 -and $partialClients.Count -lt 2; $attempt++) {
             $partial = Start-PartialHttpRequest $httpPort
             if ($partialClients.ContainsKey($partial.WorkerId)) {
@@ -999,6 +1000,9 @@ $mailConfig
 
         $reloaded = (Get-Content -Raw -LiteralPath $config).Replace(
             "return 200 `"$body`";", "return 200 `"$reloadedBody`";")
+        # Cover the pooled header buffer as well as the freed 8 KiB buffer.
+        $reloaded = $reloaded.Replace('client_header_buffer_size 8k;',
+                                      'client_header_buffer_size 1k;')
         Set-Content -LiteralPath $config -Value $reloaded -Encoding ASCII
         Invoke-Nginx @('-e', 'stderr', '-p', $dir, '-c', $config, '-s', 'reopen')
         Invoke-Nginx @('-e', 'stderr', '-p', $dir, '-c', $config, '-s', 'reload')
