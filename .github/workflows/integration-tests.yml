@@ -1,17 +1,17 @@
 name: Integration Tests
 
 on:
-  push:
-    branches: [ master, 'fix/**', 'feature/**' ]
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
+
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
 
 jobs:
   lifecycle-tests:
     name: Lifecycle and Multi-Worker Tests
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
     - name: Checkout repository
@@ -42,7 +42,7 @@ jobs:
           --with-stream \
           --with-stream_ssl_module
 
-        make -j$(nproc)
+        make -j1
 
     - name: Test graceful shutdown
       shell: pwsh

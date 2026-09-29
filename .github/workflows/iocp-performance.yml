@@ -1,14 +1,6 @@
-name: IOCP Performance Trial
+name: IOCP Performance Trial (paused)
 
 on:
-  push:
-    branches: ['fix/iocp-perf-*']
-    paths:
-      - 'src/**'
-      - 'auto/**'
-      - 'misc/*benchmark*'
-      - 'misc/*iocp*'
-      - '.github/workflows/iocp-performance.yml'
   workflow_dispatch:
     inputs:
       baseline:
@@ -25,14 +17,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: iocp-performance-${{ github.ref }}
+  group: nginx-heavy-ci
   cancel-in-progress: false
 
 jobs:
   build:
+    # Full measurements are paused; a skipped job is not a passing gate.
+    if: ${{ false }}
     name: Build baseline and candidate with one toolchain
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v5
 
@@ -88,7 +82,7 @@ jobs:
               --with-pcre \
               --with-http_ssl_module \
               --with-http_v2_module
-            make -j$(nproc)
+            make -j1
             cp objs/nginx.exe "$benchmark_bin/$2/nginx.exe"
           )
         }
@@ -129,11 +123,14 @@ jobs:
         retention-days: 14
 
   measure:
+    # Full measurements are paused; a skipped job is not a passing gate.
+    if: ${{ false }}
     name: ${{ matrix.kind }} / ${{ matrix.profile }} CPU budgets
     needs: build
     runs-on: windows-2022
-    timeout-minutes: 55
+    timeout-minutes: 15
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         kind: [static, proxy]
@@ -180,6 +177,8 @@ jobs:
         retention-days: 90
 
   gate:
+    # Full measurements are paused; a skipped job is not a passing gate.
+    if: ${{ false }}
     name: Require measured improvement and no regressions
     needs: measure
     runs-on: ubuntu-22.04

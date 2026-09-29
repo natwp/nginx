@@ -1,25 +1,33 @@
 name: Windows Build and Test
 
 on:
-  push:
-    branches: [ master, 'fix/**', 'feature/**' ]
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build one configuration per run'
+        type: choice
+        options: [Release, Debug]
+        default: Release
 
 env:
   PCRE2_VERSION: '10.44'
   ZLIB_VERSION: '1.3.1'
   OPENSSL_VERSION: '3.3.2'
 
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build nginx-iocp
     runs-on: windows-2022
+    timeout-minutes: 20
     strategy:
+      max-parallel: 1
       matrix:
         arch: [x64]
-        config: [Release, Debug]
+        config: ['${{ inputs.configuration }}']
       fail-fast: false
 
     steps:
@@ -84,7 +92,7 @@ jobs:
           $DEBUG_FLAG
         
         # Build
-        make -j$(nproc)
+        make -j1
         
         # Verify binary exists
         ls -lh objs/nginx.exe

@@ -1,5 +1,9 @@
 # Windows CI benchmark matrix
 
+Full benchmark jobs are paused. Use saved profiles and focused diagnostics
+for bottleneck investigations; the historical method and retention gates
+below remain unchanged. A skipped workflow is not a passing gate.
+
 The [extended benchmark workflow](../.github/workflows/benchmarks-extended.yml)
 compares IOCP, select, and poll using the same optimized nginx binary. Static
 files and HTTP proxy traffic run in separate Windows 2022 jobs; all comparisons
@@ -91,11 +95,12 @@ Small percentage differences should not be treated as universal speedups.
 
 ## Running and reading the workflow
 
-Open [Performance Benchmarks (Extended)](https://github.com/natwp/nginx-iocp/actions/workflows/benchmarks-extended.yml)
-and select **Run workflow**, `test_suite`, and `worker_count`. The workflow also
-runs monthly and on benchmark changes pushed to `fix/benchmark-*` branches.
+The [extended benchmark workflow](../.github/workflows/benchmarks-extended.yml)
+has no schedule or push trigger, and its measurement jobs are paused.
+Its retained inputs describe the historical method; dispatching it does
+not run measurements or satisfy a gate.
 
-Each workload job publishes a Markdown summary and a 90-day artifact named
+When enabled, each workload job publishes a Markdown summary and a 90-day artifact named
 `benchmark-results-static` or `benchmark-results-proxy` containing:
 
 - `manifest.json`: source commit, run/attempt, binary and tool hashes, build

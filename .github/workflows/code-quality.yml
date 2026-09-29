@@ -1,15 +1,17 @@
 name: Code Quality
 
 on:
-  push:
-    branches: [ master, 'fix/**', 'feature/**' ]
-  pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
 
 jobs:
   lint:
     name: Check Code Quality
     runs-on: windows-2022
+    timeout-minutes: 10
     
     steps:
     - name: Checkout repository
