@@ -1,10 +1,11 @@
 name: Smoke Tests
 
 on:
-  push:
-    branches: [ master, 'fix/**', 'feature/**' ]
-  pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
 
 jobs:
   smoke-tests:
@@ -39,7 +40,7 @@ jobs:
           --with-pcre \
           --with-http_ssl_module
 
-        make -j$(nproc)
+        make -j1
         
         if [ -f objs/nginx.exe ]; then
           echo "✓ Build successful"

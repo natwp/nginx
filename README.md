@@ -202,7 +202,8 @@ Comprehensive test suite covering:
 - Load/stress testing
 - Performance benchmarks
 
-All tests run automatically on CI. See [docs/testing.md](docs/testing.md) for details.
+Select focused CI workflows manually; pull requests run short metadata checks.
+See [docs/testing.md](docs/testing.md) for details.
 
 ```bash
 # Run local smoke tests

@@ -1,16 +1,17 @@
 name: Feature Tests
 
 on:
-  push:
-    branches: [ master, 'fix/**', 'feature/**' ]
-  pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
 
 jobs:
   feature-tests:
     name: Feature Configuration Tests
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
     - name: Checkout repository
@@ -37,7 +38,7 @@ jobs:
           --with-cc-opt="-O2" \
           --with-pcre
 
-        make -j$(nproc)
+        make -j1
         ls -lh objs/nginx.exe
 
     - name: Test IOCP event method

@@ -1,15 +1,7 @@
 name: Release Build
 
-# Releases are produced exclusively by CI.  The build runs on a GitHub-hosted
-# runner and the resulting artifact is signed with a Sigstore build provenance
-# attestation, so consumers can verify the binary came from this workflow at a
-# specific commit and was not built or altered locally.
+# Manual package validation only. Automatic publication is disabled.
 on:
-  push:
-    branches:
-      - 'fix/release-*'
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       ref:
@@ -20,11 +12,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Build and Attest Release
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 20
 
     permissions:
       contents: write        # create the GitHub release
@@ -94,7 +90,7 @@ jobs:
           --with-stream_realip_module \
           --with-stream_ssl_preread_module
 
-        make -j$(nproc)
+        make -j1
 
         ./objs/nginx.exe -V
 

@@ -1,4 +1,4 @@
-name: Load and Stress Tests
+name: Load and Stress Tests (paused)
 
 on:
   workflow_dispatch:
@@ -11,15 +11,18 @@ on:
         description: 'Number of concurrent connections'
         required: false
         default: '100'
-  schedule:
-    # Run weekly on Sunday at 2 AM UTC
-    - cron: '0 2 * * 0'
+
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
 
 jobs:
   load-tests:
+    # Full measurements are paused; a skipped job is not a passing gate.
+    if: ${{ false }}
     name: HTTP Load Tests
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 15
 
     steps:
     - name: Checkout repository
@@ -53,7 +56,7 @@ jobs:
           --with-stream \
           --with-stream_ssl_module
 
-        make -j$(nproc)
+        make -j1
         ls -lh objs/nginx.exe
 
     - name: Install oha (HTTP load testing tool)

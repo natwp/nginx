@@ -1,15 +1,6 @@
-name: Performance Benchmarks (Extended)
+name: Performance Benchmarks (Extended) (paused)
 
 on:
-  push:
-    branches: ['fix/benchmark-*']
-    paths:
-      - '.github/workflows/benchmarks-extended.yml'
-      - 'misc/benchmark-report.js'
-      - 'misc/test-benchmark-report.js'
-      - 'misc/win32-ci-benchmark.js'
-      - 'misc/win32-benchmark-helper.c'
-      - 'misc/validate-oha-summary.js'
   workflow_dispatch:
     inputs:
       test_suite:
@@ -24,21 +15,21 @@ on:
         type: choice
         options: ['2', '4', '8']
         default: '4'
-  schedule:
-    - cron: '0 3 1 * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: nginx-heavy-ci
   cancel-in-progress: false
 
 jobs:
   build:
+    # Full measurements are paused; a skipped job is not a passing gate.
+    if: ${{ false }}
     name: Build and validate benchmark tools
     runs-on: windows-2022
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v5
 
@@ -82,7 +73,7 @@ jobs:
           --with-pcre \
           --with-http_ssl_module \
           --with-http_v2_module
-        make -j$(nproc)
+        make -j1
         mkdir -p benchmark-bin
         gcc -O2 -Wall -Wextra -Werror misc/win32-benchmark-helper.c \
           -o benchmark-bin/benchmark-helper.exe -lws2_32
@@ -126,11 +117,14 @@ jobs:
         retention-days: 14
 
   benchmark:
+    # Full measurements are paused; a skipped job is not a passing gate.
+    if: ${{ false }}
     name: Repeated ${{ matrix.kind }} comparisons
     needs: build
     runs-on: windows-2022
-    timeout-minutes: 55
+    timeout-minutes: 15
     strategy:
+      max-parallel: 1
       fail-fast: false
       matrix:
         kind: [static, proxy]

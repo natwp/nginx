@@ -1,18 +1,20 @@
 name: IOCP Diagnostic Profiles
 
 on:
-  push:
-    branches: ['fix/iocp-prof-*']
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: nginx-heavy-ci
+  cancel-in-progress: false
+
 jobs:
   profile:
     name: Profile HTTP and TLS backend paths
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v5
     - uses: actions/setup-node@v4
@@ -40,7 +42,7 @@ jobs:
           --conf-path=conf/nginx.conf --pid-path=logs/nginx.pid \
           --error-log-path=logs/error.log --http-log-path=logs/access.log \
           --with-pcre --with-http_ssl_module --with-http_v2_module
-        make -j$(nproc)
+        make -j1
         mkdir -p benchmark-bin
         cp objs/nginx.exe /mingw64/bin/openssl.exe benchmark-bin/
         gcc -O2 -Wall -Wextra -Werror misc/win32-benchmark-helper.c \
