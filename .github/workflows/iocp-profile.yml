@@ -2,6 +2,27 @@ name: IOCP Diagnostic Profiles
 
 on:
   workflow_dispatch:
+    inputs:
+      scenario:
+        description: Workload to profile
+        type: choice
+        default: static-off-1k.bin-plain
+        options:
+          - static-off-1k.bin-plain
+          - static-on-1k.bin-plain
+          - static-off-1k.bin-tls
+          - proxy-fast-1k.bin-plain
+          - proxy-fast-1k.bin-tls
+          - proxy-fast-1m.bin-plain
+          - proxy-fast-1m.bin-tls
+      backend:
+        description: Event backend to profile
+        type: choice
+        default: iocp
+        options:
+          - iocp
+          - select
+          - poll
 
 permissions:
   contents: read
@@ -12,7 +33,7 @@ concurrency:
 
 jobs:
   profile:
-    name: Profile HTTP and TLS backend paths
+    name: Profile one HTTP or TLS backend path
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
@@ -66,6 +87,9 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Collect profiles without making throughput claims
       shell: pwsh
+      env:
+        IOCP_PROFILE_CASE: ${{ inputs.scenario }}
+        IOCP_PROFILE_BACKEND: ${{ inputs.backend }}
       run: |
         node .\misc\win32-iocp-profile.js
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

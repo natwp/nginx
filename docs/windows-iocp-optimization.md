@@ -130,6 +130,26 @@ the workload:
 node misc/iocp-performance-report.js path/to/extracted/artifact
 ```
 
+## Focused diagnostic profiles
+
+[IOCP Diagnostic Profiles](../.github/workflows/iocp-profile.yml) runs one
+selected workload and one event backend per manual dispatch. The default is
+a 1 KiB plaintext static response with IOCP and sendfile disabled. Each run
+uses one nginx worker, a one-second warm-up, and five seconds of profiling.
+Other workloads and backends require separate dispatches; heavy workflows
+share a concurrency group and execute serially.
+
+Use saved profiles to choose the next workload. Normalize call counts by
+the requests recorded in the same worker profile: the profile includes
+startup probes, warm-up, measurement, and shutdown. The measurement-only
+request count covers a different interval. Counts can identify repeated
+allocation or I/O work, but do not measure its cost. Calls crossing shared
+library boundaries and kernel activity are not fully visible in gprof.
+
+Compare a candidate's operation, allocation, and buffer-lifetime behavior
+on that path before requesting wider measurements. Instrumented rates do
+not satisfy or change the correctness and performance retention gates.
+
 ## Evaluated write-notification candidate
 
 OpenSSL's socket BIO sends directly through Winsock. When it returns
