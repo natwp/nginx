@@ -14,6 +14,7 @@ requests. No workflow runs on a schedule or starts a build on push.
 | Feature Tests | Manual | 15 minutes |
 | Integration Tests | Manual | 15 minutes |
 | Code Quality | Manual | 10 minutes |
+| IOCP Diagnostic Profiles | Manual | 15 minutes |
 | Release package validation | Manual, dry run | 20 minutes |
 
 Select only the suite that covers the change. The Windows build defaults to

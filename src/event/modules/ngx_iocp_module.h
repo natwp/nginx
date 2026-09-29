@@ -45,6 +45,9 @@ struct ngx_iocp_owner_s {
     ngx_uint_t              generation;
     ngx_uint_t              pending;
     ngx_uint_t              children;
+    ngx_iocp_op_t          *read_cache;
+    u_char                 *read_buffer;
+    size_t                  read_buffer_size;
     unsigned                socket:1;
     unsigned                associated:1;
     unsigned                closing:1;
@@ -100,6 +103,8 @@ ngx_int_t ngx_iocp_associate(ngx_iocp_owner_t *owner);
 void ngx_iocp_load_extensions(ngx_iocp_owner_t *owner);
 ngx_int_t ngx_iocp_add_connection(ngx_connection_t *c);
 ngx_int_t ngx_iocp_post_read(ngx_event_t *rev);
+ngx_int_t ngx_iocp_post_read_buffer(ngx_event_t *rev, size_t size);
+void ngx_iocp_release_read_buffer(ngx_event_t *rev);
 ngx_int_t ngx_iocp_post_write(ngx_event_t *wev);
 void ngx_iocp_close_connection(ngx_connection_t *c);
 void ngx_iocp_close_owner(ngx_iocp_owner_t *owner);

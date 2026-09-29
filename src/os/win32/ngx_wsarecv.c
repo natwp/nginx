@@ -454,7 +454,7 @@ ngx_iocp_wsarecv_copy(ngx_event_t *rev, u_char *buf, size_t size)
 
     if (rev->iocp_buffer_pos == rev->iocp_buffer_size) {
         if (!rev->iocp_direct_recv) {
-            ngx_free(rev->iocp_buffer);
+            ngx_iocp_release_read_buffer(rev);
         }
         rev->iocp_buffer = NULL;
         rev->iocp_buffer_size = 0;

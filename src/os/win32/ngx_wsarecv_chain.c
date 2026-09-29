@@ -700,7 +700,7 @@ ngx_iocp_wsarecv_chain_copy(ngx_event_t *rev, ngx_chain_t *chain,
     rev->iocp_buffer_pos += copied;
 
     if (rev->iocp_buffer_pos == rev->iocp_buffer_size) {
-        ngx_free(rev->iocp_buffer);
+        ngx_iocp_release_read_buffer(rev);
         rev->iocp_buffer = NULL;
         rev->iocp_buffer_size = 0;
         rev->iocp_buffer_pos = 0;

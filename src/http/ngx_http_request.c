@@ -3352,6 +3352,7 @@ static void
 ngx_http_set_keepalive(ngx_http_request_t *r)
 {
     int                        tcp_nodelay;
+    ngx_uint_t                 read_ahead;
     ngx_buf_t                 *b, *f;
     ngx_chain_t               *cl, *ln;
     ngx_event_t               *rev, *wev;
@@ -3423,7 +3424,13 @@ ngx_http_set_keepalive(ngx_http_request_t *r)
 
     c->data = hc;
 
-    if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+    read_ahead = (ngx_event_flags & NGX_USE_IOCP_EVENT);
+
+#if (NGX_HTTP_SSL)
+    read_ahead = read_ahead && c->ssl == NULL;
+#endif
+
+    if (!read_ahead && ngx_handle_read_event(rev, 0) != NGX_OK) {
         ngx_http_close_connection(c);
         return;
     }
@@ -3572,6 +3579,14 @@ ngx_http_set_keepalive(ngx_http_request_t *r)
 
     if (rev->ready) {
         ngx_post_event(rev, &ngx_posted_events);
+
+#if (NGX_HAVE_IOCP)
+    } else if (read_ahead) {
+        /* The keepalive handler will consume these bytes before parsing. */
+        if (ngx_iocp_post_read_buffer(rev, b->end - b->start) != NGX_OK) {
+            ngx_http_close_connection(c);
+        }
+#endif
     }
 }
 

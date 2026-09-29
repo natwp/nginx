@@ -50,7 +50,9 @@ static ngx_int_t ngx_iocp_process_events(ngx_cycle_t *cycle,
     ngx_msec_t timer, ngx_uint_t flags);
 static ngx_int_t ngx_iocp_process_entry(ngx_cycle_t *cycle,
     OVERLAPPED_ENTRY *entry, ngx_uint_t flags);
+static ngx_int_t ngx_iocp_post_read_internal(ngx_event_t *rev, size_t size);
 static void ngx_iocp_read_notify_complete(ngx_iocp_op_t *op);
+static void ngx_iocp_read_notify_cleanup(ngx_iocp_op_t *base);
 static void CALLBACK ngx_iocp_write_notify_callback(
     PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WAIT wait,
     TP_WAIT_RESULT result);
@@ -485,6 +487,21 @@ ngx_iocp_add_connection(ngx_connection_t *c)
 ngx_int_t
 ngx_iocp_post_read(ngx_event_t *rev)
 {
+    return ngx_iocp_post_read_internal(rev, 0);
+}
+
+
+ngx_int_t
+ngx_iocp_post_read_buffer(ngx_event_t *rev, size_t size)
+{
+    return ngx_iocp_post_read_internal(rev,
+                                      ngx_min(size, NGX_IOCP_READ_LIMIT));
+}
+
+
+static ngx_int_t
+ngx_iocp_post_read_internal(ngx_event_t *rev, size_t size)
+{
     int                         rc;
     ngx_err_t                   err;
     ngx_pool_t                 *pool;
@@ -514,6 +531,9 @@ ngx_iocp_post_read(ngx_event_t *rev)
     /*
      * A zero-byte receive is a readiness notification for stream sockets.
      * It does not consume data, which is required by SSL and MSG_PEEK users.
+     * A consumer that has selected its next receive buffer size can request
+     * data instead.  Its owned buffer remains valid even if the HTTP idle
+     * buffer is released while the receive is pending.
      * Datagram handlers post a real receive so zero-length datagrams retain
      * their normal semantics.
      */
@@ -531,7 +551,8 @@ ngx_iocp_post_read(ngx_event_t *rev)
     op = (ngx_iocp_read_notify_op_t *)
          ngx_iocp_op_create(sizeof(ngx_iocp_read_notify_op_t), c->iocp, rev,
                             pool, NGX_IOCP_OP_READ_NOTIFY,
-                            ngx_iocp_read_notify_complete, NULL);
+                            ngx_iocp_read_notify_complete,
+                            size ? ngx_iocp_read_notify_cleanup : NULL);
     if (op == NULL) {
         rev->error = 1;
         return NGX_ERROR;
@@ -539,9 +560,30 @@ ngx_iocp_post_read(ngx_event_t *rev)
 
     op->wsabuf.buf = (char *) &ngx_iocp_zero_byte;
     op->wsabuf.len = 0;
+
+    if (size) {
+        if (c->iocp->read_buffer && c->iocp->read_buffer_size >= size) {
+            op->wsabuf.buf = (char *) c->iocp->read_buffer;
+            size = c->iocp->read_buffer_size;
+            c->iocp->read_buffer = NULL;
+            c->iocp->read_buffer_size = 0;
+
+        } else {
+            op->wsabuf.buf = (char *) ngx_alloc(size, c->log);
+        }
+
+        if (op->wsabuf.buf == NULL) {
+            ngx_iocp_op_abort(&op->op);
+            rev->error = 1;
+            return NGX_ERROR;
+        }
+
+        op->wsabuf.len = (ULONG) size;
+    }
+
     op->op.flags = 0;
     op->op.bytes = 0;
-    op->op.expected = 0;
+    op->op.expected = op->wsabuf.len;
 
     rc = WSARecv(c->fd, &op->wsabuf, 1, &op->op.bytes, &op->op.flags,
                  &op->op.overlapped, NULL);
@@ -563,7 +605,7 @@ ngx_iocp_post_read(ngx_event_t *rev)
     rev->ready = 1;
     rev->error = 1;
     ngx_iocp_op_abort(&op->op);
-    (void) ngx_connection_error(c, err, "zero-byte WSARecv() failed");
+    (void) ngx_connection_error(c, err, "IOCP read submission failed");
 
     return NGX_ERROR;
 }
@@ -818,9 +860,31 @@ ngx_iocp_write_notify_cancel(ngx_iocp_write_notify_op_t *op)
 static void
 ngx_iocp_read_notify_complete(ngx_iocp_op_t *op)
 {
-    ngx_event_t  *rev;
+    ngx_event_t                *rev;
+    ngx_iocp_read_notify_op_t  *read;
 
     rev = op->event;
+
+    if (op->expected) {
+        read = (ngx_iocp_read_notify_op_t *) op;
+
+        if (op->error == 0 && op->bytes) {
+            if (rev->iocp_buffer) {
+                op->error = WSAEINVAL;
+
+            } else {
+                rev->iocp_buffer = (u_char *) read->wsabuf.buf;
+                rev->iocp_buffer_size = op->bytes;
+                rev->iocp_buffer_pos = 0;
+                rev->iocp_buffer_capacity = read->wsabuf.len;
+                rev->iocp_direct_recv = 0;
+                read->wsabuf.buf = NULL;
+            }
+        }
+
+        ngx_iocp_event_complete(op);
+        return;
+    }
 
     rev->iocp_op = NULL;
     rev->iocp_error = op->error;
@@ -837,6 +901,44 @@ ngx_iocp_read_notify_complete(ngx_iocp_op_t *op)
     if (rev->handler) {
         rev->handler(rev);
     }
+}
+
+
+static void
+ngx_iocp_read_notify_cleanup(ngx_iocp_op_t *base)
+{
+    ngx_iocp_read_notify_op_t  *op;
+
+    op = (ngx_iocp_read_notify_op_t *) base;
+
+    if (op->wsabuf.len && op->wsabuf.buf) {
+        ngx_free(op->wsabuf.buf);
+    }
+}
+
+
+void
+ngx_iocp_release_read_buffer(ngx_event_t *rev)
+{
+    ngx_connection_t  *c;
+    ngx_iocp_owner_t  *owner;
+
+    c = rev->data;
+    owner = c->iocp;
+
+    /* Retain at most one small, fully consumed allocation per connection. */
+    if (owner && !owner->closing && owner->read_buffer == NULL
+        && rev->iocp_buffer_capacity
+        && rev->iocp_buffer_capacity <= 4096)
+    {
+        owner->read_buffer = rev->iocp_buffer;
+        owner->read_buffer_size = rev->iocp_buffer_capacity;
+
+    } else {
+        ngx_free(rev->iocp_buffer);
+    }
+
+    rev->iocp_buffer_capacity = 0;
 }
 
 
@@ -884,7 +986,17 @@ ngx_iocp_op_create(size_t size, ngx_iocp_owner_t *owner, ngx_event_t *event,
         ngx_iocp_set_log(owner, owner->connection->log);
     }
 
-    op = ngx_calloc(size, owner->log);
+    if (type == NGX_IOCP_OP_READ_NOTIFY
+        && size == sizeof(ngx_iocp_read_notify_op_t) && owner->read_cache)
+    {
+        op = owner->read_cache;
+        owner->read_cache = NULL;
+        ngx_memzero(op, size);
+
+    } else {
+        op = ngx_calloc(size, owner->log);
+    }
+
     if (op == NULL) {
         return NULL;
     }
@@ -937,7 +1049,7 @@ ngx_iocp_op_abort(ngx_iocp_op_t *op)
 static void
 ngx_iocp_finish_op(ngx_iocp_op_t *op, ngx_uint_t cleanup)
 {
-    ngx_uint_t         finalize;
+    ngx_uint_t         finalize, cached;
     ngx_pool_t        *owner_pool, *data_pool;
     ngx_iocp_owner_t  *owner;
 
@@ -962,6 +1074,17 @@ ngx_iocp_finish_op(ngx_iocp_op_t *op, ngx_uint_t cleanup)
 
     finalize = owner->closing && owner->pending == 0 && owner->children == 0;
 
+    /*
+     * A callback may already have submitted the next read.  Only an op
+     * whose callback and cleanup have returned is eligible for reuse.
+     */
+    cached = !owner->closing && op->type == NGX_IOCP_OP_READ_NOTIFY
+             && owner->read_cache == NULL;
+
+    if (cached) {
+        owner->read_cache = op;
+    }
+
     if (finalize) {
         ngx_iocp_finalize_owner(owner);
     }
@@ -974,7 +1097,9 @@ ngx_iocp_finish_op(ngx_iocp_op_t *op, ngx_uint_t cleanup)
         ngx_pool_release(owner_pool);
     }
 
-    ngx_free(op);
+    if (!cached) {
+        ngx_free(op);
+    }
 }
 
 
@@ -1101,6 +1226,7 @@ ngx_iocp_close_connection(ngx_connection_t *c)
     c->read->iocp_buffer = NULL;
     c->read->iocp_buffer_size = 0;
     c->read->iocp_buffer_pos = 0;
+    c->read->iocp_buffer_capacity = 0;
     c->read->iocp_chain = NULL;
     c->read->iocp_direct_recv = 0;
     c->read->iocp_direct_chain = 0;
@@ -1177,6 +1303,14 @@ ngx_iocp_finalize_owner(ngx_iocp_owner_t *owner)
 
     if (owner->cleanup) {
         owner->cleanup(owner);
+    }
+
+    if (owner->read_cache) {
+        ngx_free(owner->read_cache);
+    }
+
+    if (owner->read_buffer) {
+        ngx_free(owner->read_buffer);
     }
 
     c = owner->connection;
@@ -1361,6 +1495,16 @@ ngx_iocp_process_entry(ngx_cycle_t *cycle, OVERLAPPED_ENTRY *entry,
 
     } else if (op->type == NGX_IOCP_OP_WRITE_NOTIFY) {
         /* posted by the thread-pool wait callback */
+
+    } else if (owner->socket && owner->connection
+               && owner->connection->type == SOCK_STREAM
+               && op->overlapped.Internal == 0)
+    {
+        /*
+         * Successful stream completions already carry their byte count.
+         * Only failures and message-oriented receives need a result query
+         * for the Winsock error or output flags.
+         */
 
     } else if (owner->socket) {
         bytes = op->bytes;
