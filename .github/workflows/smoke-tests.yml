@@ -1,6 +1,6 @@
 name: Smoke Tests
 
-on:
+"on":
   workflow_dispatch:
 
 concurrency:

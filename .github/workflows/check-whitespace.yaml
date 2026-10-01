@@ -2,7 +2,7 @@ name: Check Whitespace
 
 # Process `git log --check` output to extract just the check errors.
 
-on:
+"on":
   pull_request:
     types: [ opened, synchronize ]
 

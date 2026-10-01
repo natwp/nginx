@@ -1,6 +1,6 @@
 name: IOCP Performance Trial (paused)
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       baseline:

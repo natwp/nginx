@@ -1,6 +1,6 @@
 name: Load and Stress Tests (paused)
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       duration:

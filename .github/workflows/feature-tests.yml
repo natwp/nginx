@@ -1,6 +1,6 @@
 name: Feature Tests
 
-on:
+"on":
   workflow_dispatch:
 
 concurrency:

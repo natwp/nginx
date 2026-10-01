@@ -1,7 +1,7 @@
 name: Release Build
 
 # Manual package validation only. Automatic publication is disabled.
-on:
+"on":
   workflow_dispatch:
     inputs:
       ref:

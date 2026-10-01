@@ -1,6 +1,6 @@
 name: Performance Benchmarks (Extended) (paused)
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       test_suite:
